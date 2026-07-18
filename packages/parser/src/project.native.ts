@@ -1,5 +1,6 @@
 import { Pathy, pathy } from '@bscotch/pathy';
-import { GameMakerIde, GameMakerLauncher } from '@bscotch/stitch-launcher';
+import { findReleaseFromFeeds } from '@bscotch/gamemaker-releases';
+import { GameMakerIde, GameMakerRuntime } from '@bscotch/stitch-launcher';
 import { ok } from 'node:assert';
 import { readFile } from 'node:fs/promises';
 import { parseStringPromise } from 'xml2js';
@@ -371,22 +372,35 @@ export class Native {
     ideVersion?: string;
   }): Promise<Pathy[]> {
     if (!options.runtimeVersion && options.ideVersion) {
-      logger.warn('No stitch config found, looking up runtime version');
-      // Look up the runtime version that matches the project's IDE version.
-      const usingRelease = await GameMakerIde.findRelease({
-        ideVersion: options.ideVersion,
-        logger,
-      });
-      logger.info('Done looking, found:', usingRelease?.runtime.version);
-      options.runtimeVersion = usingRelease?.runtime.version;
+      logger.warn(
+        'No stitch config found, looking up runtime version from live feeds',
+      );
+      try {
+        let usingRelease = await findReleaseFromFeeds(options.ideVersion);
+        if (!usingRelease) {
+          logger.info(
+            'IDE version is no longer in the live feeds, checking release history',
+          );
+          usingRelease = await GameMakerIde.findRelease({
+            ideVersion: options.ideVersion,
+            logger,
+          });
+        }
+        logger.info('Done looking, found:', usingRelease?.runtime.version);
+        options.runtimeVersion = usingRelease?.runtime.version;
+      } catch (error) {
+        logger.warn('Could not look up runtime version from live feeds', error);
+      }
     }
     if (options.runtimeVersion) {
       // Find the locally installed runtime folder
       logger.info('Looking for runtime', options.runtimeVersion);
-      const installedRuntime = await GameMakerLauncher.findInstalledRuntime(
-        { version: options.runtimeVersion },
-        logger,
-      );
+      const installedRuntime = (
+        await GameMakerRuntime.listInstalled({
+          logger,
+          includeReleaseMetadata: false,
+        })
+      ).find((runtime) => runtime.version === options.runtimeVersion);
       if (installedRuntime) {
         logger.info(
           `Looking for spec files in "${installedRuntime.directory?.absolute}"`,

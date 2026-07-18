@@ -1,3 +1,4 @@
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import fetch from 'node-fetch';
 import { XMLParser } from 'fast-xml-parser';
 import { isError } from './utils.js';
@@ -41,7 +42,10 @@ export async function fetchJson<T = unknown>(
 
 async function fetchUrl(url: string) {
   try {
-    const res = await fetch(url);
+    const proxyUrl = proxyUrlFor(url);
+    const res = await fetch(url, {
+      agent: proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined,
+    });
     if (res.status >= 300) {
       throw new Error(
         `Error fetching "${url}": ${res.status} ${res.statusText}`,
@@ -53,4 +57,36 @@ async function fetchUrl(url: string) {
       `Error fetching "${url}": ${isError(err) ? err.message : 'UNKNOWN'}`,
     );
   }
+}
+
+function proxyUrlFor(url: string): string | undefined {
+  const parsedUrl = new URL(url);
+  const noProxy = process.env.NO_PROXY || process.env.no_proxy;
+  if (noProxy && shouldBypassProxy(parsedUrl, noProxy)) {
+    return undefined;
+  }
+  if (parsedUrl.protocol === 'https:') {
+    return process.env.HTTPS_PROXY || process.env.https_proxy;
+  }
+  return (
+    process.env.HTTP_PROXY ||
+    process.env.http_proxy ||
+    process.env.HTTPS_PROXY ||
+    process.env.https_proxy
+  );
+}
+
+function shouldBypassProxy(url: URL, noProxy: string): boolean {
+  const hostname = url.hostname.toLowerCase();
+  return noProxy.split(',').some((entry) => {
+    const candidate = entry.trim().toLowerCase();
+    if (!candidate) {
+      return false;
+    }
+    if (candidate === '*') {
+      return true;
+    }
+    const host = candidate.replace(/^\./, '').split(':')[0];
+    return hostname === host || hostname.endsWith(`.${host}`);
+  });
 }

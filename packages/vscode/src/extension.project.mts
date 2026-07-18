@@ -4,6 +4,7 @@ import {
   ProjectOptions,
   setLogger,
 } from '@bscotch/gml-parser';
+import { findReleaseFromFeeds } from '@bscotch/gamemaker-releases';
 import { pathy } from '@bscotch/pathy';
 import {
   GameMakerIde,
@@ -110,19 +111,31 @@ export class GameMakerProject extends Project {
     }
 
     logger.info(`Looking for GameMaker v${this.ideVersion}...`);
-    const release = await GameMakerRuntime.findRelease({
-      ideVersion: this.ideVersion,
-    });
-    if (!release) {
-      showErrorMessage(
-        `Could not find a release of GameMaker v${this.ideVersion} to run this project.`,
-      );
-      return;
+    let runtimeVersion = this.config.runtimeVersion;
+    if (runtimeVersion) {
+      logger.info(`Using configured runtime ${runtimeVersion}`);
+    } else {
+      let release = await findReleaseFromFeeds(this.ideVersion);
+      if (!release) {
+        logger.info(
+          'IDE version is no longer in the live feeds, checking release history',
+        );
+        release = await GameMakerRuntime.findRelease({
+          ideVersion: this.ideVersion,
+        });
+      }
+      if (!release) {
+        showErrorMessage(
+          `Could not find a release of GameMaker v${this.ideVersion} to run this project.`,
+        );
+        return;
+      }
+      runtimeVersion = release.runtime.version;
     }
-    logger.info(`Looking for runtime ${release.runtime.version}...`);
-    const runtime = await GameMakerLauncher.findInstalledRuntime({
-      version: release.runtime.version,
-    });
+    logger.info(`Looking for runtime ${runtimeVersion}...`);
+    const runtime = (
+      await GameMakerRuntime.listInstalled({ includeReleaseMetadata: false })
+    ).find((installed) => installed.version === runtimeVersion);
 
     logger.info(`Found runtime? ${!!runtime}`);
     if (!runtime) {

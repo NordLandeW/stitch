@@ -49,7 +49,10 @@ export class GameMakerComponent {
   }
 
   get usersDirectory() {
-    return pathy(GameMakerComponent.userDirectories[this.channel || 'beta']);
+    return (
+      this.info.usersDirectory ||
+      pathy(GameMakerComponent.userDirectories[this.channel || 'beta'])
+    );
   }
 
   async activeUser() {

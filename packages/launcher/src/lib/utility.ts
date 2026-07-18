@@ -251,10 +251,14 @@ export async function listInstalledRuntimes(options?: {
     if (!executablePath) {
       continue;
     }
+    const dataDirectory = runtimeDir.up().up().up();
     runtimes.push({
       version,
       directory: runtimeDir,
       executablePath,
+      usersDirectory: new Pathy(process.env.APPDATA).join(
+        dataDirectory.basename,
+      ),
     });
   }
   options?.logger?.log('Found', runtimes.length, 'runtimes');

@@ -46,6 +46,7 @@ export interface GameMakerInstalledVersion {
   version: string;
   executablePath: Pathy;
   directory: Pathy;
+  usersDirectory?: Pathy;
   channel?: GameMakerChannel;
   publishedAt?: Date;
   feedUrl?: string;

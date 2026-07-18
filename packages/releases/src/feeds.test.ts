@@ -3,9 +3,11 @@ import { expect } from 'chai';
 import {
   computeReleasesSummary,
   computeReleasesSummaryWithNotes,
+  findReleaseFromFeeds,
 } from './feeds.js';
 import { rawReleaseNotesCacheSchema } from './feeds.types.js';
 import { cleanNote } from './notes.js';
+import { ideFeedUrls, runtimeFeedUrls } from './urls.js';
 
 const notesCache = pathy('release-notes-cache.json').withValidator(
   rawReleaseNotesCacheSchema,
@@ -15,6 +17,45 @@ const tmpSummaryPath = pathy('releases-summary.json');
 const sampleReleaseNotesPath = pathy('samples/release_notes.json');
 
 describe('Release Feeds', function () {
+  it('finds an IDE and paired Runtime directly from their channel feeds', async function () {
+    const requestedUrls: string[] = [];
+    const ideUrl = ideFeedUrls().lts;
+    const runtimeUrl = runtimeFeedUrls().lts;
+    const release = await findReleaseFromFeeds('2026.0.0.16', async (url) => {
+      requestedUrls.push(url);
+      if (url === ideUrl) {
+        return [
+          {
+            title: 'Version 2026.0.0.16',
+            pubDate: 'Fri, 15 May 2026 08:00:00 Z',
+            comments: 'https://example.com/ide-notes.json',
+            description: 'LTS 2026',
+          },
+        ];
+      }
+      if (url === runtimeUrl) {
+        return [
+          {
+            title: 'Version 2026.0.0.22',
+            pubDate: 'Thu, 14 May 2026 08:00:00 Z',
+            comments: 'https://example.com/runtime-22-notes.json',
+          },
+          {
+            title: 'Version 2026.0.0.23',
+            pubDate: 'Fri, 15 May 2026 08:50:00 Z',
+            comments: 'https://example.com/runtime-23-notes.json',
+          },
+        ];
+      }
+      throw new Error(`Unexpected feed URL: ${url}`);
+    });
+
+    expect(requestedUrls).to.deep.equal([ideUrl, runtimeUrl]);
+    expect(release?.ide.version).to.equal('2026.0.0.16');
+    expect(release?.runtime.version).to.equal('2026.0.0.23');
+    expect(release?.runtime.feedUrl).to.equal(runtimeUrl);
+  });
+
   it('can parse runtime release_notes HTML', async function () {
     const notes = (await sampleReleaseNotesPath.read()) as {
       release_notes: string[];

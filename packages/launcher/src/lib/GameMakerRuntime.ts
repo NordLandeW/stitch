@@ -37,13 +37,17 @@ export class GameMakerRuntime extends GameMakerComponent {
 
   static async listInstalled(options?: {
     logger?: Logger;
+    includeReleaseMetadata?: boolean;
   }): Promise<GameMakerRuntime[]> {
     // Get the runtime versions that SHOULD be installable
     // for cross-checking and for identifying which channel
     // a runtime is from.
-    const releases = await GameMakerComponent.listReleases({
-      logger: options?.logger,
-    });
+    const releases =
+      options?.includeReleaseMetadata === false
+        ? []
+        : await GameMakerComponent.listReleases({
+            logger: options?.logger,
+          });
     const installedRuntimes = await listInstalledRuntimes({
       logger: options?.logger,
     });
