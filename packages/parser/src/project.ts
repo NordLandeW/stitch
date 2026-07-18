@@ -392,10 +392,23 @@ export class Project {
 
       return existing || { filePath, name };
     });
-    // Note: Should check if there have been any changes, and only write if not!
-    // No need to compare with what's already in there, just overwrite it!
-    // GameMaker seems to sort these by full path, so we'll do the same to
-    // prevent git noise.
+    const sortByFullPath = <T extends { filePath: string; name: string }>(
+      files: readonly T[],
+    ) =>
+      [...files].sort((a, b) =>
+        `${a.filePath}/${a.name}`
+          .toLowerCase()
+          .localeCompare(`${b.filePath}/${b.name}`.toLowerCase()),
+      );
+    if (
+      Yy.areEqual(
+        sortByFullPath(this.yyp.IncludedFiles),
+        sortByFullPath(includedFiles),
+      )
+    ) {
+      return;
+    }
+
     // @ts-expect-error The schema will ensure it's written correctly
     this.yyp.IncludedFiles = includedFiles;
     await this.saveYyp();

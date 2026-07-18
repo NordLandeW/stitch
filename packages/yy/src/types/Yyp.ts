@@ -84,7 +84,7 @@ export const yypFolderSchema = z.preprocess(
 
 export type YypAudioGroup = z.infer<typeof yypAudioGroupSchema>;
 export type YypAudioGroupLoose = z.input<typeof yypAudioGroupSchema>;
-export const yypAudioGroupSchema = z.object({
+export const yypAudioGroupSchema = z.looseObject({
   ConfigValues: z
     .record(z.string(), z.record(z.string(), z.string()))
     .optional(),

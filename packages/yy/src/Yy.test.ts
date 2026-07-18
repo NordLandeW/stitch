@@ -131,6 +131,24 @@ describe('Yy Files', function () {
     );
   });
 
+  it('preserves new-format audio group fields during a project round trip', async function () {
+    const source = (
+      await fs.readFile('./samples/project/2024.200.0.516.yyp', 'utf8')
+    ).replace('"$GMAudioGroup":""', '"$GMAudioGroup":"v1","exportDir":""');
+    const parsed = Yy.parse(source, 'project');
+
+    expect(parsed.AudioGroups[0]).to.deep.include({
+      $GMAudioGroup: 'v1',
+      exportDir: '',
+    });
+
+    const reparsed = Yy.parse(Yy.stringify(parsed, 'project'), 'project');
+    expect(reparsed.AudioGroups[0]).to.deep.include({
+      $GMAudioGroup: 'v1',
+      exportDir: '',
+    });
+  });
+
   it('can read GameMaker-style JSON', async function () {
     const data = await Yy.read('./samples/sample.yy');
     expect(data).to.deep.equal(sampleData);

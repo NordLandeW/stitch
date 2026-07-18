@@ -388,6 +388,9 @@ describe('Project', function () {
     await project.dir
       .join('datafiles/test-folder/test-file.txt')
       .write('hello');
+    await project.dir
+      .join('datafiles/test-folder/another-file.txt')
+      .write('hello again');
     await project.syncIncludedFiles();
     assert(
       project.datafiles.find(
@@ -395,6 +398,23 @@ describe('Project', function () {
           f.name === 'test-file.txt' && f.filePath === 'datafiles/test-folder',
       ),
     );
+
+    project.yyp.IncludedFiles.reverse();
+    let saveCount = 0;
+    const saveYyp = project.saveYyp.bind(project);
+    project.saveYyp = async () => {
+      saveCount++;
+      await saveYyp();
+    };
+
+    await project.syncIncludedFiles();
+    expect(saveCount).to.equal(0);
+
+    await project.dir
+      .join('datafiles/test-folder/new-file.txt')
+      .write('new content');
+    await project.syncIncludedFiles();
+    expect(saveCount).to.equal(1);
   });
 
   xit('can parse sample project', async function () {
