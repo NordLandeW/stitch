@@ -43,8 +43,14 @@ class GlobalDeclarationsProcessor {
     this.start = file.scopes[0].start;
   }
 
-  range(loc: CstNodeLocation) {
-    return Range.fromCst(this.start.file, loc);
+  range(loc: CstNodeLocation, endLoc?: CstNodeLocation) {
+    if (!endLoc) {
+      return Range.fromCst(this.start.file, loc);
+    }
+    return new Range(
+      Position.fromCstStart(this.start.file, loc),
+      Position.fromCstEnd(this.start.file, endLoc),
+    );
   }
 
   get currentLocalScope() {
@@ -92,11 +98,14 @@ export class GmlGlobalDeclarationsVisitor extends GmlVisitorBase {
    * global identifiers are not deleted when their definitions are,
    * so we need to either create *or update* the corresponding symbol/typeMember.
    */
-  REGISTER_GLOBAL(children: { Identifier?: IToken[] }): Signifier | undefined {
+  REGISTER_GLOBAL(
+    children: { Identifier?: IToken[] },
+    isNotDef = false,
+  ): Signifier | undefined {
     const name = children.Identifier?.[0];
     if (!name) return;
     const range = this.PROCESSOR.range(name);
-    return this.REGISTER_GLOBAL_BY_NAME(name.image, range);
+    return this.REGISTER_GLOBAL_BY_NAME(name.image, range, isNotDef);
   }
 
   REGISTER_GLOBAL_BY_NAME(name: string, range: Range, isNotDef = false) {
@@ -159,6 +168,9 @@ export class GmlGlobalDeclarationsVisitor extends GmlVisitorBase {
   override enumStatement(children: EnumStatementCstChildren) {
     const symbol = this.REGISTER_GLOBAL(children)! as Signifier;
     assert(symbol, 'Enum symbol should exist');
+    symbol.declaredAt(
+      this.PROCESSOR.range(children.Enum[0], children.EndBrace[0]),
+    );
     symbol.enum = true;
     let type = symbol.getTypeByKind('Enum');
     if (!type) {
@@ -293,18 +305,26 @@ export class GmlGlobalDeclarationsVisitor extends GmlVisitorBase {
 
   override macroStatement(children: MacroStatementCstChildren) {
     const symbol = this.REGISTER_GLOBAL(children)!;
+    symbol.declaredAt(
+      this.PROCESSOR.range(
+        children.Macro[0],
+        children.expressionStatement[0].location!,
+      ),
+    );
     symbol.macro = true;
   }
 
   override identifierAccessor(children: IdentifierAccessorCstChildren) {
-    // Add global.whatever symbols
+    // Discover global.whatever symbols without treating ordinary access as a
+    // declaration. The signifier visitor will mark an actual assignment as
+    // the definition.
     const identifier = identifierFrom(children);
     if (identifier?.type === 'Global') {
       const globalIdentifier =
         children.accessorSuffixes?.[0].children.dotAccessSuffix?.[0].children
           .identifier[0].children;
       if (globalIdentifier?.Identifier) {
-        this.REGISTER_GLOBAL(globalIdentifier);
+        this.REGISTER_GLOBAL(globalIdentifier, true);
       }
     } else if (
       identifier?.type === 'Identifier' &&

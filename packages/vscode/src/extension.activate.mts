@@ -11,6 +11,7 @@ import {
   createCopyAsTypeCallback,
 } from './extension.copyType.mjs';
 import { StitchDefinitionsProvider } from './extension.definitions.mjs';
+import { StitchDocumentSymbolProvider } from './extension.documentSymbols.mjs';
 import { StitchYyFormatProvider } from './extension.formatting.mjs';
 import { StitchHoverProvider } from './extension.hover.mjs';
 import { StitchLensProvider } from './extension.lens.mjs';
@@ -233,6 +234,7 @@ export async function activateStitchExtension(
     ...(SpriteSourcesTree?.register(workspace) || []),
     StitchHoverProvider.register(workspace),
     StitchLensProvider.register(workspace),
+    StitchDocumentSymbolProvider.register(workspace),
     StitchWorkspaceSymbolProvider.register(workspace),
     StitchCompletionProvider.register(workspace),
     ...StitchIgorView.register(workspace),

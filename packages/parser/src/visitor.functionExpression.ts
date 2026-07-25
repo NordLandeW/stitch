@@ -19,7 +19,9 @@ export function visitFunctionExpression(
   const docs = ctx.docs || this.PROCESSOR.consumeJsdoc();
   ctx.docs = undefined;
   const assignedTo = ctx.signifier;
+  const assignedToIsDefinition = ctx.signifierIsDefinition;
   ctx.signifier = undefined;
+  ctx.signifierIsDefinition = undefined;
 
   if (!children.blockStatement) {
     // Then we're in a recovery situation and should just move along
@@ -98,8 +100,8 @@ export function visitFunctionExpression(
     docs?.jsdoc.kind === 'self'
       ? docs.type[0]
       : docs?.jsdoc.kind === 'function'
-      ? docs.type[0]?.self
-      : undefined;
+        ? docs.type[0]?.self
+        : undefined;
   if (docContextRaw && docContextRaw.kind === 'Function') {
     // Then we use the function's construct if it is a constructor, else its context.
     docContextRaw = docContextRaw.self;
@@ -220,8 +222,9 @@ export function visitFunctionExpression(
       const idx = cstParams.length + i;
       const paramDoc = extraParams[i];
       assert(paramDoc, 'Expected extra param');
-      const type = docs!.type[0]?.local?.getMember(paramDoc.name!.content)
-        ?.type;
+      const type = docs!.type[0]?.local?.getMember(
+        paramDoc.name!.content,
+      )?.type;
       functionType
         .addParameter(idx, paramDoc.name!.content, {
           optional: paramDoc.optional,
@@ -260,9 +263,17 @@ export function visitFunctionExpression(
   }
 
   // End the scope
-  const endBrace = fixITokenLocation(
-    children.blockStatement[0].children.EndBrace[0],
-  );
+  const endBraceToken = children.blockStatement[0].children.EndBrace[0];
+  const declarationEnd = this.PROCESSOR.range(endBraceToken).end;
+  const endBrace = fixITokenLocation(endBraceToken);
+  if (signifier?.def?.file && (!assignedTo || assignedToIsDefinition)) {
+    const functionStart = this.PROCESSOR.range(children.Function[0]).start;
+    const declarationStart =
+      signifier.def.start.offset < functionStart.offset
+        ? signifier.def.start
+        : functionStart;
+    signifier.declaredAt(new Range(declarationStart, declarationEnd));
+  }
   this.PROCESSOR.scope.setEnd(endBrace);
   this.PROCESSOR.popScope(endBrace, true);
   assert(

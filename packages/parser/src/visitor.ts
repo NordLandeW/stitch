@@ -550,6 +550,7 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     children: StructLiteralCstChildren,
     ctx: VisitorContext,
   ): Type<'Struct'> {
+    const signifier = ctx.signifier;
     // We may already have a struct type attached to a signfier,
     // which should be updated instead of replaced.
     const structFromDocs =
@@ -560,8 +561,22 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
       ctx.signifier?.getTypeByKind('Struct') ||
       structFromDocs ||
       this.PROCESSOR.createStruct(children.StartBrace[0], children.EndBrace[0]);
-    ctx.signifier?.setType(struct);
+    signifier?.setType(struct);
+    if (signifier?.def?.file && ctx.signifierIsDefinition) {
+      const literalStart = this.PROCESSOR.range(children.StartBrace[0]).start;
+      const declarationStart =
+        signifier.def.start.offset < literalStart.offset
+          ? signifier.def.start
+          : literalStart;
+      signifier.declaredAt(
+        new Range(
+          declarationStart,
+          this.PROCESSOR.range(children.EndBrace[0]).end,
+        ),
+      );
+    }
     ctx.signifier = undefined;
+    ctx.signifierIsDefinition = undefined;
     ctx.docs = undefined;
 
     // TODO

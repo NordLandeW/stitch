@@ -78,6 +78,106 @@ describe('Project', function () {
     await Project.fallbackGmlSpecPath.exists({ assert: true });
   });
 
+  it('records full declaration ranges for source-structure features', async function () {
+    const project = await Project.initialize('samples/project');
+    const file = project.getAssetByName('Script1')!.gmlFile;
+
+    const globalFunction = file.getReferenceAt(6, 15)!.item;
+    ok(globalFunction.declaration);
+    expect(
+      file.getTextAt(
+        globalFunction.declaration.start.offset,
+        globalFunction.declaration.end.offset,
+      ),
+    ).to.match(/^function global_function\(.*\)\s*\{[\s\S]*\}\s*$/);
+
+    const macro = file.getReferenceAt(8, 10)!.item;
+    ok(macro.declaration);
+    expect(
+      file.getTextAt(
+        macro.declaration.start.offset,
+        macro.declaration.end.offset,
+      ),
+    ).to.equal('#macro surprise_macro "SURPRISE!"');
+
+    const constructor = file.getReferenceAt(18, 17)!.item;
+    ok(constructor.declaration);
+    const constructorText = file.getTextAt(
+      constructor.declaration.start.offset,
+      constructor.declaration.end.offset,
+    );
+    expect(constructorText).to.match(
+      /^function GlobalConstructor \(_name, _description\) constructor \{/,
+    );
+    expect(constructorText).to.include('static something_static');
+
+    const enumSymbol = file.getReferenceAt(22, 12)!.item;
+    ok(enumSymbol.declaration);
+    expect(
+      file.getTextAt(
+        enumSymbol.declaration.start.offset,
+        enumSymbol.declaration.end.offset,
+      ),
+    ).to.equal('enum SurpriseEnum { surprise, another_surprise }');
+
+    const complicatedFile = project.getAssetByName('Complicated')!.gmlFile;
+    const structVariable = complicatedFile.getReferenceAt(24, 2)!.item;
+    ok(structVariable.declaration);
+    expect(
+      complicatedFile.getTextAt(
+        structVariable.declaration.start.offset,
+        structVariable.declaration.end.offset,
+      ),
+    ).to.match(/^base = \{[\s\S]*changes\s*:\s*new BschemaChanges\(\),\s*\}$/);
+
+    const reassignmentSource = `function wrapper() {
+  var handler = function handler_impl() {
+    return 1;
+  };
+  handler = function replacement() {
+    return 2;
+  };
+  var settings = { first: 1 };
+  settings = { second: 2 };
+}`;
+    await file.reload(reassignmentSource);
+
+    const handler = file.getReferenceAt(2, 7)!.item;
+    ok(handler.declaration);
+    expect(
+      file.getTextAt(
+        handler.declaration.start.offset,
+        handler.declaration.end.offset,
+      ),
+    ).to.equal(`handler = function handler_impl() {
+    return 1;
+  }`);
+
+    const settings = file.getReferenceAt(8, 7)!.item;
+    ok(settings.declaration);
+    expect(
+      file.getTextAt(
+        settings.declaration.start.offset,
+        settings.declaration.end.offset,
+      ),
+    ).to.equal('settings = { first: 1 }');
+
+    await file.reload(`function read_late_global() {
+  return global.outline_late_global;
+}`);
+    const globalAccess = file.getReferenceAt(2, 20);
+    ok(globalAccess);
+    expect(globalAccess.isDef).to.equal(false);
+    expect(globalAccess.item.def).to.equal(undefined);
+
+    await complicatedFile.reload('global.outline_late_global = true;');
+    const globalAssignment = complicatedFile.getReferenceAt(1, 15);
+    ok(globalAssignment);
+    expect(globalAssignment.item).to.equal(globalAccess.item);
+    expect(globalAssignment.isDef).to.equal(true);
+    expect(globalAssignment.item.def?.file).to.equal(complicatedFile);
+  });
+
   it('can analyze a representative project', async function () {
     const projectDir = 'samples/project';
     const project = await Project.initialize(projectDir);

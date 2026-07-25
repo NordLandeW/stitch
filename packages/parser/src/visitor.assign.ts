@@ -103,7 +103,17 @@ export function assignVariable(
   const assignedToFunction = functionFromRhs(rhs);
   const assignedToStructLiteral = structLiteralFromRhs(rhs);
   const assignedToArrayLiteral = arrayLiteralFromRhs(rhs);
-  const ctx = { ...info.ctx, docs: info.docs, signifier };
+  const signifierDefinition = signifier?.def;
+  const signifierIsDefinition =
+    !!ref?.isDef ||
+    (signifierDefinition instanceof Range &&
+      Range.equals(signifierDefinition, variable.range));
+  const ctx = {
+    ...info.ctx,
+    docs: info.docs,
+    signifier,
+    signifierIsDefinition,
+  };
   if (assignedToFunction || assignedToStructLiteral || assignedToArrayLiteral) {
     if (assignedToFunction) {
       ctx.self = variable.container;

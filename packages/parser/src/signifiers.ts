@@ -25,6 +25,15 @@ export class Signifier extends Flags {
    * does not have a definite declaration.
    */
   protected _def: Range | { file?: undefined } | undefined = undefined;
+  /**
+   * The full source range that declares this signifier.
+   *
+   * `def` intentionally points only at the defining identifier so it can be
+   * used for precise navigation and renaming. This range can additionally
+   * cover the declaration body (for example an entire function or enum),
+   * which is useful for source-structure features.
+   */
+  declaration: Range | undefined = undefined;
   refs = new Set<Reference>();
 
   constructor(
@@ -58,6 +67,7 @@ export class Signifier extends Flags {
     copy.idx = this.idx;
     copy._native = this._native;
     copy._def = this._def;
+    copy.declaration = this.declaration;
     copy.flags = this.flags;
     return copy as this;
   }
@@ -73,6 +83,7 @@ export class Signifier extends Flags {
   unsetDef() {
     assert(!this.native, 'Cannot unset def on a native entity');
     this._def = undefined;
+    this.declaration = undefined;
   }
 
   get def(): Range | { file?: undefined } | undefined {
@@ -90,6 +101,11 @@ export class Signifier extends Flags {
 
   definedAt(location: Range): this {
     this.def = location;
+    return this;
+  }
+
+  declaredAt(location: Range): this {
+    this.declaration = location;
     return this;
   }
 

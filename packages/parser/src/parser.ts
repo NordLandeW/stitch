@@ -708,6 +708,8 @@ export interface VisitorContext {
   isStatic?: boolean;
   /** While processing a function expression or struct literal, the signifier may come from an assignment operation. */
   signifier?: Signifier;
+  /** The current assignment is the defining occurrence of `signifier`. */
+  signifierIsDefinition?: boolean;
   /** While processing a function expression, we may have expected type information for the value */
   type?: TypeStore;
   /** While processing `method()` calls, we may find the self-context
