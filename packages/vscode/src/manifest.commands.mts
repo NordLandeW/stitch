@@ -373,6 +373,22 @@ export const commands = {
       group: 'inline@5',
     },
   },
+  'stitch.debug': {
+    command: 'stitch.debug',
+    title: 'Stitch: Debug Project',
+    shortTitle: 'Debug',
+    icon: '$(debug-alt)',
+    enablement: when.hasProjects,
+    [$showInPalette]: true,
+    [$showInViewTitle]: {
+      when: `${when.runnerViewFocused} || (${when.assetTreeFocused} && ${when.runningInTerminal})`,
+      group: 'navigation@6',
+    },
+    [$showInViewItemContextMenu]: {
+      when: when.isInlineProject,
+      group: 'inline@6',
+    },
+  },
   'stitch.run.noDefaults': {
     command: 'stitch.run.noDefaults',
     title: 'Stitch: Set Runner Target',

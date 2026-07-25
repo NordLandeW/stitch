@@ -82,7 +82,13 @@ export class GameMakerProject extends Project {
     const windowTitle = await this.getWindowsName();
     if (windowTitle) {
       logger.info(`Attempting to kill running "${windowTitle} instances...`);
-      await killProjectRunner(windowTitle);
+      try {
+        await killProjectRunner(windowTitle);
+      } catch (error) {
+        // taskkill reports an error when no matching window exists. Continue
+        // with terminal/webview cancellation so Debug: Stop stays reliable.
+        warn(`Could not kill Runner by window title: ${String(error)}`);
+      }
       logger.info('Finished killing running instances!');
     }
     // Send a signal to the terminal to abort the current command
@@ -95,7 +101,9 @@ export class GameMakerProject extends Project {
     config?: string | null;
     compiler?: 'yyc' | 'vm';
     clean?: boolean;
-  }) {
+    debug?: boolean;
+    debuggerPort?: number;
+  }): Promise<boolean> {
     if (stitchConfig.killOthersOnRun && !options?.clean) {
       await this.kill();
     }
@@ -108,6 +116,9 @@ export class GameMakerProject extends Project {
     let compiler = options?.compiler ?? stitchConfig.runCompilerDefault;
     if (['yyc', 'vm'].indexOf(compiler) === -1) {
       compiler = stitchConfig.runCompilerDefault;
+    }
+    if (options?.debug) {
+      compiler = 'vm';
     }
 
     logger.info(`Looking for GameMaker v${this.ideVersion}...`);
@@ -128,7 +139,7 @@ export class GameMakerProject extends Project {
         showErrorMessage(
           `Could not find a release of GameMaker v${this.ideVersion} to run this project.`,
         );
-        return;
+        return false;
       }
       runtimeVersion = release.runtime.version;
     }
@@ -150,10 +161,13 @@ export class GameMakerProject extends Project {
           `GameMaker v${this.ideVersion} has been installed and opened. Once it's done installing its runtime you should be able to run your game from Stitch!`,
         );
       }
-      return;
+      return false;
     }
 
-    if (stitchConfig.runInTerminal) {
+    // Debug runs always use a hidden terminal. The webview runner reveals its
+    // own view before spawning Igor, which would replace the Debug sidebar the
+    // user just opened.
+    if (stitchConfig.runInTerminal || options?.debug) {
       logger.info(`Running Igor`, {
         igorPath: runtime.executablePath,
       });
@@ -168,6 +182,8 @@ export class GameMakerProject extends Project {
             project: this.yypPath.absolute,
             config: config || undefined,
             yyc: compiler === 'yyc',
+            debug: options?.debug,
+            debuggerPort: options?.debuggerPort,
             noCache: false,
             quiet: true,
           }),
@@ -187,7 +203,9 @@ export class GameMakerProject extends Project {
         });
       }
       this.runnerTerminal.sendText(cmd);
-      this.runnerTerminal.show();
+      if (!options?.debug) {
+        this.runnerTerminal.show();
+      }
     } else {
       logger.info('Computing Igor command...');
       let { cmd, args } = await loudlyLogThrownAsync(
@@ -200,6 +218,8 @@ export class GameMakerProject extends Project {
             project: this.yypPath.absolute,
             config: config || undefined,
             yyc: compiler === 'yyc',
+            debug: options?.debug,
+            debuggerPort: options?.debuggerPort,
             noCache: false,
             quiet: true,
           }),
@@ -215,7 +235,7 @@ export class GameMakerProject extends Project {
         clean: options?.clean,
       });
     }
-    return;
+    return true;
   }
 
   includesFile(document: vscode.Uri | vscode.TextDocument): boolean {

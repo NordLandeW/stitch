@@ -52,6 +52,8 @@ export async function computeOptions(
     runtimePath: empath(runtime.directory),
     runtime: options?.yyc ? 'YYC' : 'VM',
     config: options?.config,
+    debug: options?.debug,
+    dbgp: options?.debug ? String(options.debuggerPort ?? 6509) : undefined,
     verbose: !options?.quiet,
     ignorecache: !!options?.noCache,
     cache: empath(tempDir.join('igor/cache')),

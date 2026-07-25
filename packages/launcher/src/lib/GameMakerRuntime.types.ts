@@ -26,6 +26,15 @@ export interface GameMakerRunOptions extends GameMakerLogOptions {
   targetPlatform?: StitchSupportedBuilder;
   config?: string;
   yyc?: boolean;
+  /**
+   * Run the game as a debug build, making `debug_mode` true.
+   */
+  debug?: boolean;
+  /**
+   * Port used by the GameMaker debugger for debug builds.
+   * @default 6509
+   */
+  debuggerPort?: number;
   noCache?: boolean;
   quiet?: boolean;
 }

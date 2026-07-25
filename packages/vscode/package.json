@@ -35,6 +35,7 @@
     "build:webviews": "cd webviews && pnpm build",
     "bump": "cd ../.. && pnpm bump",
     "package": "vsce package --no-dependencies --githubBranch develop",
+    "test": "node scripts/test.mjs",
     "vscode:prepublish": "pnpm build",
     "vscode:publish": "vsce publish --no-dependencies --githubBranch develop",
     "watch": "concurrently \"pnpm watch:extension\" \"pnpm watch:webviews\" \"pnpm watch:grammar\"",
@@ -243,6 +244,13 @@
         "enablement": "stitch.projectCount > 0"
       },
       {
+        "command": "stitch.debug",
+        "title": "Stitch: Debug Project",
+        "shortTitle": "Debug",
+        "icon": "$(debug-alt)",
+        "enablement": "stitch.projectCount > 0"
+      },
+      {
         "command": "stitch.run.noDefaults",
         "title": "Stitch: Set Runner Target",
         "shortTitle": "Set Target",
@@ -327,6 +335,47 @@
       {
         "command": "stitch.spriteSource.openExplorer",
         "title": "Reveal in File Explorer"
+      }
+    ],
+    "breakpoints": [
+      {
+        "language": "gml"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "gamemaker",
+        "label": "GameMaker",
+        "languages": [
+          "gml"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "project": {
+                "type": "string",
+                "description": "Absolute path to the GameMaker .yyp project. Stitch fills this automatically."
+              },
+              "config": {
+                "type": "string",
+                "description": "Optional GameMaker project configuration."
+              },
+              "debuggerPort": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 65535,
+                "description": "Optional GameMaker debugger port. Stitch selects an available port automatically."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "gamemaker",
+            "request": "launch",
+            "name": "Debug GameMaker"
+          }
+        ]
       }
     ],
     "configuration": {
@@ -698,6 +747,11 @@
           "group": "navigation@5"
         },
         {
+          "command": "stitch.debug",
+          "when": "view == bscotch-stitch-igor || (view == bscotch-stitch-resources && config.stitch.run.inTerminal)",
+          "group": "navigation@6"
+        },
+        {
           "command": "stitch.run.noDefaults",
           "when": "view == bscotch-stitch-igor || (view == bscotch-stitch-resources && config.stitch.run.inTerminal)",
           "group": "navigation@4"
@@ -885,6 +939,11 @@
           "group": "inline@5"
         },
         {
+          "command": "stitch.debug",
+          "when": "view == bscotch-stitch-resources && stitch.projectCount > 0 && viewItem == project",
+          "group": "inline@6"
+        },
+        {
           "command": "stitch.run.noDefaults",
           "when": "view == bscotch-stitch-resources && stitch.projectCount > 0 && viewItem == project",
           "group": "inline@4"
@@ -975,6 +1034,9 @@
         },
         {
           "command": "stitch.run"
+        },
+        {
+          "command": "stitch.debug"
         },
         {
           "command": "stitch.run.noDefaults"
@@ -1103,6 +1165,7 @@
   "activationEvents": [
     "onLanguage:gml",
     "onCommand:stitch.openIde",
+    "onDebug:gamemaker",
     "workspaceContains:**/*.{yyp,yy,gml}"
   ],
   "dependencies": {
@@ -1125,6 +1188,8 @@
     "@types/plist": "3.0.5",
     "@types/vscode": "1.107.0",
     "@types/xml2js": "0.4.14",
+    "@vscode/debugadapter": "1.68.0",
+    "@vscode/debugprotocol": "1.68.0",
     "@vscode/vsce": "3.7.1",
     "concurrently": "9.2.1",
     "dotenv": "17.2.3",

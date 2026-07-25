@@ -36,6 +36,10 @@ import { GameMakerFolder } from './tree.folder.mjs';
 import { GameMakerTreeProvider } from './tree.mjs';
 import { StitchIgorView } from './webview.igor.mjs';
 import { StitchSpriteEditorProvider } from './webviews.spriteEditor.mjs';
+import {
+  registerGameMakerDebugger,
+  startGameMakerDebugging,
+} from './debug/registerGameMakerDebugger.mjs';
 
 export async function activateStitchExtension(
   workspace: StitchWorkspace,
@@ -160,6 +164,36 @@ export async function activateStitchExtension(
   const inspectorProvider = new GameMakerInspectorProvider(workspace);
   const definitionsProvider = new StitchDefinitionsProvider(workspace);
 
+  const runProject = async (
+    uriOrFolder: string[] | GameMakerFolder,
+    debug = false,
+  ) => {
+    const project = findProject(workspace, uriOrFolder);
+    if (!project) {
+      void showErrorMessage('No project found to run!');
+      return;
+    }
+    let lastConfig: any = ctx.workspaceState.get('lastRunConfig');
+    const isValidConfig =
+      typeof lastConfig === 'object' &&
+      'compiler' in lastConfig &&
+      'config' in lastConfig;
+    if (!isValidConfig) {
+      lastConfig = undefined;
+    }
+    try {
+      if (debug) {
+        await startGameMakerDebugging(project, lastConfig?.config);
+      } else {
+        await project.run(lastConfig);
+      }
+    } catch (err) {
+      void showErrorMessage(err as Error);
+    }
+  };
+
+  registerGameMakerDebugger(workspace, ctx);
+
   ctx.subscriptions.push(
     // vscode.window.onDidChangeActiveTextEditor((editor) => {
     //   if (!editor) {
@@ -253,28 +287,11 @@ export async function activateStitchExtension(
       'stitch.types.copyAsJsdocType',
       createCopyAsJsdocTypeCallback(workspace),
     ),
-    registerCommand(
-      'stitch.run',
-      async (uriOrFolder: string[] | GameMakerFolder) => {
-        const project = findProject(workspace, uriOrFolder);
-        if (!project) {
-          void showErrorMessage('No project found to run!');
-          return;
-        }
-        let lastConfig: any = ctx.workspaceState.get('lastRunConfig');
-        const isValidConfig =
-          typeof lastConfig === 'object' &&
-          'compiler' in lastConfig &&
-          'config' in lastConfig;
-        if (!isValidConfig) {
-          lastConfig = undefined;
-        }
-        try {
-          await project.run(lastConfig);
-        } catch (err) {
-          void showErrorMessage(err as Error);
-        }
-      },
+    registerCommand('stitch.run', (uriOrFolder: string[] | GameMakerFolder) =>
+      runProject(uriOrFolder, false),
+    ),
+    registerCommand('stitch.debug', (uriOrFolder: string[] | GameMakerFolder) =>
+      runProject(uriOrFolder, true),
     ),
     registerCommand(
       'stitch.stop',
