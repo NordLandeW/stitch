@@ -41,21 +41,27 @@ test('encodes batch requests with their actual packet size', () => {
 });
 
 test('encodes enabled and disabled 64-bit breakpoint addresses', () => {
+  const condition = Buffer.from([0xde, 0xad, 0xbe, 0xef]);
   const packet = makeBreakpointCommand([
-    { address: 0x1234_5678_9abcn, enabled: true },
+    {
+      address: 0x1234_5678_9abcn,
+      enabled: true,
+      condition,
+    },
     { address: 0xfedc_ba98_7654n, enabled: false },
   ]);
 
-  assert.equal(packet.length, 52);
-  assert.equal(packet.readUInt32LE(8), 52);
+  assert.equal(packet.length, 56);
+  assert.equal(packet.readUInt32LE(8), 56);
   assert.equal(packet.readUInt32LE(12), command.startBreakpoint);
   assert.equal(packet.readUInt32LE(16), 2);
   assert.equal(packet.readBigUInt64LE(20), 0x1234_5678_9abcn);
   assert.equal(packet.readUInt32LE(28), 1);
-  assert.equal(packet.readUInt32LE(32), 0);
-  assert.equal(packet.readBigUInt64LE(36), 0xfedc_ba98_7654n);
-  assert.equal(packet.readUInt32LE(44), 0);
+  assert.equal(packet.readUInt32LE(32), condition.length);
+  assert.deepEqual(packet.subarray(36, 40), condition);
+  assert.equal(packet.readBigUInt64LE(40), 0xfedc_ba98_7654n);
   assert.equal(packet.readUInt32LE(48), 0);
+  assert.equal(packet.readUInt32LE(52), 0);
 });
 
 test('maps compiled scripts to workspace sources and resolves line breakpoints', () => {
@@ -149,6 +155,9 @@ test('advertises the DAP controls implemented by the GameMaker session', async (
   assert.equal(initialize.body.supportsRestartRequest, true);
   assert.equal(initialize.body.supportsTerminateRequest, true);
   assert.equal(initialize.body.supportTerminateDebuggee, true);
+  assert.equal(initialize.body.supportsConditionalBreakpoints, true);
+  assert.equal(initialize.body.supportsEvaluateForHovers, true);
+  assert.equal(initialize.body.supportsSetVariable, true);
   input.destroy();
   output.destroy();
 });

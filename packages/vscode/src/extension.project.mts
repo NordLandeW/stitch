@@ -97,6 +97,51 @@ export class GameMakerProject extends Project {
     stitchEvents.emit('request-kill-project-in-webview');
   }
 
+  async resolveRuntime(): Promise<GameMakerRuntime | undefined> {
+    logger.info(`Looking for GameMaker v${this.ideVersion}...`);
+    let runtimeVersion = this.config.runtimeVersion;
+    if (runtimeVersion) {
+      logger.info(`Using configured runtime ${runtimeVersion}`);
+    } else {
+      let release = await findReleaseFromFeeds(this.ideVersion);
+      if (!release) {
+        logger.info(
+          'IDE version is no longer in the live feeds, checking release history',
+        );
+        release = await GameMakerRuntime.findRelease({
+          ideVersion: this.ideVersion,
+        });
+      }
+      if (!release) {
+        showErrorMessage(
+          `Could not find a release of GameMaker v${this.ideVersion} to run this project.`,
+        );
+        return undefined;
+      }
+      runtimeVersion = release.runtime.version;
+    }
+    logger.info(`Looking for runtime ${runtimeVersion}...`);
+    const runtime = (
+      await GameMakerRuntime.listInstalled({ includeReleaseMetadata: false })
+    ).find((installed) => installed.version === runtimeVersion);
+
+    logger.info(`Found runtime? ${!!runtime}`);
+    if (!runtime) {
+      const installOptions = ['Yes', 'No'] as const;
+      const chosenOption = await showErrorMessage(
+        `The runtime for GameMaker v${this.ideVersion} is either not installed or not discoverable by Stitch. Do you want Stitch to install and launch GameMaker v${this.ideVersion} for you?`,
+        ...installOptions,
+      );
+      if (chosenOption === 'Yes') {
+        await this.openInIde();
+        vscode.window.showInformationMessage(
+          `GameMaker v${this.ideVersion} has been installed and opened. Once it's done installing its runtime you should be able to run your game from Stitch!`,
+        );
+      }
+    }
+    return runtime;
+  }
+
   async run(options?: {
     config?: string | null;
     compiler?: 'yyc' | 'vm';
@@ -121,46 +166,8 @@ export class GameMakerProject extends Project {
       compiler = 'vm';
     }
 
-    logger.info(`Looking for GameMaker v${this.ideVersion}...`);
-    let runtimeVersion = this.config.runtimeVersion;
-    if (runtimeVersion) {
-      logger.info(`Using configured runtime ${runtimeVersion}`);
-    } else {
-      let release = await findReleaseFromFeeds(this.ideVersion);
-      if (!release) {
-        logger.info(
-          'IDE version is no longer in the live feeds, checking release history',
-        );
-        release = await GameMakerRuntime.findRelease({
-          ideVersion: this.ideVersion,
-        });
-      }
-      if (!release) {
-        showErrorMessage(
-          `Could not find a release of GameMaker v${this.ideVersion} to run this project.`,
-        );
-        return false;
-      }
-      runtimeVersion = release.runtime.version;
-    }
-    logger.info(`Looking for runtime ${runtimeVersion}...`);
-    const runtime = (
-      await GameMakerRuntime.listInstalled({ includeReleaseMetadata: false })
-    ).find((installed) => installed.version === runtimeVersion);
-
-    logger.info(`Found runtime? ${!!runtime}`);
+    const runtime = await this.resolveRuntime();
     if (!runtime) {
-      const installOptions = ['Yes', 'No'] as const;
-      const chosenOption = await showErrorMessage(
-        `The runtime for GameMaker v${this.ideVersion} is either not installed or not discoverable by Stitch. Do you want Stitch to install and launch GameMaker v${this.ideVersion} for you?`,
-        ...installOptions,
-      );
-      if (chosenOption === 'Yes') {
-        await this.openInIde();
-        vscode.window.showInformationMessage(
-          `GameMaker v${this.ideVersion} has been installed and opened. Once it's done installing its runtime you should be able to run your game from Stitch!`,
-        );
-      }
       return false;
     }
 

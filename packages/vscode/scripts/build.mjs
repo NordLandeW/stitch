@@ -8,6 +8,8 @@ import { $ } from 'zx';
 config();
 
 await $`mkdir -p ./dist`;
+await $`dotnet build ./src/debug/expression-compiler/GameMakerExpressionHook.csproj -c Release --nologo`;
+await $`cp ./src/debug/expression-compiler/bin/Release/net8.0/GameMakerExpressionHook.dll ./dist/`;
 
 const builder = await esbuild.build({
   entryPoints: ['./src/extension.ts', './src/manifest.update.mts'],

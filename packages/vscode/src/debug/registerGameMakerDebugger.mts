@@ -1,4 +1,5 @@
 import vscode from 'vscode';
+import path from 'node:path';
 import type { GameMakerProject } from '../extension.project.mjs';
 import type { StitchWorkspace } from '../extension.workspace.mjs';
 import {
@@ -125,6 +126,42 @@ function createHost(workspace: StitchWorkspace): GameMakerDebugSessionHost {
           ),
         })),
       );
+    },
+    async expressionCompilerOptions(args) {
+      const project = requireProject(args);
+      const runtime = await project.resolveRuntime();
+      if (!runtime) {
+        throw new Error('The GameMaker Runtime is no longer available.');
+      }
+      const platform =
+        process.platform === 'win32'
+          ? 'windows'
+          : process.platform === 'darwin'
+            ? 'osx'
+            : 'linux';
+      const architecture = process.arch === 'arm64' ? 'arm64' : 'x64';
+      const executableName =
+        process.platform === 'win32'
+          ? 'GMAssetCompiler.exe'
+          : 'GMAssetCompiler';
+      const assetCompiler = runtime.directory.join(
+        'bin',
+        'assetcompiler',
+        platform,
+        architecture,
+        executableName,
+      );
+      if (!(await assetCompiler.exists())) {
+        throw new Error(
+          `GameMaker expression compiler not found: ${assetCompiler.absolute}`,
+        );
+      }
+      return {
+        assetCompilerPath: assetCompiler.absolute,
+        projectPath: project.yypPath.absolute,
+        prefabsPath: runtime.directory.up().up().up().join('Prefabs').absolute,
+        startupHookPath: path.join(__dirname, 'GameMakerExpressionHook.dll'),
+      };
     },
   };
 }

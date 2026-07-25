@@ -18,8 +18,13 @@ const command = {
   stopTarget: 3,
   startTarget: 4,
   singleStepLine: 6,
+  getInstanceData: 7,
+  getJsInstanceData: 8,
   startBreakpoint: 9,
+  getWatches: 10,
   getUpdate: 11,
+  getArrays: 12,
+  getStructures: 13,
   restartTarget: 14,
   batch: 19,
   quitDebugger: 20,
@@ -27,8 +32,17 @@ const command = {
 } as const;
 
 const requestFlag = {
+  globals: 0x08,
+  locals: 0x10,
+  selfInstance: 0x20,
   callStack: 0x40,
 } as const;
+
+const stoppedRequestFlags =
+  requestFlag.globals |
+  requestFlag.locals |
+  requestFlag.selfInstance |
+  requestFlag.callStack;
 
 const stepType = {
   into: 0,
@@ -66,6 +80,8 @@ export interface GameMakerDebugScript {
   vmSize: bigint;
   sourcePath?: string;
   debugInfo?: DebugInfo;
+  argumentNames?: string[];
+  localNames?: string[];
 }
 
 export interface GameMakerBreakpointLocation {
@@ -74,15 +90,50 @@ export interface GameMakerBreakpointLocation {
   script: GameMakerDebugScript;
 }
 
+export type GameMakerValueKind =
+  | 'real'
+  | 'string'
+  | 'array'
+  | 'pointer'
+  | 'undefined'
+  | 'object'
+  | 'int32'
+  | 'int64'
+  | 'null'
+  | 'bool'
+  | 'ref'
+  | 'invalid';
+
+export interface GameMakerValue {
+  kind: GameMakerValueKind;
+  rawKind: number;
+  value?: number | string | bigint | boolean;
+  reference?: bigint;
+  objectKind?: number;
+  instanceId?: number;
+}
+
+export interface GameMakerVariable {
+  name: string;
+  value: GameMakerValue;
+  children?: GameMakerVariable[];
+}
+
 export interface GameMakerStackFrame {
   name: string;
   line: number;
   script?: GameMakerDebugScript;
+  address: number;
+  locals: GameMakerVariable[];
+  self: GameMakerValue;
+  other: GameMakerValue;
 }
 
 export interface GameMakerStoppedState {
   reason: 'breakpoint' | 'pause' | 'step';
   frames: GameMakerStackFrame[];
+  globals: GameMakerVariable[];
+  selfInstance?: GameMakerVariable[];
 }
 
 function fourCc(value: string) {
@@ -186,6 +237,13 @@ export class GameMakerBinaryReader {
     return value;
   }
 
+  readF32() {
+    this.require(4);
+    const value = this.buffer.readFloatLE(this.position);
+    this.position += 4;
+    return value;
+  }
+
   readBytes(size: number) {
     this.require(size);
     const value = this.buffer.subarray(this.position, this.position + size);
@@ -230,6 +288,7 @@ function makeScript(index: number, text = ''): GameMakerDebugScript {
     baseAddress: 0n,
     offsetAddress: NULL_POINTER,
     vmSize: 0n,
+    argumentNames: [],
   };
 }
 
@@ -358,13 +417,25 @@ export class GameMakerDebugMetadata {
       const displayNamePointer = item.readU32();
       const vmSize = item.readI32();
       const argumentCount = item.readI32();
-      for (let index = 0; index < argumentCount; index++) item.readU32();
+      const argumentNamePointers: number[] = [];
+      for (let index = 0; index < argumentCount; index++) {
+        argumentNamePointers.push(item.readU32());
+      }
       const localCount = item.readI32();
-      for (let index = 0; index < localCount; index++) item.readU32();
+      const localNamePointers: number[] = [];
+      for (let index = 0; index < localCount; index++) {
+        localNamePointers.push(item.readU32());
+      }
       const script = this.scripts[scriptIndex];
       if (!script) continue;
       script.displayName = reader.readCStringAt(displayNamePointer);
       script.vmSize = BigInt(Math.max(0, vmSize));
+      script.argumentNames = argumentNamePointers.map((pointer, index) =>
+        pointer ? reader.readCStringAt(pointer) : `argument${index}`,
+      );
+      script.localNames = localNamePointers
+        .filter(Boolean)
+        .map((pointer) => reader.readCStringAt(pointer));
     }
   }
 
@@ -779,10 +850,32 @@ function makeBatch(subcommand: number, values: number[]) {
   return buffer;
 }
 
+function makeBatchPayload(subcommand: number, payload: Buffer) {
+  const size = 24 + payload.length;
+  const buffer = Buffer.alloc(size);
+  buffer.writeUInt32LE(PACKET_SIGNATURE, 0);
+  buffer.writeUInt32LE(NETWORK_PACKET_SIZE, 4);
+  buffer.writeUInt32LE(size, 8);
+  buffer.writeUInt32LE(command.batch, 12);
+  buffer.writeUInt32LE(1, 16);
+  buffer.writeUInt32LE(subcommand, 20);
+  payload.copy(buffer, 24);
+  return buffer;
+}
+
 function makeBreakpointCommand(
-  breakpoints: { address: bigint; enabled: boolean }[],
+  breakpoints: {
+    address: bigint;
+    enabled: boolean;
+    condition?: Buffer;
+  }[],
 ) {
-  const size = 20 + breakpoints.length * 16;
+  const size =
+    20 +
+    breakpoints.reduce(
+      (total, breakpoint) => total + 16 + (breakpoint.condition?.length ?? 0),
+      0,
+    );
   const buffer = Buffer.alloc(size);
   buffer.writeUInt32LE(PACKET_SIGNATURE, 0);
   buffer.writeUInt32LE(NETWORK_PACKET_SIZE, 4);
@@ -793,55 +886,312 @@ function makeBreakpointCommand(
   for (const breakpoint of breakpoints) {
     buffer.writeBigUInt64LE(breakpoint.address, offset);
     buffer.writeUInt32LE(breakpoint.enabled ? 1 : 0, offset + 8);
-    buffer.writeUInt32LE(0, offset + 12);
-    offset += 16;
+    const condition = breakpoint.condition ?? Buffer.alloc(0);
+    buffer.writeUInt32LE(condition.length, offset + 12);
+    condition.copy(buffer, offset + 16);
+    offset += 16 + condition.length;
   }
   return buffer;
 }
 
-function skipRValue(reader: GameMakerBinaryReader) {
-  const kind = reader.readU32() & 0x0fff_ffff;
+function readRValue(reader: GameMakerBinaryReader): GameMakerValue {
+  const rawKind = reader.readU32();
+  const kind = rawKind & 0x0fff_ffff;
   switch (kind) {
-    case 1:
-      reader.readUtf8String();
-      break;
     case 0:
-    case 13:
-      reader.readF64();
-      break;
-    case 2:
-    case 3:
-    case 10:
-    case 15:
-      reader.readU64();
-      break;
-    case 6:
-      reader.readU64();
-      reader.readI32();
-      break;
+      return { kind: 'real', rawKind, value: reader.readF64() };
+    case 1:
+      return { kind: 'string', rawKind, value: reader.readUtf8String() };
+    case 2: {
+      const reference = reader.readU64();
+      return { kind: 'array', rawKind, reference, value: reference };
+    }
+    case 3: {
+      const reference = reader.readU64();
+      return { kind: 'pointer', rawKind, reference, value: reference };
+    }
+    case 5:
+      return { kind: 'undefined', rawKind };
+    case 6: {
+      const reference = reader.readU64();
+      return {
+        kind: 'object',
+        rawKind,
+        reference,
+        value: reference,
+        objectKind: reader.readI32(),
+      };
+    }
     case 7:
-      reader.readI32();
-      break;
+      return { kind: 'int32', rawKind, value: reader.readI32() };
+    case 10:
+      return { kind: 'int64', rawKind, value: reader.readU64() };
+    case 12:
+      return { kind: 'null', rawKind };
+    case 13:
+      return { kind: 'bool', rawKind, value: reader.readF64() !== 0 };
+    case 15: {
+      const reference = reader.readU64();
+      return { kind: 'ref', rawKind, reference, value: reference };
+    }
+    default:
+      return { kind: 'invalid', rawKind };
   }
 }
 
-function skipInstanceId(reader: GameMakerBinaryReader, version: number) {
+function readInstanceValue(reader: GameMakerBinaryReader, version: number) {
   const id = reader.readU32();
-  if (version >= 13 && id === NULL_U32) skipRValue(reader);
+  if (version >= 13 && id === NULL_U32) return readRValue(reader);
+  return {
+    kind: 'ref',
+    rawKind: 15,
+    value: BigInt(id),
+    reference: BigInt(id),
+    instanceId: id,
+  } satisfies GameMakerValue;
 }
 
-function skipLocalVariable(
+function readVariableName(
   reader: GameMakerBinaryReader,
   version: number,
   metadata: GameMakerDebugMetadata,
+  inlineVersion: number,
 ) {
   const nameId = reader.readI32();
-  if (nameId === -1 && version >= 19) {
-    reader.readString();
-  } else if (version >= 15) {
-    metadata.variableName(nameId);
+  if (nameId === -1 && version >= inlineVersion) return reader.readString();
+  return metadata.variableName(nameId) ?? '<unknown>';
+}
+
+function readLocalVariable(
+  reader: GameMakerBinaryReader,
+  version: number,
+  metadata: GameMakerDebugMetadata,
+): GameMakerVariable {
+  return {
+    name: readVariableName(reader, version, metadata, 19),
+    value: readRValue(reader),
+  };
+}
+
+function readGlobalVariable(
+  reader: GameMakerBinaryReader,
+  version: number,
+  metadata: GameMakerDebugMetadata,
+): GameMakerVariable {
+  const nameId = reader.readI32();
+  let name: string;
+  if (nameId === -1 && version >= 18) {
+    name = reader.readString();
+  } else {
+    const lookupId = nameId < 100_000 ? nameId + 100_000 : nameId;
+    name =
+      metadata.variableName(lookupId) ??
+      metadata.variableName(nameId) ??
+      '<unknown>';
   }
-  skipRValue(reader);
+  return { name, value: readRValue(reader) };
+}
+
+function scalarValue(
+  kind: 'real' | 'int32' | 'bool',
+  value: number | boolean,
+): GameMakerValue {
+  return {
+    kind,
+    rawKind: kind === 'real' ? 0 : kind === 'int32' ? 7 : 13,
+    value,
+  };
+}
+
+function readInstance(
+  reader: GameMakerBinaryReader,
+  version: number,
+  metadata: GameMakerDebugMetadata,
+  includeBuiltins: boolean,
+) {
+  const variables: GameMakerVariable[] = [];
+  if (!includeBuiltins) {
+    const count = reader.readU32();
+    for (let index = 0; index < count; index++) {
+      variables.push({
+        name: reader.readString(),
+        value: readRValue(reader),
+      });
+    }
+    return { variables };
+  }
+
+  const id = reader.readU32();
+  const builtins: GameMakerVariable[] = [];
+  const addReal = (name: string, value: number) =>
+    builtins.push({ name, value: scalarValue('real', value) });
+  const addInt = (name: string, value: number) =>
+    builtins.push({ name, value: scalarValue('int32', value) });
+  const addBool = (name: string, value: boolean) =>
+    builtins.push({ name, value: scalarValue('bool', value) });
+  const addValue = (name: string, value: GameMakerValue) =>
+    builtins.push({ name, value });
+
+  const objectIndex = reader.readU32();
+  const x = reader.readF32();
+  const y = reader.readF32();
+  const direction = reader.readF32();
+  const friction = reader.readF32();
+  const gravity = reader.readF32();
+  const gravityDirection = reader.readF32();
+  const hspeed = reader.readF32();
+  const vspeed = reader.readF32();
+  const speed = reader.readF32();
+  const xprevious = reader.readF32();
+  const yprevious = reader.readF32();
+  const spriteIndex = reader.readI32();
+  const imageAlpha = reader.readF32();
+  const imageAngle = reader.readF32();
+  const imageBlend = reader.readU32();
+  const imageIndex = reader.readF32();
+  const imageNumber = reader.readI32();
+  const imageSpeed = reader.readF32();
+  const imageXscale = reader.readF32();
+  const imageYscale = reader.readF32();
+  const alarms = Array.from({ length: 12 }, () => reader.readI32());
+  const pathIndex = reader.readI32();
+  const pathPosition = reader.readF32();
+  const pathPositionPrevious = reader.readF32();
+  const pathEndAction = reader.readF32();
+  const pathScale = reader.readF32();
+  const pathSpeed = reader.readF32();
+  const pathOrientation = reader.readF32();
+  const xstart = reader.readF32();
+  const ystart = reader.readF32();
+  const persistent = reader.readU32() !== 0;
+  const depth = reader.readF32();
+  const visible = reader.readU32() !== 0;
+  const maskIndex = reader.readI32();
+  const solid = reader.readU32() !== 0;
+  const bboxTop = reader.readF32();
+  const bboxBottom = reader.readF32();
+  const bboxLeft = reader.readF32();
+  const bboxRight = reader.readF32();
+  const spriteWidth = reader.readF32();
+  const spriteHeight = reader.readF32();
+  const spriteXoffset = reader.readF32();
+  const spriteYoffset = reader.readF32();
+  const phyActive = reader.readU32() !== 0;
+  const phyFixedRotation = reader.readU32() !== 0;
+  const phyAngularVelocity = reader.readF32();
+  const phyLinearVelocityX = reader.readF32();
+  const phyLinearVelocityY = reader.readF32();
+  const phySpeedX = reader.readF32();
+  const phySpeedY = reader.readF32();
+  const phyPositionX = reader.readF32();
+  const phyPositionY = reader.readF32();
+  const phyRotation = reader.readF32();
+  const phyBullet = reader.readU32() !== 0;
+  const phyComX = reader.readF32();
+  const phyComY = reader.readF32();
+  const phyDynamic = reader.readU32() !== 0;
+  const phyKinematic = reader.readU32() !== 0;
+  const phyInertia = reader.readF32();
+  const phyMass = reader.readF32();
+  const phySleeping = reader.readU32() !== 0;
+  const timelineIndex = reader.readI32();
+  const timelineRunning = reader.readU32() !== 0;
+  const timelineSpeed = reader.readF32();
+  const timelinePosition = reader.readF32();
+  const timelineLoop = reader.readU32() !== 0;
+  let layer: GameMakerValue | undefined;
+  if (version >= 21) layer = readRValue(reader);
+  else if (version >= 5) layer = scalarValue('real', reader.readF32());
+  const sequenceInstance = version >= 16 ? readRValue(reader) : undefined;
+  const onUiLayer = version >= 22 ? reader.readU32() !== 0 : undefined;
+  const collisionSpace = version >= 22 ? reader.readU32() : undefined;
+
+  addInt('id', id);
+  addInt('object_index', objectIndex);
+  addReal('x', x);
+  addReal('y', y);
+  addReal('direction', direction);
+  addReal('friction', friction);
+  addReal('gravity', gravity);
+  addReal('gravity_direction', gravityDirection);
+  addReal('hspeed', hspeed);
+  addReal('vspeed', vspeed);
+  addReal('speed', speed);
+  addReal('xstart', xstart);
+  addReal('ystart', ystart);
+  addReal('xprevious', xprevious);
+  addReal('yprevious', yprevious);
+  addReal('bbox_top', bboxTop);
+  addReal('bbox_bottom', bboxBottom);
+  addReal('bbox_left', bboxLeft);
+  addReal('bbox_right', bboxRight);
+  addInt('sprite_index', spriteIndex);
+  addInt('mask_index', maskIndex);
+  addReal('image_alpha', imageAlpha);
+  addReal('image_angle', imageAngle);
+  addInt('image_blend', imageBlend);
+  addReal('image_index', imageIndex);
+  addInt('image_number', imageNumber);
+  addReal('image_speed', imageSpeed);
+  addReal('image_xscale', imageXscale);
+  addReal('image_yscale', imageYscale);
+  addReal('sprite_width', spriteWidth);
+  addReal('sprite_height', spriteHeight);
+  addReal('sprite_xoffset', spriteXoffset);
+  addReal('sprite_yoffset', spriteYoffset);
+  addReal('depth', depth);
+  if (layer) addValue('layer', layer);
+  addBool('persistent', persistent);
+  addBool('solid', solid);
+  addBool('visible', visible);
+  alarms.forEach((value, index) => addInt(`alarm[${index}]`, value));
+  addInt('path_index', pathIndex);
+  addReal('path_position', pathPosition);
+  addReal('path_positionprevious', pathPositionPrevious);
+  addReal('path_endaction', pathEndAction);
+  addReal('path_scale', pathScale);
+  addReal('path_speed', pathSpeed);
+  addReal('path_orientation', pathOrientation);
+  addBool('phy_active', phyActive);
+  addBool('phy_fixed_rotation', phyFixedRotation);
+  addReal('phy_angular_velocity', phyAngularVelocity);
+  addReal('phy_linear_velocity_x', phyLinearVelocityX);
+  addReal('phy_linear_velocity_y', phyLinearVelocityY);
+  addReal('phy_speed_x', phySpeedX);
+  addReal('phy_speed_y', phySpeedY);
+  addReal('phy_position_x', phyPositionX);
+  addReal('phy_position_y', phyPositionY);
+  addReal('phy_rotation', phyRotation);
+  addBool('phy_bullet', phyBullet);
+  addReal('phy_com_x', phyComX);
+  addReal('phy_com_y', phyComY);
+  addBool('phy_dynamic', phyDynamic);
+  addBool('phy_kinematic', phyKinematic);
+  addReal('phy_inertia', phyInertia);
+  addReal('phy_mass', phyMass);
+  addBool('phy_sleeping', phySleeping);
+  addInt('timeline_index', timelineIndex);
+  addBool('timeline_running', timelineRunning);
+  addReal('timeline_speed', timelineSpeed);
+  addReal('timeline_position', timelinePosition);
+  addBool('timeline_loop', timelineLoop);
+  if (sequenceInstance) addValue('sequence_instance', sequenceInstance);
+  if (onUiLayer !== undefined) addBool('on_ui_layer', onUiLayer);
+  if (collisionSpace !== undefined) addInt('collision_space', collisionSpace);
+
+  variables.push({
+    name: 'Built-In Variables',
+    value: { kind: 'object', rawKind: 6, objectKind: -1 },
+    children: builtins,
+  });
+  const userCount = reader.readU32();
+  for (let index = 0; index < userCount; index++) {
+    variables.push({
+      name: readVariableName(reader, version, metadata, 17),
+      value: readRValue(reader),
+    });
+  }
+  return { variables, builtins, id };
 }
 
 function unwrapSingleBatch(
@@ -1021,8 +1371,98 @@ export class GameMakerProtocolClient extends EventEmitter<GameMakerProtocolEvent
     return this.enqueue(() => this.write(buffer));
   }
 
-  async setBreakpoints(breakpoints: { address: bigint; enabled: boolean }[]) {
+  async setBreakpoints(
+    breakpoints: {
+      address: bigint;
+      enabled: boolean;
+      condition?: Buffer;
+    }[],
+  ) {
     await this.send(makeBreakpointCommand(breakpoints));
+  }
+
+  async fetchArray(arrayId: bigint, startIndex = -1) {
+    const payload = Buffer.alloc(16);
+    payload.writeUInt32LE(1, 0);
+    payload.writeBigUInt64LE(arrayId, 4);
+    payload.writeInt32LE(startIndex, 12);
+    const body = await this.request(
+      makeBatchPayload(command.getArrays, payload),
+    );
+    const reader = unwrapSingleBatch(body, command.getArrays);
+    const responseCount = reader.readI32();
+    if (responseCount < 1) return [];
+    const returnedId = reader.readU64();
+    reader.readI32();
+    reader.readI32();
+    const count = reader.readI32();
+    const variables: GameMakerVariable[] = [];
+    for (let index = 0; index < count; index++) {
+      variables.push({ name: `[${index}]`, value: readRValue(reader) });
+    }
+    if (returnedId !== arrayId) {
+      throw new Error('Runner returned data for a different GameMaker array.');
+    }
+    return variables;
+  }
+
+  async fetchObject(objectId: bigint) {
+    const payload = Buffer.alloc(12);
+    payload.writeUInt32LE(1, 0);
+    payload.writeBigUInt64LE(objectId, 4);
+    const body = await this.request(
+      makeBatchPayload(command.getJsInstanceData, payload),
+    );
+    const reader = unwrapSingleBatch(body, command.getJsInstanceData);
+    if (reader.readI32() < 1) return [];
+    const returnedId = reader.readU64();
+    const exists = reader.readU32() !== 0;
+    if (returnedId !== objectId) {
+      throw new Error('Runner returned data for a different GameMaker struct.');
+    }
+    if (!exists) return [];
+    return readInstance(reader, this.metadata!.version, this.metadata!, false)
+      .variables;
+  }
+
+  async fetchInstance(instanceId: number) {
+    const payload = Buffer.alloc(8);
+    payload.writeUInt32LE(1, 0);
+    payload.writeUInt32LE(instanceId >>> 0, 4);
+    const body = await this.request(
+      makeBatchPayload(command.getInstanceData, payload),
+    );
+    const reader = unwrapSingleBatch(body, command.getInstanceData);
+    if (reader.readI32() < 1) return [];
+    const returnedId = reader.readU32();
+    const exists = reader.readU32() !== 0;
+    if (returnedId !== instanceId >>> 0) {
+      throw new Error(
+        'Runner returned data for a different GameMaker instance.',
+      );
+    }
+    if (!exists) return [];
+    return readInstance(reader, this.metadata!.version, this.metadata!, true)
+      .variables;
+  }
+
+  async evaluate(vmBytes: Buffer, fetchId: number) {
+    const payload = Buffer.alloc(8 + vmBytes.length);
+    payload.writeUInt32LE(1, 0);
+    payload.writeUInt32LE(fetchId >>> 0, 4);
+    vmBytes.copy(payload, 8);
+    const body = await this.request(
+      makeBatchPayload(command.getWatches, payload),
+    );
+    const reader = unwrapSingleBatch(body, command.getWatches);
+    if (reader.readI32() < 1) {
+      throw new Error('GameMaker did not return an evaluation result.');
+    }
+    const returnedId = reader.readU32();
+    if (returnedId !== fetchId >>> 0) {
+      throw new Error('GameMaker returned a mismatched evaluation result.');
+    }
+    return readRValue(reader);
   }
 
   async start() {
@@ -1098,7 +1538,7 @@ export class GameMakerProtocolClient extends EventEmitter<GameMakerProtocolEvent
 
   private async readStoppedState(): Promise<GameMakerStoppedState> {
     const body = await this.request(
-      makeBatch(command.getUpdate, [requestFlag.callStack]),
+      makeBatch(command.getUpdate, [stoppedRequestFlags]),
     );
     const reader = unwrapSingleBatch(body, command.getUpdate);
     const isStopped = reader.readU32() !== 0;
@@ -1110,24 +1550,27 @@ export class GameMakerProtocolClient extends EventEmitter<GameMakerProtocolEvent
     const baseAddress = reader.readU64();
     const frames: GameMakerStackFrame[] = [];
     if (baseAddress === NULL_POINTER) {
-      return { reason: this.expectedStopReason, frames };
+      const globals = this.readGlobals(reader);
+      return { reason: this.expectedStopReason, frames, globals };
     }
 
     const address = reader.readU32();
-    skipInstanceId(reader, this.metadata!.version);
-    skipInstanceId(reader, this.metadata!.version);
+    const self = readInstanceValue(reader, this.metadata!.version);
+    const other = readInstanceValue(reader, this.metadata!.version);
     const currentScript = this.metadata!.scriptForAddress(baseAddress, address);
 
     const localCount = reader.readU32();
+    const currentLocals: GameMakerVariable[] = [];
     for (let index = 0; index < localCount; index++) {
-      skipLocalVariable(reader, this.metadata!.version, this.metadata!);
-    }
-    const includesSelf = reader.readU32() !== 0;
-    if (includesSelf) {
-      throw new Error(
-        'Runner returned unexpected self-instance data for a call-stack-only request.',
+      currentLocals.push(
+        readLocalVariable(reader, this.metadata!.version, this.metadata!),
       );
     }
+    const includesSelf = reader.readU32() !== 0;
+    const selfInstance = includesSelf
+      ? readInstance(reader, this.metadata!.version, this.metadata!, true)
+          .variables
+      : undefined;
 
     const currentArgumentCount = reader.readU32();
     if (currentArgumentCount === NULL_U32) {
@@ -1136,17 +1579,35 @@ export class GameMakerProtocolClient extends EventEmitter<GameMakerProtocolEvent
           name: currentScript.displayName || currentScript.name,
           line: this.metadata!.lineForAddress(currentScript, address),
           script: currentScript,
+          address,
+          locals: currentLocals,
+          self,
+          other,
         });
       }
-      return { reason: this.expectedStopReason, frames };
+      const globals = this.readGlobals(reader);
+      return {
+        reason: this.expectedStopReason,
+        frames,
+        globals,
+        selfInstance,
+      };
     }
-    for (let index = 0; index < currentArgumentCount; index++)
-      skipRValue(reader);
+    for (let index = 0; index < currentArgumentCount; index++) {
+      currentLocals.push({
+        name: currentScript?.argumentNames?.[index] ?? `argument${index}`,
+        value: readRValue(reader),
+      });
+    }
     if (currentScript) {
       frames.push({
         name: currentScript.displayName || currentScript.name,
         line: this.metadata!.lineForAddress(currentScript, address),
         script: currentScript,
+        address,
+        locals: currentLocals,
+        self,
+        other,
       });
     }
 
@@ -1154,23 +1615,56 @@ export class GameMakerProtocolClient extends EventEmitter<GameMakerProtocolEvent
     for (let frameIndex = 0; frameIndex < frameCount; frameIndex++) {
       const frameBase = reader.readU64();
       const frameAddress = reader.readU32();
-      skipInstanceId(reader, this.metadata!.version);
-      skipInstanceId(reader, this.metadata!.version);
+      const frameSelf = readInstanceValue(reader, this.metadata!.version);
+      const frameOther = readInstanceValue(reader, this.metadata!.version);
       const argumentCount = reader.readU32();
-      for (let index = 0; index < argumentCount; index++) skipRValue(reader);
+      const argumentValues: GameMakerValue[] = [];
+      for (let index = 0; index < argumentCount; index++) {
+        argumentValues.push(readRValue(reader));
+      }
       const frameLocalCount = reader.readU32();
+      const frameLocals: GameMakerVariable[] = [];
       for (let index = 0; index < frameLocalCount; index++) {
-        skipLocalVariable(reader, this.metadata!.version, this.metadata!);
+        frameLocals.push(
+          readLocalVariable(reader, this.metadata!.version, this.metadata!),
+        );
       }
       const script = this.metadata!.scriptForAddress(frameBase, frameAddress);
       if (!script) continue;
+      for (let index = 0; index < argumentValues.length; index++) {
+        frameLocals.push({
+          name: script.argumentNames?.[index] ?? `argument${index}`,
+          value: argumentValues[index]!,
+        });
+      }
       frames.push({
         name: script.displayName || script.name,
         line: this.metadata!.lineForAddress(script, frameAddress),
         script,
+        address: frameAddress,
+        locals: frameLocals,
+        self: frameSelf,
+        other: frameOther,
       });
     }
-    return { reason: this.expectedStopReason, frames };
+    const globals = this.readGlobals(reader);
+    return {
+      reason: this.expectedStopReason,
+      frames,
+      globals,
+      selfInstance,
+    };
+  }
+
+  private readGlobals(reader: GameMakerBinaryReader) {
+    const count = reader.readU32();
+    const globals: GameMakerVariable[] = [];
+    for (let index = 0; index < count; index++) {
+      globals.push(
+        readGlobalVariable(reader, this.metadata!.version, this.metadata!),
+      );
+    }
+    return globals;
   }
 
   async close() {
