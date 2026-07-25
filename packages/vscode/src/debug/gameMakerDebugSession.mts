@@ -1,6 +1,7 @@
 import {
   Breakpoint,
   ContinuedEvent,
+  ErrorDestination,
   InitializedEvent,
   LoggingDebugSession,
   OutputEvent,
@@ -80,11 +81,7 @@ function canonicalSource(sourcePath: string) {
 }
 
 async function findAvailablePort() {
-  for (
-    let port = GAMEMAKER_DEBUG_PORT_FIRST;
-    port <= GAMEMAKER_DEBUG_PORT_LAST;
-    port += 1
-  ) {
+  for (const port of debugPortCandidates()) {
     const server = net.createServer();
     const available = await new Promise<boolean>((resolve) => {
       server.once('error', () => resolve(false));
@@ -98,6 +95,16 @@ async function findAvailablePort() {
   }
   throw new Error(
     `Could not allocate a GameMaker debugger port in the supported range ${GAMEMAKER_DEBUG_PORT_FIRST}-${GAMEMAKER_DEBUG_PORT_LAST}.`,
+  );
+}
+
+function debugPortCandidates(randomValue = Math.random()) {
+  const count = GAMEMAKER_DEBUG_PORT_LAST - GAMEMAKER_DEBUG_PORT_FIRST + 1;
+  const normalized = Math.max(0, Math.min(0.999_999_999_999, randomValue));
+  const start = Math.floor(normalized * count);
+  return Array.from(
+    { length: count },
+    (_, offset) => GAMEMAKER_DEBUG_PORT_FIRST + ((start + offset) % count),
   );
 }
 
@@ -117,9 +124,11 @@ export class GameMakerDebugSession extends LoggingDebugSession {
   private stoppedState?: GameMakerStoppedState;
   private configured = false;
   private ending = false;
+  private disposed = false;
   private nextSourceReference = 1;
   private nextVariableReference = 1;
   private nextEvaluateId = 1;
+  private readonly staleReferenceWarnings = new Set<number>();
 
   constructor(private readonly host: GameMakerDebugSessionHost) {
     super();
@@ -127,21 +136,30 @@ export class GameMakerDebugSession extends LoggingDebugSession {
     this.setDebuggerColumnsStartAt1(true);
 
     this.protocol.on('stopped', (state) => {
+      if (this.disposed) return;
       this.stoppedState = state;
       this.resetVariableReferences();
       this.sendEvent(new StoppedEvent(state.reason, THREAD_ID));
     });
     this.protocol.on('continued', () => {
+      if (this.disposed) return;
       this.stoppedState = undefined;
       this.resetVariableReferences();
       this.sendEvent(new ContinuedEvent(THREAD_ID, true));
     });
     this.protocol.on('terminated', (error) => {
+      if (this.disposed) return;
       if (error) {
         this.sendEvent(new OutputEvent(`${error.message}\n`, 'stderr'));
       }
       if (!this.ending) this.sendEvent(new TerminatedEvent());
     });
+  }
+
+  override dispose() {
+    this.disposed = true;
+    void this.endSession();
+    super.dispose();
   }
 
   protected override initializeRequest(
@@ -174,14 +192,22 @@ export class GameMakerDebugSession extends LoggingDebugSession {
         ),
       );
       await this.host.launch(args, port);
+      if (this.ending) {
+        await this.host.stop(args);
+        return;
+      }
       await this.protocol.connect('127.0.0.1', port);
+      if (this.ending) return;
       const metadata = this.protocol.metadata;
       if (!metadata)
         throw new Error('GameMaker debugger metadata was not loaded.');
       metadata.mapSources(await this.host.loadSources(args));
+      if (this.ending) return;
       if (this.host.expressionCompilerOptions) {
+        const compilerOptions = await this.host.expressionCompilerOptions(args);
+        if (this.ending) return;
         this.expressionCompiler = new GameMakerExpressionCompiler(
-          await this.host.expressionCompilerOptions(args),
+          compilerOptions,
         );
       }
       this.sendEvent(
@@ -193,6 +219,7 @@ export class GameMakerDebugSession extends LoggingDebugSession {
       this.sendEvent(new InitializedEvent());
       this.sendResponse(response);
     } catch (error) {
+      if (this.ending) return;
       const message = error instanceof Error ? error.message : String(error);
       await this.endSession();
       this.sendErrorResponse(response, 1001, message);
@@ -341,7 +368,11 @@ export class GameMakerDebugSession extends LoggingDebugSession {
   ) {
     const frame = this.stoppedState?.frames[args.frameId - 1];
     if (!frame || !this.stoppedState) {
-      this.sendErrorResponse(response, 1005, 'Unknown GameMaker stack frame.');
+      this.sendStaleReferenceError(
+        response,
+        1005,
+        'Ignored a stale GameMaker stack-frame request after execution resumed.',
+      );
       return;
     }
 
@@ -397,10 +428,10 @@ export class GameMakerDebugSession extends LoggingDebugSession {
   ) {
     const container = this.variableContainers.get(args.variablesReference);
     if (!container || !this.stoppedState) {
-      this.sendErrorResponse(
+      this.sendStaleReferenceError(
         response,
         1006,
-        'This GameMaker variable reference is no longer valid.',
+        'Ignored a stale GameMaker variable request after execution resumed.',
       );
       return;
     }
@@ -525,10 +556,10 @@ export class GameMakerDebugSession extends LoggingDebugSession {
   ) {
     const script = this.sourceReferences.get(args.sourceReference);
     if (!script) {
-      this.sendErrorResponse(
+      this.sendStaleReferenceError(
         response,
         1003,
-        'Unknown GameMaker source reference.',
+        `Ignored a stale GameMaker source request (reference ${args.sourceReference}).`,
       );
       return;
     }
@@ -622,6 +653,23 @@ export class GameMakerDebugSession extends LoggingDebugSession {
       1004,
       error instanceof Error ? error.message : String(error),
     );
+  }
+
+  private sendStaleReferenceError(
+    response: DebugProtocol.Response,
+    id: number,
+    message: string,
+  ) {
+    this.sendErrorResponse(
+      response,
+      id,
+      message,
+      undefined,
+      0 as ErrorDestination,
+    );
+    if (this.staleReferenceWarnings.has(id) || this.disposed) return;
+    this.staleReferenceWarnings.add(id);
+    this.sendEvent(new OutputEvent(`${message}\n`, 'console'));
   }
 
   private async syncBreakpoints(force = false) {
@@ -922,3 +970,8 @@ export class GameMakerDebugSession extends LoggingDebugSession {
     }
   }
 }
+
+export const gameMakerDebugSessionInternals = {
+  debugPortCandidates,
+  findAvailablePort,
+};

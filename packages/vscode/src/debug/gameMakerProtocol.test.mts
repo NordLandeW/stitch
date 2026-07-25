@@ -1,9 +1,15 @@
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
+import net from 'node:net';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
-import { GameMakerDebugSession } from './gameMakerDebugSession.mjs';
+import {
+  GameMakerDebugSession,
+  gameMakerDebugSessionInternals,
+} from './gameMakerDebugSession.mjs';
 import {
   GameMakerDebugMetadata,
+  GameMakerProtocolClient,
   gameMakerProtocolInternals,
 } from './gameMakerProtocol.mjs';
 
@@ -158,6 +164,149 @@ test('advertises the DAP controls implemented by the GameMaker session', async (
   assert.equal(initialize.body.supportsConditionalBreakpoints, true);
   assert.equal(initialize.body.supportsEvaluateForHovers, true);
   assert.equal(initialize.body.supportsSetVariable, true);
+  input.destroy();
+  output.destroy();
+});
+
+test('scans every safe GameMaker debugger port from a random start', () => {
+  const ports = gameMakerDebugSessionInternals.debugPortCandidates(0.5);
+
+  assert.equal(ports.length, 1_000);
+  assert.equal(new Set(ports).size, ports.length);
+  assert.equal(ports[0], 7_009);
+  assert.equal(ports.at(-1), 7_008);
+  assert.equal(Math.min(...ports), 6_509);
+  assert.equal(Math.max(...ports), 7_508);
+});
+
+test('cancels an in-flight GameMaker debugger handshake immediately', async () => {
+  const server = net.createServer();
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  assert(address && typeof address === 'object');
+
+  const client = new GameMakerProtocolClient();
+  const connecting = client.connect('127.0.0.1', address.port, 10_000);
+  const [socket] = (await once(server, 'connection')) as [net.Socket];
+  const socketClosed = once(socket, 'close');
+  const started = Date.now();
+  await client.close();
+  await socketClosed;
+
+  await assert.rejects(connecting, /cancelled/i);
+  assert(Date.now() - started < 1_000);
+  server.close();
+  await once(server, 'close');
+});
+
+test('disposing an inline GameMaker adapter stops a pending launch', async () => {
+  const server = net.createServer();
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  assert(address && typeof address === 'object');
+
+  let stopResolve: (() => void) | undefined;
+  const stopped = new Promise<void>((resolve) => {
+    stopResolve = resolve;
+  });
+  const session = new GameMakerDebugSession({
+    async launch() {},
+    async stop() {
+      stopResolve?.();
+    },
+    async loadSources() {
+      return [];
+    },
+  });
+  const input = new PassThrough();
+  const output = new PassThrough();
+  session.start(input, output);
+  const launch = JSON.stringify({
+    seq: 1,
+    type: 'request',
+    command: 'launch',
+    arguments: {
+      type: 'gamemaker',
+      request: 'launch',
+      name: 'Dispose test',
+      project: 'test.yyp',
+      debuggerPort: address.port,
+    },
+  });
+  input.write(`Content-Length: ${Buffer.byteLength(launch)}\r\n\r\n${launch}`);
+  const [socket] = (await once(server, 'connection')) as [net.Socket];
+  const socketClosed = once(socket, 'close');
+
+  session.dispose();
+  await Promise.all([stopped, socketClosed]);
+  input.destroy();
+  output.destroy();
+  server.close();
+  await once(server, 'close');
+});
+
+test('reports stale stack frames in the Debug Console without a popup', async () => {
+  const session = new GameMakerDebugSession({
+    async launch() {},
+    async stop() {},
+    async loadSources() {
+      return [];
+    },
+  });
+  const input = new PassThrough();
+  const output = new PassThrough();
+  session.start(input, output);
+
+  let received = Buffer.alloc(0);
+  const messages: any[] = [];
+  const completed = new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error('Timed out reading stale-frame responses.')),
+      2_000,
+    );
+    output.on('data', (data) => {
+      received = Buffer.concat([received, Buffer.from(data)]);
+      for (;;) {
+        const headerEnd = received.indexOf('\r\n\r\n');
+        if (headerEnd < 0) break;
+        const header = received.subarray(0, headerEnd).toString('ascii');
+        const size = Number(/Content-Length: (\d+)/i.exec(header)?.[1]);
+        const bodyStart = headerEnd + 4;
+        if (!size || received.length < bodyStart + size) break;
+        messages.push(
+          JSON.parse(
+            received.subarray(bodyStart, bodyStart + size).toString('utf8'),
+          ),
+        );
+        received = received.subarray(bodyStart + size);
+      }
+      if (messages.length < 2) return;
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
+  const scopes = JSON.stringify({
+    seq: 1,
+    type: 'request',
+    command: 'scopes',
+    arguments: { frameId: 99 },
+  });
+  input.write(`Content-Length: ${Buffer.byteLength(scopes)}\r\n\r\n${scopes}`);
+
+  await completed;
+  const response = messages.find(
+    (message) => message.type === 'response' && message.command === 'scopes',
+  );
+  const outputEvent = messages.find(
+    (message) => message.type === 'event' && message.event === 'output',
+  );
+  assert.equal(response.success, false);
+  assert.equal(response.body.error.showUser, undefined);
+  assert.match(outputEvent.body.output, /stale GameMaker stack-frame/);
+  assert.equal(outputEvent.body.category, 'console');
+  session.dispose();
   input.destroy();
   output.destroy();
 });

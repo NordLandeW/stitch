@@ -822,6 +822,20 @@ class SocketReader {
 }
 
 class GameMakerDebuggerUnavailableError extends Error {}
+class GameMakerDebuggerClosedError extends Error {}
+
+function waitForDelay(milliseconds: number, signal: AbortSignal) {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, milliseconds);
+    signal.addEventListener('abort', finish, { once: true });
+  });
+}
 
 function makeCommand(commandId: number, args: number[] = []) {
   const buffer = Buffer.alloc(NETWORK_PACKET_SIZE);
@@ -1237,6 +1251,7 @@ export class GameMakerProtocolClient extends EventEmitter<GameMakerProtocolEvent
   private pingId = 0;
   private running = false;
   private closed = false;
+  private readonly closeController = new AbortController();
   private expectedStopReason: GameMakerStoppedState['reason'] = 'breakpoint';
 
   async connect(host: string, port: number, timeout = 180_000) {
@@ -1251,11 +1266,21 @@ export class GameMakerProtocolClient extends EventEmitter<GameMakerProtocolEvent
         this.socket?.destroy();
         this.socket = undefined;
         this.reader = undefined;
+        if (this.closed) {
+          throw new GameMakerDebuggerClosedError(
+            'GameMaker debugger connection was cancelled.',
+          );
+        }
         if (!(lastError instanceof GameMakerDebuggerUnavailableError)) {
           throw lastError;
         }
-        await new Promise((resolve) => setTimeout(resolve, 250));
+        await waitForDelay(250, this.closeController.signal);
       }
+    }
+    if (this.closed) {
+      throw new GameMakerDebuggerClosedError(
+        'GameMaker debugger connection was cancelled.',
+      );
     }
     throw new Error(
       `Could not connect to the GameMaker debugger on ${host}:${port}: ${lastError?.message ?? 'timed out'}`,
@@ -1265,29 +1290,42 @@ export class GameMakerProtocolClient extends EventEmitter<GameMakerProtocolEvent
   private async connectOnce(host: string, port: number) {
     const socket = new net.Socket();
     const reader = new SocketReader(socket);
+    this.socket = socket;
+    this.reader = reader;
     await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        socket.off('error', onError);
+        socket.off('close', onClose);
+        if (error) reject(error);
+        else resolve();
+      };
       const timeout = setTimeout(() => {
         socket.destroy();
-        reject(
+        finish(
           new GameMakerDebuggerUnavailableError(
             'Connection attempt timed out.',
           ),
         );
       }, 1_000);
-      const onError = (error: Error) => {
-        clearTimeout(timeout);
-        reject(new GameMakerDebuggerUnavailableError(error.message));
-      };
+      const onError = (error: Error) =>
+        finish(new GameMakerDebuggerUnavailableError(error.message));
+      const onClose = () =>
+        finish(
+          new GameMakerDebuggerUnavailableError(
+            'Debugger connection attempt was closed.',
+          ),
+        );
       socket.once('error', onError);
+      socket.once('close', onClose);
       socket.connect(port, host, () => {
-        clearTimeout(timeout);
-        socket.off('error', onError);
-        resolve();
+        finish();
       });
     });
     socket.setNoDelay(true);
-    this.socket = socket;
-    this.reader = reader;
 
     const greeting = await reader.readExactly(
       Buffer.byteLength('GM:Studio-Connect') + 1,
@@ -1670,15 +1708,20 @@ export class GameMakerProtocolClient extends EventEmitter<GameMakerProtocolEvent
   async close() {
     if (this.closed) return;
     this.closed = true;
+    this.closeController.abort();
     if (this.pollTimer) clearTimeout(this.pollTimer);
-    try {
-      // Do not enqueue shutdown behind an in-flight poll. A disconnected or
-      // wedged Runner can otherwise keep Debug: Stop waiting indefinitely.
-      await this.write(makeCommand(command.quitDebugger));
-    } catch {
-      // The Runner may already have closed its socket.
+    if (this.metadata) {
+      try {
+        // Do not enqueue shutdown behind an in-flight poll. A disconnected or
+        // wedged Runner can otherwise keep Debug: Stop waiting indefinitely.
+        await this.write(makeCommand(command.quitDebugger));
+      } catch {
+        // The Runner may already have closed its socket.
+      }
     }
     this.socket?.destroy();
+    this.socket = undefined;
+    this.reader = undefined;
   }
 }
 
