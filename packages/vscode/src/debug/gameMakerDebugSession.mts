@@ -173,7 +173,12 @@ export class GameMakerDebugSession extends LoggingDebugSession {
     response.body.supportTerminateDebuggee = true;
     response.body.supportsConditionalBreakpoints = true;
     response.body.supportsFunctionBreakpoints = false;
-    response.body.supportsEvaluateForHovers = true;
+    // Let VS Code resolve debug hovers from the current scopes. When no
+    // runtime variable matches (for example a function or a compile-time
+    // macro), it falls back to Stitch's language hover instead of evaluating
+    // the hovered text and replacing useful source information with an opaque
+    // runtime value.
+    response.body.supportsEvaluateForHovers = false;
     response.body.supportsSetVariable = true;
     this.sendResponse(response);
   }
@@ -463,13 +468,15 @@ export class GameMakerDebugSession extends LoggingDebugSession {
     args: DebugProtocol.EvaluateArguments,
   ) {
     const state = this.stoppedState;
-    const frameId = args.frameId ?? 1;
-    const frame = state?.frames[frameId - 1];
-    if (!state || !frame || frameId !== 1 || !this.expressionCompiler) {
+    // GameMaker's watch request has no frame selector. Always compile against
+    // the frame where the Runner is currently paused, even if VS Code sends
+    // the id of a caller frame selected in the Call Stack view.
+    const frame = state?.frames[0];
+    if (!state || !frame || !this.expressionCompiler) {
       this.sendErrorResponse(
         response,
         1007,
-        'GameMaker expressions can only be evaluated in the current top frame while paused.',
+        'GameMaker expressions can only be evaluated while paused.',
       );
       return;
     }
@@ -886,6 +893,14 @@ export class GameMakerDebugSession extends LoggingDebugSession {
     return undefined;
   }
 
+  private isGlobalScriptFunction(name: string) {
+    return (this.protocol.metadata?.scripts ?? []).some(
+      (script) =>
+        script.displayName === name &&
+        script.name === `gml_Script_${script.displayName}`,
+    );
+  }
+
   private prepareExpression(
     expression: string,
     frame: GameMakerStoppedState['frames'][number],
@@ -899,6 +914,14 @@ export class GameMakerDebugSession extends LoggingDebugSession {
       state.globals.some((variable) => variable.name === trimmed)
     ) {
       prepared = prepared.replace(trimmed, `global.${trimmed}`);
+    } else {
+      // GameMaker's debugger resolves project-level script functions through
+      // the global instance. Compiling player_exists() directly resolves it
+      // against self and the Runner reports "Unable to evaluate".
+      const functionCall = /^(\s*)([A-Za-z_]\w*)\s*\(/.exec(prepared);
+      if (functionCall && this.isGlobalScriptFunction(functionCall[2]!)) {
+        prepared = `${functionCall[1]}global.${prepared.slice(functionCall[1]!.length)}`;
+      }
     }
     for (const [index, name] of (frame.script?.argumentNames ?? []).entries()) {
       const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

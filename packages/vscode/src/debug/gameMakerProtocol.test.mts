@@ -162,10 +162,102 @@ test('advertises the DAP controls implemented by the GameMaker session', async (
   assert.equal(initialize.body.supportsTerminateRequest, true);
   assert.equal(initialize.body.supportTerminateDebuggee, true);
   assert.equal(initialize.body.supportsConditionalBreakpoints, true);
-  assert.equal(initialize.body.supportsEvaluateForHovers, true);
+  assert.equal(initialize.body.supportsEvaluateForHovers, false);
   assert.equal(initialize.body.supportsSetVariable, true);
   input.destroy();
   output.destroy();
+});
+
+test('compiles watched project functions through the GameMaker global instance', async () => {
+  const session = new GameMakerDebugSession({
+    async launch() {},
+    async stop() {},
+    async loadSources() {
+      return [];
+    },
+  });
+  const internals = session as any;
+  let compilerExpression: string | undefined;
+  let compilerGlobals: string[] | undefined;
+  let compilerLocals: string[] | undefined;
+  let responseBody: any;
+  internals.stoppedState = {
+    reason: 'pause',
+    frames: [
+      {
+        name: 'debug_object.Step',
+        line: 1,
+        address: 0,
+        locals: [
+          {
+            name: 'current_execution_frame_local',
+            value: { kind: 'real', rawKind: 0, value: 1 },
+          },
+        ],
+        self: { kind: 'undefined', rawKind: 5 },
+        other: { kind: 'undefined', rawKind: 5 },
+      },
+      {
+        name: 'debug_object.Step',
+        line: 1,
+        address: 0,
+        locals: [
+          {
+            name: 'caller_frame_local',
+            value: { kind: 'real', rawKind: 0, value: 2 },
+          },
+        ],
+        self: { kind: 'undefined', rawKind: 5 },
+        other: { kind: 'undefined', rawKind: 5 },
+      },
+    ],
+    globals: [],
+  };
+  internals.protocol.metadata = new GameMakerDebugMetadata();
+  internals.protocol.metadata.scripts.push({
+    name: 'gml_Script_player_exists',
+    displayName: 'player_exists',
+  });
+  internals.expressionCompiler = {
+    async compileExpression(
+      expression: string,
+      locals: string[],
+      globals: string[],
+    ) {
+      compilerExpression = expression;
+      compilerLocals = locals;
+      compilerGlobals = globals;
+      return Buffer.from([1]);
+    },
+  };
+  internals.protocol.evaluate = async () => ({
+    kind: 'bool',
+    rawKind: 13,
+    value: true,
+  });
+  internals.sendResponse = (response: any) => {
+    responseBody = response.body;
+  };
+
+  await internals.evaluateRequest(
+    {
+      seq: 0,
+      type: 'response',
+      request_seq: 1,
+      command: 'evaluate',
+      success: true,
+    },
+    {
+      expression: 'player_exists()',
+      frameId: 2,
+      context: 'watch',
+    },
+  );
+
+  assert.deepEqual(compilerLocals, ['current_execution_frame_local']);
+  assert.equal(compilerExpression, 'global.player_exists()');
+  assert.deepEqual(compilerGlobals, []);
+  assert.equal(responseBody.result, 'true');
 });
 
 test('scans every safe GameMaker debugger port from a random start', () => {

@@ -171,9 +171,6 @@ export class GameMakerProject extends Project {
       return false;
     }
 
-    // Debug runs always use a hidden terminal. The webview runner reveals its
-    // own view before spawning Igor, which would replace the Debug sidebar the
-    // user just opened.
     if (stitchConfig.runInTerminal || options?.debug) {
       logger.info(`Running Igor`, {
         igorPath: runtime.executablePath,
@@ -210,9 +207,7 @@ export class GameMakerProject extends Project {
         });
       }
       this.runnerTerminal.sendText(cmd);
-      if (!options?.debug) {
-        this.runnerTerminal.show();
-      }
+      this.runnerTerminal.show();
     } else {
       logger.info('Computing Igor command...');
       let { cmd, args } = await loudlyLogThrownAsync(

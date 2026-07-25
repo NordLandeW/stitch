@@ -627,29 +627,14 @@
     ],
     "keybindings": [
       {
-        "command": "-debug.openView",
+        "command": "stitch.debug",
         "key": "f5",
-        "when": "editorTextFocus && !editorReadonly && resourceExtname =~ /\\.(yy|yyp|gml)$/"
-      },
-      {
-        "command": "-workbench.action.debug.start",
-        "key": "f5",
-        "when": "editorTextFocus && !editorReadonly && resourceExtname =~ /\\.(yy|yyp|gml)$/"
-      },
-      {
-        "command": "-workbench.action.debug.continue",
-        "key": "f5",
-        "when": "editorTextFocus && !editorReadonly && resourceExtname =~ /\\.(yy|yyp|gml)$/"
+        "when": "!inDebugMode && ((editorTextFocus && resourceExtname =~ /\\.(yy|yyp|gml)$/) || view == bscotch-stitch-resources)"
       },
       {
         "command": "stitch.run",
-        "key": "f5",
-        "when": "(editorTextFocus && resourceExtname =~ /\\.(yy|yyp|gml)$/) || view == bscotch-stitch-resources"
-      },
-      {
-        "command": "stitch.run.noDefaults",
-        "key": "shift+f5",
-        "when": "(editorTextFocus && resourceExtname =~ /\\.(yy|yyp|gml)$/) || view == bscotch-stitch-resources"
+        "key": "ctrl+f5",
+        "when": "!inDebugMode && ((editorTextFocus && resourceExtname =~ /\\.(yy|yyp|gml)$/) || view == bscotch-stitch-resources)"
       },
       {
         "command": "stitch.assets.rename",
