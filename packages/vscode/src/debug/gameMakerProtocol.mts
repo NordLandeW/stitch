@@ -130,10 +130,11 @@ export interface GameMakerStackFrame {
 }
 
 export interface GameMakerStoppedState {
-  reason: 'breakpoint' | 'pause' | 'step';
+  reason: 'breakpoint' | 'exception' | 'pause' | 'step';
   frames: GameMakerStackFrame[];
   globals: GameMakerVariable[];
   selfInstance?: GameMakerVariable[];
+  exceptionMessage?: string;
 }
 
 function fourCc(value: string) {
@@ -1235,6 +1236,45 @@ function unwrapSingleBatch(
   return reader;
 }
 
+function readStoppedSupplementalData(
+  reader: GameMakerBinaryReader,
+  version: number,
+) {
+  const debugOutput = reader.readString();
+
+  // These collections are present in every stopped update, with zero counts
+  // when their corresponding request flags were not set.
+  for (let index = 0; index < 6; index++) reader.readU32();
+
+  const instanceCount = reader.readU32();
+  reader.readBytes(instanceCount * 8);
+
+  const renderStateCount = reader.readU32();
+  reader.readBytes(renderStateCount * 4);
+
+  if (version >= 14) {
+    const textureCount = reader.readI32();
+    const surfaceCount = reader.readI32();
+    if (textureCount < 0 || surfaceCount < 0) {
+      throw new Error('Runner returned invalid debugger surface counts.');
+    }
+    reader.readBytes(textureCount * 4);
+    reader.readBytes(surfaceCount * 8);
+  } else if (reader.readI32() > 0) {
+    reader.readI32();
+    const surfaceCount = reader.readI32();
+    if (surfaceCount < 0) {
+      throw new Error('Runner returned an invalid debugger surface count.');
+    }
+    reader.readBytes(surfaceCount * 4);
+  }
+
+  return {
+    debugOutput,
+    exceptionMessage: reader.readString(),
+  };
+}
+
 export interface GameMakerProtocolEvents {
   stopped: [state: GameMakerStoppedState];
   continued: [];
@@ -1589,7 +1629,7 @@ export class GameMakerProtocolClient extends EventEmitter<GameMakerProtocolEvent
     const frames: GameMakerStackFrame[] = [];
     if (baseAddress === NULL_POINTER) {
       const globals = this.readGlobals(reader);
-      return { reason: this.expectedStopReason, frames, globals };
+      return this.finishStoppedState(reader, { frames, globals });
     }
 
     const address = reader.readU32();
@@ -1624,12 +1664,11 @@ export class GameMakerProtocolClient extends EventEmitter<GameMakerProtocolEvent
         });
       }
       const globals = this.readGlobals(reader);
-      return {
-        reason: this.expectedStopReason,
+      return this.finishStoppedState(reader, {
         frames,
         globals,
         selfInstance,
-      };
+      });
     }
     for (let index = 0; index < currentArgumentCount; index++) {
       currentLocals.push({
@@ -1686,11 +1725,26 @@ export class GameMakerProtocolClient extends EventEmitter<GameMakerProtocolEvent
       });
     }
     const globals = this.readGlobals(reader);
-    return {
-      reason: this.expectedStopReason,
+    return this.finishStoppedState(reader, {
       frames,
       globals,
       selfInstance,
+    });
+  }
+
+  private finishStoppedState(
+    reader: GameMakerBinaryReader,
+    state: Omit<GameMakerStoppedState, 'reason' | 'exceptionMessage'>,
+  ): GameMakerStoppedState {
+    const supplemental = readStoppedSupplementalData(
+      reader,
+      this.metadata!.version,
+    );
+    const exceptionMessage = supplemental.exceptionMessage.trim();
+    return {
+      ...state,
+      reason: exceptionMessage ? 'exception' : this.expectedStopReason,
+      exceptionMessage: exceptionMessage || undefined,
     };
   }
 
@@ -1731,5 +1785,6 @@ export const gameMakerProtocolInternals = {
   makeBreakpointCommand,
   makeCommand,
   normalizeSource,
+  readStoppedSupplementalData,
   stepType,
 };

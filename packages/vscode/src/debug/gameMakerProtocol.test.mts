@@ -8,6 +8,7 @@ import {
   gameMakerDebugSessionInternals,
 } from './gameMakerDebugSession.mjs';
 import {
+  GameMakerBinaryReader,
   GameMakerDebugMetadata,
   GameMakerProtocolClient,
   gameMakerProtocolInternals,
@@ -19,8 +20,17 @@ const {
   makeBreakpointCommand,
   makeCommand,
   normalizeSource,
+  readStoppedSupplementalData,
   stepType,
 } = gameMakerProtocolInternals;
+
+function debuggerString(value: string) {
+  const bytes = Buffer.from(value, 'latin1');
+  const result = Buffer.alloc(4 + bytes.length + 1);
+  result.writeUInt32LE(bytes.length + 1);
+  bytes.copy(result, 4);
+  return result;
+}
 
 test('encodes fixed-size GameMaker debugger commands', () => {
   const packet = makeCommand(command.singleStepLine, [stepType.over]);
@@ -162,10 +172,126 @@ test('advertises the DAP controls implemented by the GameMaker session', async (
   assert.equal(initialize.body.supportsTerminateRequest, true);
   assert.equal(initialize.body.supportTerminateDebuggee, true);
   assert.equal(initialize.body.supportsConditionalBreakpoints, true);
+  assert.equal(initialize.body.supportsExceptionInfoRequest, true);
   assert.equal(initialize.body.supportsEvaluateForHovers, false);
   assert.equal(initialize.body.supportsSetVariable, true);
   input.destroy();
   output.destroy();
+});
+
+test('reads GameMaker exception details from the end of a stopped update', async () => {
+  const u32 = (value: number) => {
+    const buffer = Buffer.alloc(4);
+    buffer.writeUInt32LE(value);
+    return buffer;
+  };
+  const u64 = (value: bigint) => {
+    const buffer = Buffer.alloc(8);
+    buffer.writeBigUInt64LE(value);
+    return buffer;
+  };
+  const body = Buffer.concat([
+    u32(command.batch),
+    u32(1),
+    u32(command.getUpdate),
+    u32(1),
+    u32(0),
+    u64(0n),
+    u64(0xffff_ffff_ffff_ffffn),
+    u32(0),
+    debuggerString('Runner debug output'),
+    ...Array.from({ length: 6 }, () => u32(0)),
+    u32(0),
+    u32(0),
+    u32(0),
+    u32(0),
+    debuggerString(
+      'Variable obj_player.health not set before reading it.',
+    ),
+  ]);
+  const client = new GameMakerProtocolClient();
+  const internals = client as any;
+  internals.metadata = { version: 17 };
+  internals.request = async () => body;
+
+  const state = await internals.readStoppedState();
+
+  assert.equal(state.reason, 'exception');
+  assert.equal(
+    state.exceptionMessage,
+    'Variable obj_player.health not set before reading it.',
+  );
+  assert.deepEqual(state.frames, []);
+  assert.deepEqual(state.globals, []);
+
+  const supplementalBuffer = Buffer.concat([
+    debuggerString('output'),
+    ...Array.from({ length: 6 }, () => u32(0)),
+    u32(2),
+    Buffer.alloc(16),
+    u32(3),
+    Buffer.alloc(12),
+    u32(2),
+    u32(1),
+    Buffer.alloc(8),
+    Buffer.alloc(8),
+    debuggerString('error'),
+  ]);
+  const supplementalReader = new GameMakerBinaryReader(supplementalBuffer);
+  assert.deepEqual(readStoppedSupplementalData(supplementalReader, 17), {
+    debugOutput: 'output',
+    exceptionMessage: 'error',
+  });
+  assert.equal(supplementalReader.remaining, 0);
+});
+
+test('reports a stopped GameMaker exception through DAP', () => {
+  const session = new GameMakerDebugSession({
+    async launch() {},
+    async stop() {},
+    async loadSources() {
+      return [];
+    },
+  });
+  const internals = session as any;
+  const events: any[] = [];
+  let responseBody: any;
+  internals.sendEvent = (event: any) => events.push(event);
+  internals.sendResponse = (response: any) => {
+    responseBody = response.body;
+  };
+  internals.protocol.emit('stopped', {
+    reason: 'exception',
+    frames: [],
+    globals: [],
+    exceptionMessage: 'GameMaker runtime error details',
+  });
+
+  const stopped = events[0];
+  assert.equal(stopped.event, 'stopped');
+  assert.equal(stopped.body.reason, 'exception');
+  assert.equal(stopped.body.description, 'Paused on GameMaker exception');
+  assert.equal(stopped.body.text, 'GameMaker runtime error details');
+
+  internals.exceptionInfoRequest(
+    {
+      seq: 0,
+      type: 'response',
+      request_seq: 1,
+      command: 'exceptionInfo',
+      success: true,
+    },
+    { threadId: 1 },
+  );
+  assert.deepEqual(responseBody, {
+    exceptionId: 'GameMaker Runtime Error',
+    description: 'GameMaker runtime error details',
+    breakMode: 'always',
+    details: {
+      message: 'GameMaker runtime error details',
+      typeName: 'GameMaker Runtime Error',
+    },
+  });
 });
 
 test('compiles watched project functions through the GameMaker global instance', async () => {

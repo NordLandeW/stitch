@@ -139,7 +139,15 @@ export class GameMakerDebugSession extends LoggingDebugSession {
       if (this.disposed) return;
       this.stoppedState = state;
       this.resetVariableReferences();
-      this.sendEvent(new StoppedEvent(state.reason, THREAD_ID));
+      const event: DebugProtocol.StoppedEvent = new StoppedEvent(
+        state.reason,
+        THREAD_ID,
+        state.exceptionMessage,
+      );
+      if (state.exceptionMessage) {
+        event.body.description = 'Paused on GameMaker exception';
+      }
+      this.sendEvent(event);
     });
     this.protocol.on('continued', () => {
       if (this.disposed) return;
@@ -172,6 +180,7 @@ export class GameMakerDebugSession extends LoggingDebugSession {
     response.body.supportsTerminateRequest = true;
     response.body.supportTerminateDebuggee = true;
     response.body.supportsConditionalBreakpoints = true;
+    response.body.supportsExceptionInfoRequest = true;
     response.body.supportsFunctionBreakpoints = false;
     // Let VS Code resolve debug hovers from the current scopes. When no
     // runtime variable matches (for example a function or a compile-time
@@ -571,6 +580,34 @@ export class GameMakerDebugSession extends LoggingDebugSession {
       return;
     }
     response.body = { content: script.text, mimeType: 'text/x-gml' };
+    this.sendResponse(response);
+  }
+
+  protected override exceptionInfoRequest(
+    response: DebugProtocol.ExceptionInfoResponse,
+    args: DebugProtocol.ExceptionInfoArguments,
+  ) {
+    const exceptionMessage =
+      args.threadId === THREAD_ID
+        ? this.stoppedState?.exceptionMessage
+        : undefined;
+    if (!exceptionMessage) {
+      this.sendErrorResponse(
+        response,
+        1009,
+        'No GameMaker exception information is available for this thread.',
+      );
+      return;
+    }
+    response.body = {
+      exceptionId: 'GameMaker Runtime Error',
+      description: exceptionMessage,
+      breakMode: 'always',
+      details: {
+        message: exceptionMessage,
+        typeName: 'GameMaker Runtime Error',
+      },
+    };
     this.sendResponse(response);
   }
 
