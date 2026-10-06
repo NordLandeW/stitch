@@ -105,3 +105,7 @@ Once everything has been installed and built:
 
 - Run `pnpm watch` (rebuilds whenever you make a change)
 - Hit `F5` (or otherwise launch the debugger) to run the extension in a debug environment
+
+#### Packaging a local VSIX
+
+Run `bash ./build_vscode.sh` from the repository root to build the workspace packages and package the VS Code extension. The script stops on build errors and writes the installable `.vsix` file to `packages/vscode`. It can also be invoked by its full path from another directory.
