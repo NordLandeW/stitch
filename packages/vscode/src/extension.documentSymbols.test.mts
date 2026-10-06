@@ -40,7 +40,7 @@ function createFixture() {
     selectionEnd: number,
     declarationStart = selectionStart,
     declarationEnd = selectionEnd,
-    parent = rootContainer,
+    parent: object = rootContainer,
   ) {
     const item = {
       name,
@@ -58,7 +58,10 @@ function createFixture() {
       static: false,
       functionType: undefined,
       structType: undefined,
-      getTypeByKind(kind: string) {
+      getTypeByKind(
+        this: { functionType?: TestFunctionType; structType?: object },
+        kind: string,
+      ) {
         if (kind === 'Function') return this.functionType;
         if (kind === 'Struct') return this.structType;
         return;
@@ -247,6 +250,7 @@ test('falls back to the identifier range for declarations without a full range',
   const macroSymbol = symbols.find(({ item }) => item === macro);
 
   assert(macroSymbol);
-  assert.equal(macroSymbol.range.start.offset, macro.def!.start.offset);
-  assert.equal(macroSymbol.range.end.offset, macro.def!.end.offset);
+  assert(macro.def instanceof Range);
+  assert.equal(macroSymbol.range.start.offset, macro.def.start.offset);
+  assert.equal(macroSymbol.range.end.offset, macro.def.end.offset);
 });
