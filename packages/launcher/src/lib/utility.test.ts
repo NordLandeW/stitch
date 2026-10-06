@@ -22,7 +22,12 @@ async function withServer<T>(
   listener: RequestListener,
   callback: (url: string) => Promise<T>,
 ) {
-  const server = createServer(listener);
+  const server = createServer((request, response) => {
+    // These synthetic bytes are not an installer download. Avoid triggering
+    // download-manager integration in the developer's desktop session.
+    response.setHeader('Content-Type', 'text/plain');
+    listener(request, response);
+  });
   server.keepAliveTimeout = 1;
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -36,7 +41,7 @@ async function withServer<T>(
     if (!address || typeof address === 'string') {
       throw new Error('Could not determine test server address');
     }
-    return await callback(`http://127.0.0.1:${address.port}/installer.exe`);
+    return await callback(`http://127.0.0.1:${address.port}/fixture`);
   } finally {
     if (previousNoProxy === undefined) delete process.env.npm_config_no_proxy;
     else process.env.npm_config_no_proxy = previousNoProxy;
