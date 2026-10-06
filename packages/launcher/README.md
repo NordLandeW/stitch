@@ -35,6 +35,10 @@ Stitch Launcher _may_ attempt to install missing runtimes, but there's a good ch
 - [Node.js v16+](https://nodejs.org/en/). This package is only exported as ESM -- [here's a guide](https://adamcoster.com/blog/commonjs-and-esm-importexport-compatibility-examples) to how to import it if you're using CommonJS.
 - [A GameMaker license](https://gamemaker.io/). This package can be used to automate downloading and installing of GameMaker components, but you'll need to have a GameMaker license to actually use it!
 
+## Third-party software
+
+Stitch Launcher uses the 7-Zip command-line program to extract GameMaker's NSIS installer archives without executing them. 7-Zip is licensed under the GNU LGPL with additional components under BSD licenses and an unRAR restriction. The complete license is distributed with the `7z-bin` package; its source is available from [7-zip.org](https://www.7-zip.org/).
+
 ## Installation
 
 In a Node project, run `npm install @bscotch/stitch-launcher`

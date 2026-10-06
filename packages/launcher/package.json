@@ -48,6 +48,7 @@
     "watch": "tsc --build --watch"
   },
   "dependencies": {
+    "7z-bin": "0.0.8",
     "@bscotch/gamemaker-releases": "workspace:*",
     "@bscotch/logger": "0.2.2",
     "@bscotch/pathy": "^2.12.1",

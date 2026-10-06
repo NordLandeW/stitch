@@ -4,7 +4,7 @@ License information for the content of this extension. This extension was develo
 
 ## Stitch name and logo
 
-![Stitch Logo](https://img.bscotch.net/fit-in/256x256/logos/stitch.png "The Stitch Logo, copyright and trademark Butterscotch Shenanigans, all rights reserved.")
+![Stitch Logo](https://img.bscotch.net/fit-in/256x256/logos/stitch.png 'The Stitch Logo, copyright and trademark Butterscotch Shenanigans, all rights reserved.')
 
 Stitch™ and its logo are trademarks of Bscotch. Bscotch reserves all rights to Stitch and its logo.
 
@@ -18,7 +18,7 @@ Bscotch retains all rights to such content, and it may not be used in any way ex
 
 ## Extension code and content
 
-Everything found in this extension, except for the Stitch name/logo and sample content as described above, falls under the MIT license (https://opensource.org/license/mit/):
+The extension's code and content, except for the Stitch name/logo, sample content, and separately licensed third-party software described here, fall under the MIT license (https://opensource.org/license/mit/):
 
 Copyright 2023 Butterscotch Shenanigans
 
@@ -27,3 +27,9 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## Third-party software
+
+This extension bundles the 7-Zip command-line program to extract GameMaker's NSIS installer archives without executing them. 7-Zip is licensed under the GNU LGPL with additional components under BSD licenses and an unRAR restriction. The complete license is included at `bin/win/License.txt`; its source is available from [7-zip.org](https://www.7-zip.org/).
+
+The `7z-bin` JavaScript wrapper is distributed under the MIT license. Its copyright and license notices are included at `bin/7z-bin-LICENSE.txt`.

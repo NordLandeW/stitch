@@ -153,6 +153,9 @@ importers:
 
   packages/launcher:
     dependencies:
+      7z-bin:
+        specifier: 0.0.8
+        version: 0.0.8
       '@bscotch/gamemaker-releases':
         specifier: workspace:*
         version: link:../releases
@@ -630,6 +633,9 @@ importers:
         version: 5.9.3
 
 packages:
+
+  7z-bin@0.0.8:
+    resolution: {integrity: sha512-x0ngaq4yGntINofmAnh5TDx575KDjFUv8xNHQ+VCNZTuf8hn3VR7QIV4Bmm4VjuPvX74DACFWRlfIGA+6IK0ig==}
 
   '@apidevtools/json-schema-ref-parser@11.9.3':
     resolution: {integrity: sha512-60vepv88RwcJtSHrD6MjIL6Ta3SOYbgfnkHb+ppAVK+o9mXprRtulx7VlRl3lN3bbvysAfCS7WMVfhUYemB0IQ==}
@@ -4259,6 +4265,8 @@ packages:
     hasBin: true
 
 snapshots:
+
+  7z-bin@0.0.8: {}
 
   '@apidevtools/json-schema-ref-parser@11.9.3':
     dependencies:

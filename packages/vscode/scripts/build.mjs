@@ -36,6 +36,19 @@ const builder = await esbuild.build({
   },
 });
 
+// The launcher extracts GameMaker's NSIS installer without executing it.
+// Bundle the full Windows 7-Zip binaries (including their license) so the
+// extension does not depend on a system-wide 7-Zip installation. The bundled
+// launcher resolves this as ../bin/win/<arch>/7z.exe from dist/extension.js.
+await fsp.rm('./bin', { recursive: true, force: true });
+await fsp.cp('../launcher/node_modules/7z-bin/bin/win', './bin/win', {
+  recursive: true,
+});
+await fsp.copyFile(
+  '../launcher/node_modules/7z-bin/LICENSE',
+  './bin/7z-bin-LICENSE.txt',
+);
+
 // Copy the template project from current stitch-core
 await $`rm -rf ./assets/templates`;
 await $`mkdir -p ./assets/templates`;

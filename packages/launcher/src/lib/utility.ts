@@ -1,9 +1,13 @@
 import { Pathy } from '@bscotch/pathy';
 import { ok } from 'assert';
 import { default as axios } from 'axios';
-import { exec } from 'child_process';
+import { path7z } from '7z-bin';
+import { execFile } from 'child_process';
+import { randomUUID } from 'crypto';
 import { createWriteStream } from 'fs';
+import { rename } from 'fs/promises';
 import os from 'os';
+import { pipeline } from 'stream/promises';
 import {
   GameMakerDefaultMacros,
   GameMakerInstalledVersion,
@@ -171,36 +175,106 @@ export async function download(
     console.log(
       `Download target path already exists, skipping download: "${to}"`,
     );
-    return;
+    return false;
   }
   await to.up().ensureDirectory();
   console.log(`Downloading ${url} to ${to.absolute}`);
-  const response = await axios({
-    method: 'get',
-    url,
-    responseType: 'stream',
-  });
-  const writeStream = createWriteStream(to.absolute);
-  response.data.pipe(writeStream);
-
-  return new Promise((resolve) => {
-    writeStream.on('finish', () => {
-      writeStream.close();
-      resolve(undefined);
+  const partialPath = new Pathy(`${to.absolute}.${randomUUID()}.partial`);
+  const backupPath = new Pathy(`${to.absolute}.${randomUUID()}.replaced`);
+  try {
+    const response = await axios({
+      method: 'get',
+      url,
+      responseType: 'stream',
+      // Request the artifact itself so byte counts match Content-Length.
+      headers: { 'Accept-Encoding': 'identity' },
+      decompress: false,
     });
-  });
+    const encoding = response.headers['content-encoding'];
+    if (encoding && String(encoding).toLowerCase() !== 'identity') {
+      response.data.destroy();
+      throw new Error(
+        `Unexpected Content-Encoding ${encoding} downloading ${url}`,
+      );
+    }
+    await pipeline(
+      response.data,
+      createWriteStream(partialPath.absolute, { flags: 'wx' }),
+    );
+
+    const downloadedSize = (await partialPath.stat()).size;
+    const expectedSize = Number(response.headers['content-length']);
+    ok(downloadedSize > 0, `Downloaded an empty file from ${url}`);
+    ok(
+      !Number.isFinite(expectedSize) || downloadedSize === expectedSize,
+      `Incomplete download from ${url}: expected ${expectedSize} bytes, received ${downloadedSize}`,
+    );
+
+    const hadExistingTarget = await to.exists();
+    if (hadExistingTarget) {
+      await rename(to.absolute, backupPath.absolute);
+    }
+    try {
+      await rename(partialPath.absolute, to.absolute);
+    } catch (error) {
+      if (hadExistingTarget && (await backupPath.exists())) {
+        await rename(backupPath.absolute, to.absolute);
+      }
+      throw error;
+    }
+    if (hadExistingTarget) {
+      try {
+        await backupPath.delete();
+      } catch (error) {
+        console.warn(
+          `Downloaded ${to.absolute}, but could not remove the replaced file ${backupPath.absolute}: ${String(error)}`,
+        );
+      }
+    }
+    return true;
+  } catch (error) {
+    if (await partialPath.exists()) {
+      await partialPath.delete();
+    }
+    throw error;
+  }
 }
 
-// Make async so we don't block any threads
-export async function runIdeInstaller(idePath: Pathy) {
+/**
+ * Extract a GameMaker NSIS installer without executing it. Installer-only
+ * payloads are excluded so the resulting directory contains only the
+ * portable IDE files Stitch needs.
+ */
+export async function extractIdeInstaller(idePath: Pathy, target: Pathy) {
   ok(process.platform === 'win32', 'Only Windows is supported');
-  console.log('Running installer', idePath.basename, '...');
-  const command = `start /wait "" "${idePath.absolute}" /S`;
-  debug(`Running command: ${command}`);
-  const installer = exec(command);
-  return await new Promise((resolve, reject) => {
-    installer.on('error', reject);
-    installer.on('exit', resolve);
+  console.log('Extracting installer', idePath.basename, '...');
+  await target.ensureDirectory();
+  const args = [
+    'x',
+    idePath.absolute,
+    `-o${target.absolute}`,
+    '-y',
+    '-bb0',
+    '-bso0',
+    '-bsp0',
+    '-xr!$PLUGINSDIR',
+    '-xr!$TEMP',
+  ];
+  debug(`Running command: ${path7z} ${args.join(' ')}`);
+  await new Promise<void>((resolve, reject) => {
+    execFile(
+      path7z,
+      args,
+      { maxBuffer: 4 * 1024 * 1024, windowsHide: true },
+      (error, _stdout, stderr) => {
+        if (error) {
+          error.message = `${error.message}${stderr ? `\n${stderr.trim()}` : ''}`;
+          reject(error);
+          return;
+        }
+        resolve();
+      },
+    );
   });
 }
 
@@ -359,12 +433,24 @@ export async function listInstalledIdes(
 ) {
   assert(parentDir, 'No program files directory provided');
 
-  const ideExecutables = await new Pathy(parentDir).listChildrenRecursively({
+  const root = new Pathy(parentDir);
+  const ideExecutables = await root.listChildrenRecursively({
     maxDepth: 1,
     includePatterns: [/^GameMaker(Studio2?)?(-(Beta|LTS))?\.exe$/],
   });
 
-  return ideExecutables;
+  // Staging and rollback directories are not published installations. Still
+  // allow an explicit staging root so installation can validate it before
+  // publishing it into the cache.
+  return ideExecutables.filter((executable) => {
+    const directory = executable.up();
+    return (
+      directory.absolute === root.absolute ||
+      !/^gamemaker-\d+\.\d+\.\d+\.\d+\.(extracting|replaced)-[0-9a-f-]+$/i.test(
+        directory.basename,
+      )
+    );
+  });
 }
 
 export type Logger = {

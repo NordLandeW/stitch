@@ -1,6 +1,8 @@
 import { Pathy } from '@bscotch/pathy';
 import { ok } from 'assert';
 import { ChildProcess, exec } from 'child_process';
+import { randomUUID } from 'crypto';
+import { rename } from 'fs/promises';
 import { GameMakerComponent } from './GameMakerComponent.js';
 import type {
   GameMakerDefaultMacros,
@@ -10,10 +12,10 @@ import {
   cleanVersionString,
   createStaticTracer,
   download,
+  extractIdeInstaller,
   listDefaultMacrosPaths,
   listInstalledIdes,
   listInstalledRuntimes,
-  runIdeInstaller,
   setActiveRuntime,
   trace,
 } from './utility.js';
@@ -36,8 +38,8 @@ export interface GameMakerIdeInstallOptions {
    */
   programFiles?: string;
   /**
-   * If true, the installer will be downloaded
-   * and run even if it is already evailable
+   * If true, the installer will be downloaded and extracted even if this IDE
+   * version is already available in Stitch's cache.
    */
   force?: boolean;
 }
@@ -101,6 +103,10 @@ export function assert(
 @trace
 export class GameMakerIde extends GameMakerComponent {
   static readonly error = GameMakerIdeError;
+  protected static readonly pendingInstalls = new Map<
+    string,
+    Promise<GameMakerIde>
+  >();
 
   constructor(info: GameMakerInstalledVersion) {
     super(info);
@@ -191,15 +197,13 @@ export class GameMakerIde extends GameMakerComponent {
   }
 
   /**
-   * Install the specified IDE version. Only
-   * one IDE version can be installed at a time
-   * (per stable and beta channels), so this
-   * may clobber the currently-installed IDE.
+   * Make the specified IDE version available in Stitch's versioned cache.
+   * Multiple versions can coexist. If a native installation is available it
+   * is copied; otherwise the official NSIS installer is downloaded and
+   * extracted without being executed.
    *
-   * If this version is already installed, no action
-   * is taken. If this version's installer is already
-   * downloaded, it will not be re-downloaded. If it
-   * is *not* downloaded, then it will be downloaded.
+   * If this version is already cached, no action is taken. Cached installers
+   * are reused, but an invalid archive is removed and downloaded once more.
    */
   @trace
   static async install(
@@ -207,6 +211,25 @@ export class GameMakerIde extends GameMakerComponent {
     options?: GameMakerIdeInstallOptions,
   ): Promise<GameMakerIde> {
     version = cleanVersionString(version);
+    const pendingInstall = GameMakerIde.pendingInstalls.get(version);
+    if (pendingInstall) {
+      return await pendingInstall;
+    }
+    const install = GameMakerIde.installWithoutDeduplication(version, options);
+    GameMakerIde.pendingInstalls.set(version, install);
+    try {
+      return await install;
+    } finally {
+      if (GameMakerIde.pendingInstalls.get(version) === install) {
+        GameMakerIde.pendingInstalls.delete(version);
+      }
+    }
+  }
+
+  protected static async installWithoutDeduplication(
+    version: string,
+    options?: GameMakerIdeInstallOptions,
+  ): Promise<GameMakerIde> {
     const release = await GameMakerComponent.findRelease({
       ideVersion: version,
     });
@@ -219,31 +242,29 @@ export class GameMakerIde extends GameMakerComponent {
     if (!installedVersion || options?.force) {
       // See if it's installed to PROGRAMFILES,
       // just not yet to Stitch.
-      let directlyInstalled = await GameMakerIde.findDirectlyInstalled(
-        version,
-        options?.programFiles,
-      );
-      if (!directlyInstalled || options?.force) {
-        // Download & install!
+      const directlyInstalled = options?.force
+        ? undefined
+        : await GameMakerIde.findDirectlyInstalled(
+            version,
+            options?.programFiles,
+          );
+      if (!directlyInstalled) {
+        // Download and extract directly into Stitch's versioned cache. The
+        // GameMaker installer is an NSIS archive; executing it only adds
+        // system-level installation side effects that Stitch does not need.
         const installerPath = GameMakerIde.cachedIdeInstallerPath(version);
-        await download(release.ide.link, installerPath);
-        await runIdeInstaller(installerPath);
-        // Make sure this version is now installed
-        directlyInstalled = await GameMakerIde.findDirectlyInstalled(
+        await GameMakerIde.extractDownloadedInstaller(
           version,
-          options?.programFiles,
+          release.ide.link,
+          installerPath,
         );
-        ok(
-          directlyInstalled,
-          `Could not find version ${version} after installation. Installation might have gone to an unexpected location or the installer might have failed.`,
+      } else {
+        // Reuse an IDE that was installed outside Stitch.
+        console.log("Copying installed files to Stitch's cache...");
+        await directlyInstalled.directory.copy(
+          GameMakerIde.cachedIdeDirectory(version),
         );
-        await installerPath.delete();
       }
-      // Copy over to Stitch
-      console.log("Copying installed files to Stitch's cache...");
-      await directlyInstalled.directory.copy(
-        GameMakerIde.cachedIdeDirectory(version),
-      );
       installedVersion = await GameMakerIde.findInstalled(version);
     }
     ok(
@@ -251,6 +272,99 @@ export class GameMakerIde extends GameMakerComponent {
       `Could not find version ${version} after installation.`,
     );
     return installedVersion;
+  }
+
+  protected static async extractDownloadedInstaller(
+    version: string,
+    downloadUrl: string,
+    installerPath: Pathy,
+  ) {
+    const target = GameMakerIde.cachedIdeDirectory(version);
+    let lastError: unknown;
+
+    // Retry once with a fresh download. This repairs old truncated installer
+    // files that earlier Stitch versions treated as valid cache entries.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const staging = target
+        .up()
+        .join(`${target.basename}.extracting-${randomUUID()}`);
+      try {
+        await download(downloadUrl, installerPath, { force: attempt > 0 });
+        await extractIdeInstaller(installerPath, staging);
+        await GameMakerIde.assertExtractedIde(staging, version);
+        await GameMakerIde.replaceCachedIdeDirectory(staging, target);
+        try {
+          await installerPath.delete();
+        } catch (error) {
+          logger.warn(
+            `Installed GameMaker ${version}, but could not remove cached installer ${installerPath.absolute}: ${String(error)}`,
+          );
+        }
+        return;
+      } catch (error) {
+        lastError = error;
+        if (await staging.exists()) {
+          await staging.delete({ recursive: true });
+        }
+        if (await installerPath.exists()) {
+          await installerPath.delete();
+        }
+      }
+    }
+    const detail =
+      lastError instanceof Error
+        ? ` ${lastError.message}`
+        : lastError === undefined
+          ? ''
+          : ` ${String(lastError)}`;
+    throw new Error(
+      `Could not extract GameMaker ${version} from its installer.${detail}`,
+      { cause: lastError },
+    );
+  }
+
+  protected static async assertExtractedIde(directory: Pathy, version: string) {
+    const extractedIdes = await GameMakerIde.listInstalledInDir(directory);
+    const extractedIde = extractedIdes.find(
+      (ide) =>
+        ide.version === version &&
+        ide.directory.absolute.toLowerCase() ===
+          directory.absolute.toLowerCase(),
+    );
+    ok(
+      extractedIde,
+      `Extracted installer did not contain GameMaker IDE ${version}`,
+    );
+  }
+
+  protected static async replaceCachedIdeDirectory(
+    staging: Pathy,
+    target: Pathy,
+  ) {
+    const backup = target
+      .up()
+      .join(`${target.basename}.replaced-${randomUUID()}`);
+    const hadExistingTarget = await target.exists();
+    if (hadExistingTarget) {
+      await rename(target.absolute, backup.absolute);
+    }
+    try {
+      await rename(staging.absolute, target.absolute);
+    } catch (error) {
+      if (hadExistingTarget && (await backup.exists())) {
+        await rename(backup.absolute, target.absolute);
+      }
+      throw error;
+    }
+    if (hadExistingTarget) {
+      try {
+        await backup.delete({ recursive: true });
+      } catch (error) {
+        logger.warn(
+          `Installed the new IDE cache but could not remove backup ${backup.absolute}: ${String(error)}`,
+        );
+      }
+    }
   }
 
   @trace

@@ -54,7 +54,7 @@ export class GameMakerProject extends Project {
         if (!ide) {
           progress.report({
             increment: 10,
-            message: 'Version not found. Installing...',
+            message: 'Version not found. Downloading and extracting...',
           });
           await GameMakerIde.install(this.ideVersion);
         }
@@ -129,13 +129,13 @@ export class GameMakerProject extends Project {
     if (!runtime) {
       const installOptions = ['Yes', 'No'] as const;
       const chosenOption = await showErrorMessage(
-        `The runtime for GameMaker v${this.ideVersion} is either not installed or not discoverable by Stitch. Do you want Stitch to install and launch GameMaker v${this.ideVersion} for you?`,
+        `The runtime for GameMaker v${this.ideVersion} is either not installed or not discoverable by Stitch. Do you want Stitch to download, extract, and launch GameMaker v${this.ideVersion} for you?`,
         ...installOptions,
       );
       if (chosenOption === 'Yes') {
         await this.openInIde();
         vscode.window.showInformationMessage(
-          `GameMaker v${this.ideVersion} has been installed and opened. Once it's done installing its runtime you should be able to run your game from Stitch!`,
+          `GameMaker v${this.ideVersion} has been downloaded, extracted, and opened. Once it's done installing its runtime you should be able to run your game from Stitch!`,
         );
       }
     }
