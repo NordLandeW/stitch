@@ -73,6 +73,7 @@ export interface GameMakerDebugSessionHost {
   expressionCompilerOptions?(
     args: GameMakerLaunchRequestArguments,
   ): Promise<GameMakerExpressionCompilerOptions>;
+  armContinueFocusGuard?(): (() => void) | undefined;
 }
 
 function canonicalSource(sourcePath: string) {
@@ -129,6 +130,7 @@ export class GameMakerDebugSession extends LoggingDebugSession {
   private nextVariableReference = 1;
   private nextEvaluateId = 1;
   private readonly staleReferenceWarnings = new Set<number>();
+  private cancelContinueFocusGuard?: () => void;
 
   constructor(private readonly host: GameMakerDebugSessionHost) {
     super();
@@ -136,6 +138,7 @@ export class GameMakerDebugSession extends LoggingDebugSession {
     this.setDebuggerColumnsStartAt1(true);
 
     this.protocol.on('stopped', (state) => {
+      this.clearContinueFocusGuard();
       if (this.disposed) return;
       this.stoppedState = state;
       this.resetVariableReferences();
@@ -615,10 +618,13 @@ export class GameMakerDebugSession extends LoggingDebugSession {
     response: DebugProtocol.ContinueResponse,
   ) {
     try {
+      this.clearContinueFocusGuard();
+      this.cancelContinueFocusGuard = this.host.armContinueFocusGuard?.();
       await this.protocol.continue();
       response.body = { allThreadsContinued: true };
       this.sendResponse(response);
     } catch (error) {
+      this.clearContinueFocusGuard();
       this.sendControlError(response, error);
     }
   }
@@ -754,6 +760,11 @@ export class GameMakerDebugSession extends LoggingDebugSession {
   private resetVariableReferences() {
     this.variableContainers.clear();
     this.nextVariableReference = 1;
+  }
+
+  private clearContinueFocusGuard() {
+    this.cancelContinueFocusGuard?.();
+    this.cancelContinueFocusGuard = undefined;
   }
 
   private registerVariables(variables: RegisteredVariable[]) {
@@ -994,6 +1005,7 @@ export class GameMakerDebugSession extends LoggingDebugSession {
   }
 
   private async endSession(terminateDebuggee = true) {
+    this.clearContinueFocusGuard();
     if (this.ending) return;
     this.ending = true;
     try {

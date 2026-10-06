@@ -179,6 +179,31 @@ test('advertises the DAP controls implemented by the GameMaker session', async (
   output.destroy();
 });
 
+test('arms the window focus guard before continuing GameMaker', async () => {
+  const calls: string[] = [];
+  let cancellations = 0;
+  const session = new GameMakerDebugSession({
+    async launch() {},
+    async stop() {},
+    async loadSources() {
+      return [];
+    },
+    armContinueFocusGuard() {
+      calls.push('guard');
+      return () => cancellations++;
+    },
+  });
+  const internals = session as any;
+  internals.protocol.continue = async () => calls.push('continue');
+  internals.sendResponse = () => calls.push('response');
+
+  await internals.continueRequest({});
+
+  assert.deepEqual(calls, ['guard', 'continue', 'response']);
+  internals.clearContinueFocusGuard();
+  assert.equal(cancellations, 1);
+});
+
 test('reads GameMaker exception details from the end of a stopped update', async () => {
   const u32 = (value: number) => {
     const buffer = Buffer.alloc(4);

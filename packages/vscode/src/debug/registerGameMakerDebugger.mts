@@ -2,6 +2,7 @@ import vscode from 'vscode';
 import path from 'node:path';
 import type { GameMakerProject } from '../extension.project.mjs';
 import type { StitchWorkspace } from '../extension.workspace.mjs';
+import { armContinueFocusGuard as createContinueFocusGuard } from './continueFocusGuard.mjs';
 import {
   GameMakerDebugSession,
   GameMakerDebugSessionHost,
@@ -97,6 +98,20 @@ function createHost(workspace: StitchWorkspace): GameMakerDebugSessionHost {
   };
 
   return {
+    armContinueFocusGuard() {
+      return createContinueFocusGuard({
+        initiallyFocused: vscode.window.state.focused,
+        onDidChangeFocus(listener) {
+          const subscription = vscode.window.onDidChangeWindowState((state) =>
+            listener(state.focused),
+          );
+          return () => subscription.dispose();
+        },
+        focusWindow() {
+          return vscode.commands.executeCommand('workbench.action.focusWindow');
+        },
+      });
+    },
     async launch(args, debuggerPort) {
       const project = requireProject(args);
       const launched = await project.run({
