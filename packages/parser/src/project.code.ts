@@ -468,8 +468,8 @@ export class Code {
           symbolRef.file.dirty = true;
         }
       }
-      // If no refs remain and was defined here, delete the signifier as well
-      if (isDefinedInThisFile && !signifier.refs.size) {
+      // Remove orphaned declarations and unresolved names left behind while editing.
+      if (!signifier.refs.size && (isDefinedInThisFile || !signifier.def)) {
         signifier.parent.removeMember(signifier.name);
       }
       cleared.add(signifier);
