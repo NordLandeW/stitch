@@ -82,12 +82,12 @@ describe('Release Feeds', function () {
     );
     await tmpSummaryPath.write(withNotes);
     expect(withNotes.length).to.be.greaterThan(0);
-    expect(withNotes.every((r) => r.channel)).to.exist;
+    expect(withNotes.every((r) => r.channel)).to.equal(true);
     for (const type of ['ide', 'runtime'] as const) {
-      expect(withNotes.every((r) => r[type])).to.exist;
-      expect(withNotes.every((r) => r[type].version)).to.exist;
-      expect(withNotes.every((r) => r[type].notes)).to.exist;
-      expect(withNotes.every((r) => r[type].notes.groups)).to.exist;
+      expect(withNotes.every((r) => r[type])).to.equal(true);
+      expect(withNotes.every((r) => r[type].version)).to.equal(true);
+      expect(withNotes.every((r) => r[type].notes)).to.equal(true);
+      expect(withNotes.every((r) => r[type].notes.groups)).to.equal(true);
     }
     const sampleRelease = withNotes.find(
       (r) => r.runtime.version === '2022.0.1.30',
