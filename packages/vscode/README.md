@@ -189,6 +189,14 @@ Stitch also provides support for symbol search <kbd><kbd>Ctrl</kbd>+<kbd>T</kbd>
 
 Finally, the Intellisense features (go-to-definition, find-references, etc) make it easy to navigate the code in your project.
 
+#### Selecting a GameMaker project
+
+Stitch loads one GameMaker project per VS Code workspace. When multiple `.yyp` files are available, choose a project once. Stitch remembers the choice in VS Code's local workspace state and restores it when you reopen the workspace.
+
+To change projects, open the Command Palette (`Ctrl+Shift+P` on Windows/Linux, `Cmd+Shift+P` on macOS) and run **Stitch: Select GameMaker Project**. Choosing a different project saves the selection and reloads the current VS Code window. Finish any active debugging session before switching. Cancelling the picker or choosing the current project keeps the current window running.
+
+The `stitch.assets.filters.allowedProjects` setting limits candidates by project or folder name, case-insensitively. If it matches nothing, Stitch uses all discovered projects. If the saved project is no longer available in that list, Stitch asks again, or automatically loads the only remaining candidate. The selection command is also available after cancelling the initial picker or when no project has loaded.
+
 ### 🦋 Syntax highlighting
 
 Stitch provides context-aware "semantic highlighting" for all symbols.

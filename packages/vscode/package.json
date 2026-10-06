@@ -54,6 +54,10 @@
         "title": "Stitch: New Project"
       },
       {
+        "command": "stitch.selectProject",
+        "title": "Stitch: Select GameMaker Project"
+      },
+      {
         "command": "stitch.diagnostics.suppress",
         "title": "Suppress Diagnostics"
       },
@@ -383,7 +387,7 @@
       "properties": {
         "stitch.assets.filters.allowedProjects": {
           "title": "Allowed Projects",
-          "description": "If your VSCode Workspace includes multiple GameMaker projects you'll see a selector on load to pick which project you want to load. Optionally limit the list to GameMaker project folder names listed here. If only one matches you it will load without a selector. If none match, all projects will be listed.",
+          "description": "Limit project selection to these GameMaker project or folder names. Stitch remembers the selected project for this workspace and loads it automatically while it remains in the filtered list. Use 'Stitch: Select GameMaker Project' to choose again. If only one project matches, it loads automatically. If none match, all discovered projects are available.",
           "type": "array",
           "items": {
             "type": "string",
@@ -992,6 +996,9 @@
         },
         {
           "command": "stitch.newProject"
+        },
+        {
+          "command": "stitch.selectProject"
         },
         {
           "command": "stitch.openLocation.gameMaker"

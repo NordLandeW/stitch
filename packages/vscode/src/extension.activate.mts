@@ -16,6 +16,8 @@ import { StitchYyFormatProvider } from './extension.formatting.mjs';
 import { StitchHoverProvider } from './extension.hover.mjs';
 import { StitchLensProvider } from './extension.lens.mjs';
 import { StitchLocationsProvider } from './extension.locations.mjs';
+import { ProjectSelection } from './extension.projectSelection.core.mjs';
+import { chooseGameMakerProject } from './extension.projectSelection.mjs';
 import { StitchReferenceProvider } from './extension.refs.mjs';
 import { StitchReleasePickerProvider } from './extension.releases.mjs';
 import { StitchRenameProvider } from './extension.rename.mjs';
@@ -31,7 +33,7 @@ import {
   pathyFromUri,
   registerCommand,
 } from './lib.mjs';
-import { Timer, info, logger, showErrorMessage, warn } from './log.mjs';
+import { Timer, info, logger, showErrorMessage } from './log.mjs';
 import { SpriteSourcesTree } from './spriteSources.mjs';
 import { GameMakerFolder } from './tree.folder.mjs';
 import { GameMakerTreeProvider } from './tree.mjs';
@@ -92,43 +94,9 @@ export async function activateStitchExtension(
   info('Loading projects...');
   const toWatch: vscode.RelativePattern[] = [];
 
-  let yypFiles = await vscode.workspace.findFiles(`**/*.yyp`);
-  if (!yypFiles.length) {
-    warn('No .yyp files found in workspace!');
-  }
-
-  // Pre-filter based on allowed project config
-  const allowed = stitchConfig.allowedProjects.map((p) => p.toLowerCase());
-  let prefiltered = [...yypFiles];
-  if (allowed.length) {
-    prefiltered = prefiltered.filter((projectUri) => {
-      const path = pathyFromUri(projectUri);
-      const yypName = path.name;
-      const folderName = path.up().name;
-      return (
-        allowed.includes(yypName.toLowerCase()) ||
-        allowed.includes(folderName.toLowerCase())
-      );
-    });
-  }
-  yypFiles = prefiltered.length ? prefiltered : yypFiles;
-
-  // Only allow loading one project at a time to reduce complexity
-  if (yypFiles.length > 1) {
-    const chosen = await vscode.window.showQuickPick(
-      yypFiles.map((yyp) => ({
-        label: pathyFromUri(yyp).basename,
-        description: pathyFromUri(yyp).up().absolute,
-        uri: yyp,
-      })),
-      {
-        title:
-          'Stitch: Multiple GameMaker projects found! Choose a project to load.',
-      },
-    );
-    if (!chosen) yypFiles.length = 0;
-    else yypFiles = [chosen.uri];
-  }
+  const projectSelection = new ProjectSelection(ctx.workspaceState);
+  const selectedProject = await chooseGameMakerProject(projectSelection);
+  const yypFiles = selectedProject ? [selectedProject] : [];
 
   for (const yypFile of yypFiles) {
     info('Loading project', yypFile);
@@ -150,6 +118,16 @@ export async function activateStitchExtension(
         new vscode.RelativePattern(base, '*/*/*.png'),
         new vscode.RelativePattern(base, 'datafiles/**/*'),
       );
+      try {
+        await projectSelection.remember({
+          uri: yypFile.toString(),
+        });
+      } catch (error) {
+        logger.error(error);
+        showErrorMessage(
+          'Stitch could not remember the selected project. See the Stitch Output panel for details.',
+        );
+      }
     } catch (error) {
       logger.error(error);
       logger.error('Error loading project', yypFile);
@@ -385,6 +363,23 @@ export async function activateStitchExtension(
     ),
     registerCommand('stitch.newProject', async () => {
       await workspace.createNewProject();
+    }),
+    registerCommand('stitch.selectProject', async () => {
+      try {
+        await projectSelection.switchProject(
+          async () => {
+            const chosen = await chooseGameMakerProject(projectSelection, true);
+            return chosen ? { uri: chosen.toString() } : undefined;
+          },
+          workspace.projects.length ? selectedProject?.toString() : undefined,
+          () => vscode.commands.executeCommand('workbench.action.reloadWindow'),
+        );
+      } catch (error) {
+        logger.error(error);
+        showErrorMessage(
+          'Stitch could not switch projects. See the Stitch Output panel for details.',
+        );
+      }
     }),
     workspace.semanticHighlightProvider.register(),
     workspace.signatureHelpStatus,
