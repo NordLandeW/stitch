@@ -176,6 +176,19 @@ describe('Project', function () {
     expect(globalAssignment.item).to.equal(globalAccess.item);
     expect(globalAssignment.isDef).to.equal(true);
     expect(globalAssignment.item.def?.file).to.equal(complicatedFile);
+    expect(
+      complicatedFile.refs.filter((ref) => ref.item === globalAccess.item),
+    ).to.have.lengthOf(1);
+
+    await file.reload('global.outline_late_global = false;');
+    const reassignment = file.getReferenceAt(1, 15)!;
+    expect(reassignment.isDef).to.equal(false);
+    expect(reassignment.item.def?.file).to.equal(complicatedFile);
+
+    await complicatedFile.reload('');
+    expect(reassignment.item.def).to.equal(undefined);
+    await file.reload('global.outline_late_global = false;');
+    expect(file.getReferenceAt(1, 15)!.isDef).to.equal(true);
   });
 
   it('can analyze a representative project', async function () {

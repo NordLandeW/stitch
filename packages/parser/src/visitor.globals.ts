@@ -108,14 +108,20 @@ export class GmlGlobalDeclarationsVisitor extends GmlVisitorBase {
     return this.REGISTER_GLOBAL_BY_NAME(name.image, range, isNotDef);
   }
 
-  REGISTER_GLOBAL_BY_NAME(name: string, range: Range, isNotDef = false) {
-    // Create it if it doesn't already exist.
+  DISCOVER_GLOBAL(name: string) {
     let symbol = this.PROCESSOR.globalSelf.getMember(name);
     if (!symbol) {
       symbol = new Signifier(this.PROCESSOR.project.self, name);
-      // Add the symbol and type to the project.
       this.PROCESSOR.globalSelf.addMember(symbol);
     }
+    symbol.global = true;
+    symbol.macro = false;
+    symbol.enum = false;
+    return symbol;
+  }
+
+  REGISTER_GLOBAL_BY_NAME(name: string, range: Range, isNotDef = false) {
+    const symbol = this.DISCOVER_GLOBAL(name);
     // Ensure it's defined here.
     if (!isNotDef && !symbol.native) {
       symbol.definedAt(range);
@@ -130,9 +136,6 @@ export class GmlGlobalDeclarationsVisitor extends GmlVisitorBase {
       );
     }
     symbol.addRef(range, !isNotDef && !symbol.native);
-    symbol.global = true;
-    symbol.macro = false; // Reset macro status
-    symbol.enum = false; // Reset enum status
     return symbol;
   }
 
@@ -324,7 +327,9 @@ export class GmlGlobalDeclarationsVisitor extends GmlVisitorBase {
         children.accessorSuffixes?.[0].children.dotAccessSuffix?.[0].children
           .identifier[0].children;
       if (globalIdentifier?.Identifier) {
-        this.REGISTER_GLOBAL(globalIdentifier, true);
+        // The symbol pass records the reference with its assignment status.
+        // An earlier non-defining reference here would shadow that result.
+        this.DISCOVER_GLOBAL(globalIdentifier.Identifier[0].image);
       }
     } else if (
       identifier?.type === 'Identifier' &&
