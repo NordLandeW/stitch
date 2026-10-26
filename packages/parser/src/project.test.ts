@@ -78,6 +78,144 @@ describe('Project', function () {
     await Project.fallbackGmlSpecPath.exists({ assert: true });
   });
 
+  for (const readsFirst of [false, true]) {
+    it(`preserves derived member definitions with base reads ${readsFirst ? 'before' : 'after'} constructors`, async function () {
+      const project = await Project.initialize('samples/project');
+      const file = project.getAssetByName('Complicated')!.gmlFile;
+      const constructors = `
+function BaseSettings() constructor {
+  baseValue = 1;
+}
+function DerivedSettings(value):BaseSettings() constructor {
+  /// @type {Real}
+  derivedValue = value;
+  /// @type {Bool}
+  derivedFlag = true;
+  derivedValue = value + 1;
+}
+function GrandSettings(value):DerivedSettings(value) constructor {}
+function OtherSettings():BaseSettings() constructor {}
+`;
+      const reads = `
+/// @param {Struct.BaseSettings} settings
+function ReadBaseSettings(settings) {
+  return [settings.derivedValue, settings.derivedFlag];
+}
+/// @param {Struct.GrandSettings} settings
+function ReadDerivedSettings(settings) {
+  return [settings.derivedValue, settings.derivedFlag, settings.baseValue];
+}
+`;
+      const original = readsFirst ? reads + constructors : constructors + reads;
+      for (const source of [
+        original,
+        original,
+        original.replaceAll('derivedValue', 'renamedValue'),
+      ]) {
+        await file.reload(source, { reloadDirty: true });
+        const base = project.types.get('Struct.BaseSettings')!;
+        const derived = project.types.get('Struct.DerivedSettings')!;
+        const grand = project.types.get('Struct.GrandSettings')!;
+        const sibling = project.types.get('Struct.OtherSettings')!;
+        for (const [name, value, kind] of [
+          [
+            source.includes('renamedValue') ? 'renamedValue' : 'derivedValue',
+            'value',
+            'Real',
+          ],
+          ['derivedFlag', 'true', 'Bool'],
+        ]) {
+          const offset = source.indexOf(`${name} = ${value};`);
+          const ref = file.refs.find((r) => r.start.offset === offset)!;
+          ok(ref, `Missing assignment reference for ${name}`);
+          expect(ref.isDef, `${name} first assignment`).to.equal(true);
+          expect(ref.item.def?.file).to.equal(file);
+          expect(ref.item.def?.file && ref.item.def.start.offset).to.equal(
+            offset,
+          );
+          expect(ref.item.parent).to.equal(derived);
+          expect(ref.item.type.kind).to.equal(kind);
+          expect(derived.getMember(name, true)).to.equal(ref.item);
+          expect(grand.getMember(name)).to.equal(ref.item);
+          expect(base.getMember(name)?.def).to.equal(undefined);
+          expect(sibling.getMember(name)?.def).to.equal(undefined);
+          const readOffset =
+            source.indexOf(
+              `settings.${name}`,
+              source.indexOf('function ReadDerivedSettings'),
+            ) + 'settings.'.length;
+          const read = file.refs.find((r) => r.start.offset === readOffset)!;
+          expect(read.item).to.equal(ref.item);
+          expect(read.isDef).to.equal(false);
+          const diagnosticOffsets = file
+            .getDiagnostics()
+            .UNDECLARED_VARIABLE_REFERENCE.map((d) => d.location.start.offset);
+          expect(diagnosticOffsets).not.to.include(offset);
+          const baseReadOffset =
+            source.indexOf(
+              `settings.${name}`,
+              source.indexOf('function ReadBaseSettings'),
+            ) + 'settings.'.length;
+          expect(diagnosticOffsets).to.include(baseReadOffset);
+        }
+        const valueName = source.includes('renamedValue')
+          ? 'renamedValue'
+          : 'derivedValue';
+        const reassignment = file.refs.find(
+          (r) => r.start.offset === source.indexOf(`${valueName} = value + 1`),
+        )!;
+        expect(reassignment.isDef).to.equal(false);
+        expect(grand.getMember('baseValue')).to.equal(
+          base.getMember('baseValue'),
+        );
+        expect(file.getDiagnostics().SYNTAX_ERROR).to.have.lengthOf(0);
+      }
+    });
+  }
+
+  it('reconciles real base declarations after derived assignments and edits', async function () {
+    const project = await Project.initialize('samples/project');
+    const file = project.getAssetByName('Complicated')!.gmlFile;
+    for (const baseDefines of [true, false, true]) {
+      const source = `
+/// @param {Struct.BaseSettings} settings
+function ReadBaseSettings(settings) { return settings.sharedValue; }
+/// @param {Struct.GrandSettings} settings
+function ReadDerivedSettings(settings) { return settings.sharedValue; }
+function DerivedSettings():BaseSettings() constructor { sharedValue = 2; }
+function GrandSettings():DerivedSettings() constructor {}
+function BaseSettings() constructor { ${baseDefines ? 'sharedValue' : 'baseValue'} = 1; }
+`;
+      await file.reload(source, { reloadDirty: true });
+      const base = project.types.get('Struct.BaseSettings')!;
+      const derived = project.types.get('Struct.DerivedSettings')!;
+      const grand = project.types.get('Struct.GrandSettings')!;
+      const definitionOffset = source.indexOf(
+        `sharedValue = ${baseDefines ? 1 : 2}`,
+      );
+      const definition = file.refs.find(
+        (r) => r.start.offset === definitionOffset,
+      )!;
+      expect(definition.isDef).to.equal(true);
+      expect(definition.item.parent).to.equal(baseDefines ? base : derived);
+      expect(
+        definition.item.def?.file && definition.item.def.start.offset,
+      ).to.equal(definitionOffset);
+      expect(grand.getMember('sharedValue')).to.equal(definition.item);
+      const childAssignment = file.refs.find(
+        (r) => r.start.offset === source.indexOf('sharedValue = 2'),
+      )!;
+      expect(childAssignment.isDef).to.equal(!baseDefines);
+      expect(childAssignment.item).to.equal(definition.item);
+      expect(
+        file
+          .getDiagnostics()
+          .UNDECLARED_VARIABLE_REFERENCE.map((d) => d.location.start.offset),
+      ).not.to.include(definitionOffset);
+      expect(file.getDiagnostics().SYNTAX_ERROR).to.have.lengthOf(0);
+    }
+  });
+
   it('records full declaration ranges for source-structure features', async function () {
     const project = await Project.initialize('samples/project');
     const file = project.getAssetByName('Script1')!.gmlFile;

@@ -16,6 +16,7 @@ const signifierFlags = {
   Definitive: 1 << 13, // Is a definitive variable (defined in a definitiveSelf, such as a constructor or Create event)
   Enum: 1 << 14, // Is an enum
   EnumMember: 1 << 15, // Is an enum member
+  Placeholder: 1 << 16, // An unresolved access, not an inheritable declaration
 };
 
 export class Flags {
@@ -30,6 +31,13 @@ export class Flags {
   }
   protected getFlag(flag: number) {
     return !!(this.flags & flag);
+  }
+
+  get placeholder() {
+    return this.getFlag(signifierFlags.Placeholder);
+  }
+  set placeholder(placeholder: boolean) {
+    this.setFlag(signifierFlags.Placeholder, placeholder);
   }
 
   get override() {

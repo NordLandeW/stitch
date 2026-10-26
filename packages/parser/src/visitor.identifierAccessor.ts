@@ -95,8 +95,8 @@ export function visitIdentifierAccessor(
     const autoDeclarePrefixes =
       this.PROCESSOR.project.options?.settings?.autoDeclareGlobalsPrefixes ||
       [];
-    const isAutoDeclared = autoDeclarePrefixes.some(
-      (prefix) => lastAccessed.name?.startsWith(prefix),
+    const isAutoDeclared = autoDeclarePrefixes.some((prefix) =>
+      lastAccessed.name?.startsWith(prefix),
     );
     if (!isAutoDeclared) {
       this.PROCESSOR.addDiagnostic(
@@ -113,7 +113,7 @@ export function visitIdentifierAccessor(
     // but might be declared later. So add it to the self scope but
     // without setting where it's defined. Diagnostics should be added
     // later.
-    item = scope.self.addMember(lastAccessed.name);
+    item = scope.self.addMember(lastAccessed.name, { placeholder: true });
     if (item) {
       item.instance = true;
     }
@@ -525,7 +525,9 @@ function processDotAccessor(
     // We need to add it! If this is an assignment operation, then
     // we can use the central assignment logic. Otherwise we just
     // need to add an "undeclared" variable to the current type.
-    property = dottableType.addMember(propertyIdentifier.name);
+    property = dottableType.addMember(propertyIdentifier.name, {
+      placeholder: true,
+    });
     if (property) {
       property.instance = true;
       property.addRef(propertyNameRange);

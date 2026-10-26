@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import { Signifier } from './signifiers.js';
 import { replaceGenerics, updateGenericsMap } from './types.checks.js';
 import { KnownTypesMap, typeFromFeatherString } from './types.feather.js';
 import { Type, TypeStore } from './types.js';
@@ -80,6 +81,36 @@ describe('Types', function () {
     union.type = [new Type('String'), new Type('Real')];
     expect(string.narrows(union)).to.be.true;
     expect(union.narrows(string)).to.be.false;
+  });
+
+  it('keeps unresolved ancestor accesses separate until a declaration exists', function () {
+    const base = new Type('Struct');
+    const child = base.derive();
+    const grandchild = child.derive();
+    const observed = base.addMember('value', { placeholder: true })!;
+    const declared = child.addMember('value', { type: new Type('Real') })!;
+    declared.def = {};
+    expect(child.getMember('value', true)).to.equal(declared);
+    expect(grandchild.getMember('value')).to.equal(declared);
+    expect(base.getMember('value')).to.equal(observed);
+    expect(grandchild.listMembers()).to.deep.equal([declared]);
+    expect(grandchild.totalMembers()).to.equal(1);
+
+    // A later actual base declaration still unifies inherited references.
+    observed.def = {};
+    expect(child.getMember('value', true)).to.equal(undefined);
+    expect(grandchild.getMember('value')).to.equal(observed);
+    expect(grandchild.listMembers()).to.deep.equal([observed]);
+    expect(grandchild.totalMembers()).to.equal(1);
+
+    // Explicit overrides retain their separate identity.
+    const overridden = new Signifier(child, 'value');
+    overridden.override = true;
+    child.addMember(overridden);
+    overridden.def = {};
+    expect(overridden).not.to.equal(observed);
+    base.refreshMemberInheritance(observed);
+    expect(grandchild.getMember('value')).to.equal(overridden);
   });
 
   it('can check whether one struct type satisfies another', function () {

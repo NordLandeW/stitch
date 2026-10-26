@@ -84,6 +84,7 @@ export class Signifier extends Flags {
     assert(!this.native, 'Cannot unset def on a native entity');
     this._def = undefined;
     this.declaration = undefined;
+    this.placeholder = true;
   }
 
   get def(): Range | { file?: undefined } | undefined {
@@ -97,6 +98,8 @@ export class Signifier extends Flags {
       return;
     }
     this._def = location;
+    this.placeholder = false;
+    this.parent.refreshMemberInheritance(this);
   }
 
   definedAt(location: Range): this {
@@ -116,6 +119,8 @@ export class Signifier extends Flags {
     this._native = nativeModule;
     if (nativeModule) {
       this._def = {};
+      this.placeholder = false;
+      this.parent.refreshMemberInheritance(this);
     }
   }
 

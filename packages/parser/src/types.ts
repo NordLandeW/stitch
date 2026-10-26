@@ -347,7 +347,8 @@ export class Type<T extends PrimitiveName = PrimitiveName> {
       return this._members?.size || 0;
     }
     return (
-      (this._members?.size || 0) + this.extends.totalMembers(excludeParents)
+      (this._members?.size || 0) +
+      this.extends.listMembers().filter((member) => !member.placeholder).length
     );
   }
 
@@ -360,7 +361,10 @@ export class Type<T extends PrimitiveName = PrimitiveName> {
     if (excludeParents || !this.extends) {
       return [...members];
     }
-    return [...members, ...this.extends.listMembers()];
+    return [
+      ...members,
+      ...this.extends.listMembers().filter((member) => !member.placeholder),
+    ];
   }
 
   getMember(name: string, excludeParents = false): Signifier | undefined {
@@ -371,7 +375,10 @@ export class Type<T extends PrimitiveName = PrimitiveName> {
     if (excludeParents) {
       return this._members?.get(name);
     }
-    return this._members?.get(name) || this.extends?.getMember(name);
+    const own = this._members?.get(name);
+    if (own) return own;
+    const inherited = this.extends?.getMember(name);
+    return inherited?.placeholder ? undefined : inherited;
   }
 
   /** For container types that have named members, like Structs and Enums */
@@ -381,6 +388,7 @@ export class Type<T extends PrimitiveName = PrimitiveName> {
       type?: Type | Type[];
       writable?: boolean;
       override?: boolean;
+      placeholder?: boolean;
     },
   ): Signifier | undefined {
     // If this is a Id.Instance or Asset.GMObject type, then we want to add
@@ -421,6 +429,7 @@ export class Type<T extends PrimitiveName = PrimitiveName> {
         member = new Signifier(this, name);
         member.override = !!options?.override;
         member.writable = options?.writable ?? true;
+        member.placeholder = !!options?.placeholder;
         if (type) {
           member.setType(type);
         }
@@ -442,9 +451,17 @@ export class Type<T extends PrimitiveName = PrimitiveName> {
       this._members.set(member.name, member);
       // Ensure that all children of this parent are referencing
       // the same root-most member.
-      this.replaceMemberInChildren(member);
+      this.refreshMemberInheritance(member);
     }
     return member;
+  }
+
+  /** Publish a declaration after an unresolved member receives its definition. */
+  refreshMemberInheritance(member: Signifier) {
+    if (member.placeholder || this.getMember(member.name, true) !== member) {
+      return;
+    }
+    this.replaceMemberInChildren(member);
   }
 
   protected replaceMemberInChildren(member: Signifier) {
