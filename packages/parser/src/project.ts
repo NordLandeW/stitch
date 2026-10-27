@@ -197,9 +197,11 @@ export class Project {
     this.resourceUpdates++;
     const operation = this.resourceBarrier
       .catch(() => {})
-      .then(() => {
+      .then(async () => {
         if (this.disposed) throw new Error('Project has been disposed');
-        return action();
+        const result = await action();
+        await this.reconcileSourceOwnership();
+        return result;
       });
     this.resourceBarrier = operation.then(
       () => {
@@ -447,19 +449,77 @@ export class Project {
     return this.options?.documentText?.(path.absolute) ?? disk;
   }
 
-  /** Reconcile one listed resource, including restoration after its YY was missing. */
-  async reloadResource(path: Pathy): Promise<void> {
-    const name = this.assetNameFromPath(path);
-    await this.withResourceUpdate(async () => {
-      const resource = this.yyp.resources.find(
-        (entry) => entry.id.name.toLocaleLowerCase() === name,
+  sourceOwners(path: Pathy): Asset[] {
+    const key = path.absolute.toLocaleLowerCase();
+    return [...this.assets.values()].filter(
+      (asset) =>
+        asset.sourcePaths?.some(
+          (source) => source.absolute.toLocaleLowerCase() === key,
+        ) ||
+        asset.sourceCandidates?.some(
+          (source) => source.path.absolute.toLocaleLowerCase() === key,
+        ),
+    );
+  }
+
+  /** A physical query/edit document has one execution context. Conflicts remain explicit metadata diagnostics. */
+  private async reconcileSourceOwnership(): Promise<void> {
+    const claims = new Map<string, Set<Asset>>();
+    for (const asset of this.assets.values())
+      for (const source of asset.sourceCandidates || []) {
+        const key = source.path.absolute.toLocaleLowerCase();
+        let owners = claims.get(key);
+        if (!owners) claims.set(key, (owners = new Set()));
+        owners.add(asset);
+      }
+    for (const asset of this.assets.values()) {
+      if (!asset.sourceCandidates) continue;
+      const conflicts = asset.sourceCandidates.filter(
+        (source) =>
+          claims.get(source.path.absolute.toLocaleLowerCase())!.size > 1,
       );
-      if (!resource) return;
-      const existing = this.assets.get(name);
-      if (existing) await existing.reload(false);
-      else {
-        const restored = await Asset.from(this, resource);
-        if (restored) this.registerAsset(restored);
+      this.setResourceDiagnostics(
+        asset.yyPath.absolute,
+        'source-ownership',
+        conflicts.map(
+          (source) =>
+            new Diagnostic(
+              `The GML source ${source.path.relativeFrom(this.dir)} is shared by multiple resources. Analysis and source deletion require an unambiguous execution context.`,
+              {
+                start: { line: 1, column: 1, offset: 0 },
+                end: { line: 1, column: 1, offset: 0 },
+              },
+              'warning',
+            ),
+        ),
+      );
+      await asset.reconcileGmlSources(
+        asset.sourceCandidates.filter(
+          (source) =>
+            claims.get(source.path.absolute.toLocaleLowerCase())!.size === 1,
+        ),
+      );
+    }
+  }
+
+  /** Reconcile listed metadata or a source URI, including paths outside its resource directory. */
+  async reloadResource(path: Pathy): Promise<void> {
+    const names = new Set(
+      this.sourceOwners(path).map((asset) => asset.name.toLocaleLowerCase()),
+    );
+    names.add(this.assetNameFromPath(path));
+    await this.withResourceUpdate(async () => {
+      for (const name of names) {
+        const resource = this.yyp.resources.find(
+          (entry) => entry.id.name.toLocaleLowerCase() === name,
+        );
+        if (!resource) continue;
+        const existing = this.assets.get(name);
+        if (existing) await existing.reload(false);
+        else {
+          const restored = await Asset.from(this, resource);
+          if (restored) this.registerAsset(restored);
+        }
       }
       for (const asset of this.assets.values()) asset.refreshParent();
     });
@@ -491,6 +551,21 @@ export class Project {
     name = name.toLocaleLowerCase();
     const asset = this.assets.get(name);
     if (!asset) return;
+    const directory =
+      asset.dir.absolute.toLocaleLowerCase().replaceAll('\\', '/') + '/';
+    assert(
+      ![...this.assets.values()].some(
+        (other) =>
+          other !== asset &&
+          other.sourcePaths?.some((path) =>
+            path.absolute
+              .toLocaleLowerCase()
+              .replaceAll('\\', '/')
+              .startsWith(directory),
+          ),
+      ),
+      'Resource deletion would remove GML source referenced by another resource.',
+    );
     // Remove the asset from the yyp
     const resourceIdx = this.yyp.resources.findIndex(
       (r) => r.id.name.toLocaleLowerCase() === name,
@@ -568,11 +643,10 @@ export class Project {
   }
 
   getGmlFile(path: Pathy<any>): Code | undefined {
-    const resource = this.getAsset(path);
-    if (!resource) {
-      return;
-    }
-    return resource.getGmlFile(path);
+    return (
+      this.analysis.document(path.absolute) ||
+      this.getAsset(path)?.getGmlFile(path)
+    );
   }
 
   /** Normalize path information for a datafile ("Included File") */
@@ -752,6 +826,21 @@ export class Project {
         record.value.trim() === asset.name
       )
         record.value = record.value.replace(asset.name, to);
+      if (
+        typeof record.creationCodeFile === 'string' &&
+        record.creationCodeFile
+      ) {
+        const prefix =
+          record.creationCodeFile.match(/^\$\{project_dir\}[/\\]?/)?.[0] || '';
+        const path = this.dir.join(
+          record.creationCodeFile.slice(prefix.length),
+        ).absolute;
+        const renamed = renamedPath(path, renames);
+        if (renamed !== path)
+          record.creationCodeFile =
+            prefix +
+            pathy(renamed).relativeFrom(this.dir).replaceAll('\\', '/');
+      }
       if (typeof record.path === 'string') {
         if (
           record.path.replaceAll('\\', '/').toLocaleLowerCase() ===
@@ -1902,6 +1991,7 @@ export class Project {
    * @internal
    * Initialize a collection of new assets by parsing their GML */
   async initiallyParseAssetCode(assets: Asset[]): Promise<void> {
+    await this.reconcileSourceOwnership();
     for (const asset of this.assets.values()) asset.refreshParent();
     for (const asset of assets) {
       for (const code of asset.gmlFiles.values()) this.analysis.register(code);

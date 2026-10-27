@@ -5,6 +5,7 @@ import {
   type FeatherTypeDiagnostic,
 } from './jsdoc.feather.js';
 import { typeFromFeatherString } from './types.feather.js';
+import { Type, TypeStore } from './types.js';
 
 describe('Feather type string recovery', function () {
   for (const source of [
@@ -163,4 +164,72 @@ describe('Feather type string recovery', function () {
       });
     });
   }
+});
+
+describe('Feather type graph display', function () {
+  it('shows recursive item paths in type and function hover text without changing the graph', function () {
+    const array = new Type('Array');
+    const items = new TypeStore().addType([array, new Type('Real')]);
+    array.items = items;
+    expect(array.toFeatherString()).to.equal('Array<...|Real>');
+    expect(array.code).to.equal('Array<...|Real>');
+    const fn = Type.Function.named('read');
+    fn.setReturnType(array);
+    expect(fn.code).to.equal('function read(): Array<...|Real>');
+    expect(array.items).to.equal(items);
+    expect(array.items.type[0]).to.equal(array);
+    expect(array.toFeatherString()).to.equal('Array<...|Real>');
+  });
+
+  it('expands shared acyclic paths and same-key distinct objects normally', function () {
+    const leaf = new Type('Array');
+    leaf.semanticKey = 'same-key';
+    leaf.items = new TypeStore().addType(new Type('Real'));
+    const root = new Type('Array');
+    root.semanticKey = 'same-key';
+    root.items = new TypeStore().addType([leaf, leaf]);
+    expect(root.toFeatherString()).to.equal('Array<Array<Real>|Array<Real>>');
+    leaf.items = new TypeStore().addType(root);
+    expect(root.toFeatherString()).to.equal('Array<Array<...>|Array<...>>');
+    const named = new Type('Struct').named('Entry');
+    named.items = new TypeStore().addType(named);
+    expect(named.toFeatherString()).to.equal('Struct.Entry');
+  });
+
+  it('renders deeply nested finite input iteratively', function () {
+    let root: Type = new Type('Real');
+    for (let depth = 0; depth < 4096; depth++) {
+      const parent = new Type('Array');
+      parent.items = new TypeStore().addType(root);
+      root = parent;
+    }
+    expect(root.toFeatherString()).to.equal(
+      'Array<'.repeat(4096) + 'Real' + '>'.repeat(4096),
+    );
+  });
+
+  it('bounds exponentially shared display expansion without changing semantic aliases', function () {
+    let root: Type = new Type('Real');
+    let reads = 0;
+    for (let depth = 0; depth < 64; depth++) {
+      const parent = new Type('Array');
+      const items = new TypeStore().addType([root, root]);
+      // A broken formatter must fail deterministically instead of exhausting
+      // the test worker while expanding an otherwise small finite graph.
+      Object.defineProperty(parent, 'items', {
+        get() {
+          if (++reads > 100_000)
+            throw new Error('Unbounded shared graph display');
+          return items;
+        },
+      });
+      root = parent;
+    }
+    const text = root.toFeatherString();
+    expect(text).to.match(/^Array</);
+    expect(text).to.include('...');
+    expect(text.length).to.be.lessThan(100_000);
+    expect(text.match(/</g)!.length).to.equal(text.match(/>/g)!.length);
+    expect(root.items!.type[0]).to.equal(root.items!.type[1]);
+  });
 });

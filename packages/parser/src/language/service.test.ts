@@ -298,12 +298,10 @@ function snapshot(project: MemoryProject) {
         kind: type.kind,
         type: type.toFeatherString(),
         members: sorted(
-          type
-            .listMembers(true)
-            .map((member) => ({
-              name: member.name,
-              type: member.type.toFeatherString(),
-            })),
+          type.listMembers(true).map((member) => ({
+            name: member.name,
+            type: member.type.toFeatherString(),
+          })),
         ),
       })),
   };
@@ -366,6 +364,73 @@ describe('ProjectAnalysis through real Project and Code models', function () {
       expectChain(reordered, 'Real');
       expect(snapshot(reordered)).to.deep.equal(expected);
     }
+  });
+
+  it('owns implicit field write sites independently of evaluation order and borrowed definitions', async function () {
+    const sources: Sources = {
+      State:
+        'function shared_state(){initialize_state();static state={};return state;}',
+      Alpha:
+        'function initialize_state(){with(shared_state()){enabled=false;}}',
+      Beta: 'function update_state(next){shared_state().enabled=next;}',
+      Read: 'function read_state(){return shared_state().enabled;}',
+    };
+    const project = await createProject(sources, {
+      fileOrder: ['State', 'Alpha', 'Beta', 'Read'],
+    });
+    const reversed = await createProject(sources, {
+      fileOrder: ['State', 'Beta', 'Alpha', 'Read'],
+    });
+    expect(snapshot(project)).to.deep.equal(snapshot(reversed));
+    const field = () =>
+      project.testCode('Read').refs.find((ref) => ref.item.name === 'enabled')!
+        .item;
+    expect(field().def?.file?.asset.name).to.equal('Alpha');
+    expect(
+      project
+        .testCode('Alpha')
+        .refs.some((ref) => ref.item.name === 'enabled' && ref.isDef),
+    ).to.equal(true);
+    await project.testCode('Alpha').reload('function initialize_state(){}');
+    expect(field().def?.file?.asset.name).to.equal('Beta');
+    expect(snapshot(project)).to.deep.equal(
+      snapshot(await createProject(currentSources(project))),
+    );
+    await project.testCode('Alpha').reload(sources.Alpha);
+    expect(snapshot(project)).to.deep.equal(snapshot(reversed));
+  });
+
+  it('converges when acyclic input progress makes a consumer output reappear', async function () {
+    const sources: Sources = {
+      A: 'function revisit_a() { return revisit_b() ?? 1; }',
+      B: 'function revisit_b() { return (revisit_c() ?? { value: "fallback" }).value; }',
+      C: 'function revisit_c() { return { value: undefined }; }',
+    };
+    // A first sees B's pending return (Real), then B's fallback (String),
+    // then C's resolved object makes B return Undefined and A return Real.
+    // The dependency graph is a DAG; repeating A's output is normal progress.
+    const project = await createProject(sources, {
+      fileOrder: ['A', 'B', 'C'],
+    });
+    expect(kinds(callable(project, 'revisit_a').returns)).to.deep.equal([
+      'Real',
+    ]);
+    expect(kinds(callable(project, 'revisit_b').returns)).to.deep.equal([
+      'Undefined',
+    ]);
+    const cold = await createProject(sources, { fileOrder: ['C', 'B', 'A'] });
+    expect(snapshot(project)).to.deep.equal(snapshot(cold));
+    await project
+      .testCode('C')
+      .reload('function revisit_c() { return { value: "changed" }; }');
+    expect(kinds(callable(project, 'revisit_a').returns)).to.deep.equal([
+      'String',
+    ]);
+    await project.testCode('C').reload(sources.C);
+    expect(kinds(callable(project, 'revisit_a').returns)).to.deep.equal([
+      'Real',
+    ]);
+    expect(snapshot(project)).to.deep.equal(snapshot(cold));
   });
 
   it('refreshes unchanged consumers after provider return edits and matches the final cold project', async function () {

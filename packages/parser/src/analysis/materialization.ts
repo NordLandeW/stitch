@@ -27,7 +27,7 @@ import type {
   SymbolContribution,
   UnitEvaluation,
 } from './model.js';
-import { value } from './values.js';
+import { value, valueFrom } from './values.js';
 
 type SourceLocationHost = Pick<MaterializationHost, 'source'>;
 const sourceRangeFactories = new WeakMap<
@@ -260,11 +260,26 @@ export function materializeUnit(
   };
 }
 
-function mappedStore(
-  source: TypeStore | undefined,
+/** Contributions may share large unions. Visit each source object once and
+ * normalize the complete result without expanding it into function arguments. */
+function mappedStores(
+  sources: Iterable<TypeStore | undefined>,
   host: MaterializationHost,
-): TypeStore | undefined {
-  return source && value(...source.type.map((type) => host.value(type)));
+): TypeStore {
+  function* mapped(): Iterable<Type> {
+    const stores = new Set<TypeStore>();
+    const types = new Set<Type>();
+    for (const source of sources) {
+      if (!source || stores.has(source)) continue;
+      stores.add(source);
+      for (const type of source.type) {
+        if (types.has(type)) continue;
+        types.add(type);
+        yield host.value(type);
+      }
+    }
+  }
+  return valueFrom(mapped());
 }
 function canonicalMember(
   source: Signifier,
@@ -278,7 +293,7 @@ function canonicalMember(
       : undefined;
   // Native generic parameters and annotation-only members may be anonymous.
   const member = new Signifier(host.value(source.parent), source.name);
-  member.replaceMetadata(source, mappedStore(source.type, host)!);
+  member.replaceMetadata(source, mappedStores([source.type], host));
   member.replaceDefinition(source.def, source.declaration);
   return member;
 }
@@ -332,13 +347,17 @@ export function installTypeContributions(
   target.setBaseView(base && host.value(base));
   const signifier = source.signifier;
   target._signifier = signifier ? canonicalMember(signifier, host) : undefined;
-  const items = sources.flatMap((entry) => entry.items?.type || []);
-  const returns = sources.flatMap((entry) => entry.returns?.type || []);
   target.items = sources.some((entry) => !!entry.items)
-    ? value(...items.map((entry) => host.value(entry)))
+    ? mappedStores(
+        sources.map((entry) => entry.items),
+        host,
+      )
     : undefined;
   target.returns = sources.some((entry) => !!entry.returns)
-    ? value(...returns.map((entry) => host.value(entry)))
+    ? mappedStores(
+        sources.map((entry) => entry.returns),
+        host,
+      )
     : undefined;
   const members = new Map<string, Signifier>();
   for (const candidate of sources)
@@ -381,10 +400,9 @@ export function installSymbolContributions(
   )?.item.resourceDefinition;
   target.replaceMetadata(
     source.item,
-    value(
-      ...effective
-        .flatMap((entry) => entry.item.type.type)
-        .map((type) => host.value(type)),
+    mappedStores(
+      effective.map((entry) => entry.item.type),
+      host,
     ),
   );
   // Copied GML metadata cannot perpetuate a removed resource declaration.

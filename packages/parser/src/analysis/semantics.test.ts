@@ -18,6 +18,7 @@ import {
 } from './materialization.js';
 import {
   globalKey,
+  memberKey,
   type MaterializationHost,
   type SemanticEnvironment,
   type SymbolView,
@@ -453,12 +454,357 @@ describe('Transactional GML semantics', function () {
     expect(kinds(invalid.returns('Probe'))).not.to.include('String');
   });
 
+  it('accepts a statement terminator in the final for clause and retains its effects', function () {
+    const result = analyze(
+      'function Count(){var total=0;for(var i=0;i<3;++i;){total+=i;}return total;}',
+    );
+    expect(result.result.status).to.equal('complete');
+    expect(result.result.diagnostics).to.deep.equal([]);
+    expect(kinds(result.returns('Count'))).to.deep.equal(['Real']);
+  });
+
+  it('accepts empty enums as configurable declarations', function () {
+    const result = analyze('enum Groups {} function Read(){return Groups;}');
+    expect(result.result.status).to.equal('complete');
+    expect(result.result.diagnostics).to.deep.equal([]);
+    expect(kinds(result.returns('Read'))).to.deep.equal(['Enum']);
+  });
+
+  it('constructs a parenthesized anonymous constructor and exposes its members', function () {
+    const result = analyze(
+      'function Build(){return (new (function() constructor {field=1;})()).field;}',
+    );
+    expect(result.result.status).to.equal('complete');
+    expect(result.result.diagnostics).to.deep.equal([]);
+    expect(kinds(result.returns('Build'))).to.deep.equal(['Real']);
+  });
+
+  it('applies self-only annotations to a callable receiver while preserving storage type annotations', function () {
+    const receiver = Type.Struct.named('Receiver');
+    receiver.semanticKey = 'Struct.Receiver';
+    const field = new Signifier(receiver, 'field', Type.String);
+    field.semanticKey = memberKey(receiver.semanticKey, field.name);
+    field.replaceDefinition({});
+    receiver.setOwnMember(field);
+    const result = analyze(
+      'function Probe(){\n/// @self Struct.Receiver\nvar read=function(){return field;};return read();}',
+      new Map(),
+      '2024.13.0.0',
+      {},
+      new Map([['Struct.Receiver', receiver]]),
+    );
+    expect(kinds(result.returns('Probe'))).to.deep.equal(['String']);
+    expect(
+      result.result.diagnostics.some((diagnostic) =>
+        diagnostic.message.includes('not callable'),
+      ),
+    ).to.equal(false);
+    const constrained = analyze(
+      'function Probe(){\n/// @type {String}\nvar text=1;return text;}',
+    );
+    expect(kinds(constrained.returns('Probe'))).to.deep.equal(['String']);
+  });
+
+  it('keeps unbound dependent native results unknown and preserves resolved container items', function () {
+    const reader = native('buffer_read', 2);
+    reader.item
+      .getTypeByKind('Function')!
+      .setReturnType(new Type('ArgumentIdentity'));
+    const creator = native('array_create', 2);
+    creator.item
+      .getTypeByKind('Function')!
+      .setReturnType(
+        new Type('Array').addItemType(new Type('ArgumentIdentity')),
+      );
+    const result = analyze(
+      'function Raw(){return buffer_read(1,2);}function Label(){return "prefix"+buffer_read(1,2);}function Item(){return array_create(1,"text")[0];}',
+      new Map([
+        ['buffer_read', reader],
+        ['array_create', creator],
+      ]),
+    );
+    expect(kinds(result.returns('Raw'))).to.deep.equal(['Unknown']);
+    expect(kinds(result.returns('Label'))).to.deep.equal(['String']);
+    expect(kinds(result.returns('Item'))).to.deep.equal(['String']);
+    expect(
+      result.result.diagnostics.some((diagnostic) =>
+        diagnostic.message.includes('String on both sides'),
+      ),
+    ).to.equal(false);
+  });
+
+  it('keeps generic runtime instance storage writable without changing the native contract', function () {
+    const base = Type.Struct;
+    base.semanticKey = 'native:instance-storage';
+    base.isReadonly = true;
+    const instance = new Type('Id.Instance');
+    instance.semanticKey = 'native:instance';
+    instance.isReadonly = true;
+    instance.setBaseView(base);
+    const creator = native('instance_create_layer', 4);
+    creator.item.getTypeByKind('Function')!.setReturnType(instance);
+    const lookup = native('lookup_runtime_instance');
+    lookup.item.getTypeByKind('Function')!.setReturnType(instance);
+    const input = new Signifier(Type.Struct, 'input_handle', instance);
+    input.semanticKey = globalKey(input.name);
+    input.replaceDefinition({});
+    const external = new Map([
+      ['instance_create_layer', creator],
+      ['lookup_runtime_instance', lookup],
+      ['input_handle', { key: input.semanticKey, item: input }],
+    ]);
+    const result = analyze(
+      'function Created(object){var inst=instance_create_layer(0,0,"Instances",object);var alias=inst;alias.external_field="text";return inst.external_field;}function LookedUp(){var inst=lookup_runtime_instance();inst.external_field=7;return inst.external_field;}function Input(){input_handle.external_field=1;return input_handle.external_field;}function NotCallable(){lookup_runtime_instance()();}',
+      external,
+      '2024.13.0.0',
+      {},
+      new Map<string, Type>([
+        [base.semanticKey, base],
+        [instance.semanticKey, instance],
+      ]),
+    );
+    expect(kinds(result.returns('Created'))).to.deep.equal(['String']);
+    expect(kinds(result.returns('LookedUp'))).to.deep.equal(['Real']);
+    expect(kinds(result.returns('Input'))).to.deep.equal(['Real']);
+    expect(
+      result.result.diagnostics.some((diagnostic) =>
+        diagnostic.message.includes('Cannot add variables'),
+      ),
+    ).to.equal(false);
+    expect(
+      result.result.diagnostics.some((diagnostic) =>
+        diagnostic.message.includes('not callable'),
+      ),
+    ).to.equal(true);
+    expect(base.isReadonly).to.equal(true);
+    expect(instance.isReadonly).to.equal(true);
+    expect(base.getMember('external_field')).to.equal(undefined);
+    expect(instance.getMember('external_field')).to.equal(undefined);
+  });
+
+  it('separates independent generic instance inputs while preserving assignment aliases', function () {
+    const base = Type.Struct;
+    base.semanticKey = 'native:input-base';
+    base.isReadonly = true;
+    const instance = new Type('Id.Instance');
+    instance.isReadonly = true;
+    instance.setBaseView(base);
+    const external = new Map(
+      ['first', 'second'].map((name) => {
+        const item = new Signifier(Type.Struct, name, instance);
+        item.semanticKey = globalKey(name);
+        item.replaceDefinition({});
+        return [name, { key: item.semanticKey, item }] as const;
+      }),
+    );
+    const types = new Map<string, Type>([
+      [base.semanticKey, base],
+      ['Id.Instance', instance],
+    ]);
+    const independent = analyze(
+      'function Probe(){first.field=1;second.field="other";return first.field;}',
+      external,
+      '2024.13.0.0',
+      {},
+      types,
+    );
+    expect(kinds(independent.returns('Probe'))).to.deep.equal(['Real']);
+    const alias = analyze(
+      'function Probe(){first.field=1;var alias=first;alias.field="other";return first.field;}',
+      external,
+      '2024.13.0.0',
+      {},
+      types,
+    );
+    expect(kinds(alias.returns('Probe'))).to.deep.equal(['String']);
+    const parameters = analyze(
+      '/// @param {Id.Instance} first\n/// @param {Id.Instance} second\nfunction Probe(first,second){first.field=1;second.field="other";return first.field;}',
+      new Map(),
+      '2024.13.0.0',
+      {},
+      types,
+    );
+    expect(kinds(parameters.returns('Probe'))).to.deep.equal(['Real']);
+    const assigned = analyze(
+      '/// @param {Id.Instance} first\n/// @param {Id.Instance} second\nfunction Probe(first,second){first=second;first.field="alias";return second.field;}',
+      new Map(),
+      '2024.13.0.0',
+      {},
+      types,
+    );
+    expect(kinds(assigned.returns('Probe'))).to.deep.equal(['String']);
+    expect(base.getMember('field')).to.equal(undefined);
+    expect(instance.getMember('field')).to.equal(undefined);
+  });
+
+  it('keeps unidentified container instance members unknown without inventing shared storage', function () {
+    const base = Type.Struct;
+    base.semanticKey = 'native:unidentified-base';
+    base.isReadonly = true;
+    const instance = new Type('Id.Instance');
+    instance.isReadonly = true;
+    instance.setBaseView(base);
+    const handles = native('get_handles');
+    handles.item
+      .getTypeByKind('Function')!
+      .setReturnType(new Type('Array').addItemType(instance));
+    const result = analyze(
+      'function Probe(){get_handles()[0].field=1;get_handles()[0].field="other";return get_handles()[0].field;}function NotCallable(){get_handles()[0]();}',
+      new Map([['get_handles', handles]]),
+      '2024.13.0.0',
+      {},
+      new Map([[base.semanticKey, base]]),
+    );
+    expect(kinds(result.returns('Probe'))).to.deep.equal(['Any']);
+    expect(
+      result.result.diagnostics.some((diagnostic) =>
+        diagnostic.message.includes('Cannot add variables'),
+      ),
+    ).to.equal(false);
+    expect(
+      result.result.diagnostics.some((diagnostic) =>
+        diagnostic.message.includes('not callable'),
+      ),
+    ).to.equal(true);
+    expect(base.isReadonly).to.equal(true);
+    expect(base.getMember('field')).to.equal(undefined);
+  });
+
+  it('narrows native callable guards and conjunctions without allowing definite non-callable paths', function () {
+    const guards = new Map(
+      ['is_callable', 'is_method'].map((name) => {
+        const guard = native(name, 1);
+        guard.item.getTypeByKind('Function')!.setReturnType(Type.Bool);
+        return [name, guard] as const;
+      }),
+    );
+    const safe = analyze(
+      'function Safe(){var cb=undefined;if(is_callable(cb)&&true){cb();return "unreachable";}return 1;}function Guarded(cb){if(is_method(cb)&&true)return cb(1);return undefined;}',
+      guards,
+    );
+    expect(kinds(safe.returns('Safe'))).to.deep.equal(['Real']);
+    expect(
+      safe.result.diagnostics.some((diagnostic) =>
+        diagnostic.message.includes('not callable'),
+      ),
+    ).to.equal(false);
+    const unsafe = analyze(
+      'function Unsafe(){var cb=undefined;if(!is_callable(cb))cb();}',
+      guards,
+    );
+    expect(
+      unsafe.result.diagnostics.some((diagnostic) =>
+        diagnostic.message.includes('not callable'),
+      ),
+    ).to.equal(true);
+    const named = analyze(
+      'function Callback(){return 1;}function Probe(){var cb=Callback;if(!is_method(cb))return cb();return "method";}',
+      guards,
+    );
+    expect(kinds(named.returns('Probe'))).to.deep.equal(['Real', 'String']);
+    expect(
+      named.result.diagnostics.some((diagnostic) =>
+        diagnostic.message.includes('not callable'),
+      ),
+    ).to.equal(false);
+  });
+
+  it('selects constant switch entries while preserving fallthrough and unknown selector paths', function () {
+    const selected = analyze(
+      'function Probe(){var cb=undefined;switch(1){case 2:cb();return "unreachable";case 1:;case 3:return 7;default:return "unreachable";}}',
+    );
+    expect(kinds(selected.returns('Probe'))).to.deep.equal(['Real']);
+    expect(
+      selected.result.diagnostics.some((diagnostic) =>
+        diagnostic.message.includes('not callable'),
+      ),
+    ).to.equal(false);
+    const earlyDefault = analyze(
+      'function Probe(){var cb=undefined;switch(1){default:cb();return "unreachable";case 1:return 7;}}',
+    );
+    expect(kinds(earlyDefault.returns('Probe'))).to.deep.equal(['Real']);
+    expect(
+      earlyDefault.result.diagnostics.some((diagnostic) =>
+        diagnostic.message.includes('not callable'),
+      ),
+    ).to.equal(false);
+    const recovery = analyze(
+      'function Probe(){var result=1;switch(1){case 1:return result;case (result="invalid label"):return result;}return result;}',
+    );
+    expect(kinds(recovery.returns('Probe'))).to.deep.equal(['Real']);
+    const unknown = analyze(
+      'function Probe(selector){var cb=undefined;switch(selector){case 2:cb();break;case 1:return 7;}return undefined;}',
+    );
+    expect(
+      unknown.result.diagnostics.some((diagnostic) =>
+        diagnostic.message.includes('not callable'),
+      ),
+    ).to.equal(true);
+  });
+
   it('solves recursive return shapes without an arbitrary pass limit', function () {
     const recursive = analyze('function Tree(){return {next:Tree()};}');
     const shape = recursive.returns('Tree').type[0];
     expect(shape.kind).to.equal('Struct');
     expect(shape.getMember('next')!.type.type[0].kind).to.equal('Struct');
     expect(recursive.result.status).to.equal('complete');
+    let current = shape;
+    for (let depth = 0; depth < 64; depth++) {
+      current = current.getMember('next')!.type.type[0];
+      expect(current.kind).to.equal('Struct');
+    }
+  });
+
+  it('solves recursive arrays and distinct mutually recursive allocations', function () {
+    const arrays = analyze('function Tree(){return [Tree()];}');
+    let array = arrays.returns('Tree').type[0];
+    for (let depth = 0; depth < 64; depth++) {
+      expect(array.kind).to.equal('Array');
+      array = array.items!.type[0];
+    }
+    expect(arrays.result.status).to.equal('complete');
+    const mutual = analyze(
+      'function Left(){return {left:1,next:Right()};}function Right(){return {right:"text",next:Left()};}',
+    );
+    let shape = mutual.returns('Left').type[0];
+    for (let depth = 0; depth < 32; depth++) {
+      expect(kinds(shape.getMember('left')!.type)).to.deep.equal(['Real']);
+      expect(shape.getMember('right')).to.equal(undefined);
+      const right = shape.getMember('next')!.type.type[0];
+      expect(kinds(right.getMember('right')!.type)).to.deep.equal(['String']);
+      expect(right.getMember('left')).to.equal(undefined);
+      shape = right.getMember('next')!.type.type[0];
+    }
+    expect(mutual.result.status).to.equal('complete');
+  });
+
+  it('retains terminating alternatives through recursive returns and late native allocations', function () {
+    const tree = analyze(
+      'function Tree(stop){if(stop)return undefined;return {value:1,next:Tree(stop)};}',
+    );
+    expect(kinds(tree.returns('Tree'))).to.deep.equal(['Struct', 'Undefined']);
+    let shape = tree
+      .returns('Tree')
+      .type.find((type) => type.kind === 'Struct')!;
+    for (let depth = 0; depth < 32; depth++) {
+      expect(kinds(shape.getMember('value')!.type)).to.deep.equal(['Real']);
+      const next = shape.getMember('next')!.type;
+      expect(kinds(next)).to.deep.equal(['Struct', 'Undefined']);
+      shape = next.type.find((type) => type.kind === 'Struct')!;
+    }
+    const create = native('array_create', 2);
+    create.item.getTypeByKind('Function')!.setReturnType(new Type('Array'));
+    const allocated = analyze(
+      'function Tree(){return array_create(1,Tree());}',
+      new Map([['array_create', create]]),
+    );
+    let array = allocated.returns('Tree').type[0];
+    for (let depth = 0; depth < 32; depth++) {
+      expect(array.kind).to.equal('Array');
+      array = array.items!.type[0];
+    }
+    expect(tree.result.status).to.equal('complete');
+    expect(allocated.result.status).to.equal('complete');
   });
 
   it('keeps legacy script calls and caller storage available before 2.3', function () {
@@ -577,6 +923,79 @@ describe('Transactional GML semantics', function () {
           dependency.facet === 'items',
       ),
     ).to.equal(true);
+  });
+
+  it('keeps inherited native members canonical through declaration skeletons and external writes', function () {
+    const owner = 'object:Widget:self';
+    const context: Partial<UnitContext> = {
+      kind: 'object-event',
+      selfOwner: owner,
+    };
+    const source = analyze('image_index=1;', new Map(), '2024.13.0.0', context);
+    const skeleton = createDeclarationSummary(source.bound).types.get(owner)!;
+    const base = Type.Struct;
+    base.semanticKey = 'native:widget-base';
+    const image = new Signifier(base, 'image_index', Type.Real);
+    image.semanticKey = globalKey(image.name);
+    image.native = 'Base';
+    image.instance = true;
+    base.setOwnMember(image);
+    skeleton.setBaseView(base);
+    const resource = new Type('Asset.GMObject').named('Widget');
+    resource.semanticKey = 'Asset.GMObject.Widget';
+    const symbol = new Signifier(Type.Struct, 'Widget', resource);
+    symbol.semanticKey = globalKey(symbol.name);
+    symbol.replaceDefinition({});
+    const external = new Map([
+      [symbol.name, { key: symbol.semanticKey, item: symbol }],
+    ]);
+    const types = new Map<string, Type>([
+      [owner, skeleton],
+      [base.semanticKey, base],
+      [resource.semanticKey, resource],
+    ]);
+    const event = analyze(
+      'image_index=1;',
+      external,
+      '2024.13.0.0',
+      context,
+      types,
+    );
+    const eventReferences = event.view.refs.filter(
+      (reference) => reference.item.name === 'image_index',
+    );
+    expect(eventReferences).to.have.length(1);
+    for (const reference of eventReferences) {
+      expect(reference.item.native).to.equal('Base');
+      expect(reference.item.def?.file).to.equal(undefined);
+      expect(reference.isDef).to.equal(false);
+    }
+    for (const shape of [skeleton, event.result.types.get(owner)!]) {
+      resource.setBaseView(shape);
+      types.set(owner, shape);
+      const writer = analyze(
+        'Widget.image_index=2;function Read(){return Widget.image_index;}',
+        external,
+        '2024.13.0.0',
+        {},
+        types,
+      );
+      const references = writer.view.refs.filter(
+        (reference) => reference.item.name === 'image_index',
+      );
+      expect(references).to.have.length(2);
+      for (const reference of references) {
+        expect(reference.item.native).to.equal('Base');
+        expect(reference.item.def?.file).to.equal(undefined);
+        expect(reference.isDef).to.equal(false);
+      }
+      expect(
+        [...writer.result.symbols.values()].some(
+          (symbol) => symbol.item.name === 'image_index' && !!symbol.origin,
+        ),
+      ).to.equal(false);
+      expect(kinds(writer.returns('Read'))).to.deep.equal(['Real']);
+    }
   });
 
   it('preserves intrinsic identity and readonly metadata after invalid source declarations', function () {

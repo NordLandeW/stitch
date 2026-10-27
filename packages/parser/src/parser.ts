@@ -38,6 +38,14 @@ export class GmlParser extends CstParser {
 
   readonly file = this.RULE('file', () => {
     this.SUBRULE(this.statements);
+    this.MANY(() => this.SUBRULE(this.extensionFunction));
+  });
+
+  /** Extension callable sections end at the next #define or physical EOF. */
+  readonly extensionFunction = this.RULE('extensionFunction', () => {
+    this.CONSUME(t.Define);
+    this.CONSUME(t.Identifier);
+    this.SUBRULE(this.statements);
   });
 
   optionallyConsumeSemicolon() {
@@ -277,10 +285,18 @@ export class GmlParser extends CstParser {
   });
 
   readonly identifierAccessor = this.RULE('identifierAccessor', () => {
-    this.OPTION(() => {
-      this.CONSUME(t.New);
-    });
-    this.SUBRULE(this.identifier);
+    this.OR1([
+      {
+        ALT: () => {
+          this.CONSUME(t.New);
+          this.OR2([
+            { ALT: () => this.SUBRULE(this.identifier) },
+            { ALT: () => this.SUBRULE(this.parenthesizedExpression) },
+          ]);
+        },
+      },
+      { ALT: () => this.SUBRULE2(this.identifier) },
+    ]);
     this.MANY(() => {
       this.SUBRULE(this.accessorSuffixes);
     });
@@ -396,12 +412,14 @@ export class GmlParser extends CstParser {
     this.CONSUME(t.Enum);
     this.CONSUME1(t.Identifier);
     this.CONSUME(t.StartBrace);
-    this.SUBRULE(this.enumMember);
-    this.MANY(() => {
-      this.CONSUME2(t.Comma);
-      this.SUBRULE2(this.enumMember);
+    this.OPTION1(() => {
+      this.SUBRULE(this.enumMember);
+      this.MANY(() => {
+        this.CONSUME2(t.Comma);
+        this.SUBRULE2(this.enumMember);
+      });
+      this.OPTION2(() => this.CONSUME3(t.Comma));
     });
-    this.OPTION(() => this.CONSUME3(t.Comma));
     this.CONSUME(t.EndBrace);
   });
 
@@ -473,6 +491,8 @@ export class GmlParser extends CstParser {
     this.OPTION2(() => this.SUBRULE2(this.expression));
     this.CONSUME3(t.Semicolon);
     this.OPTION3(() => this.SUBRULE3(this.expression));
+    // The third clause is a statement and may retain its terminating semicolon.
+    this.OPTION4(() => this.CONSUME4(t.Semicolon));
     this.CONSUME(t.EndParen);
     this.SUBRULE(this.blockableStatement);
   });

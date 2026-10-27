@@ -48,6 +48,7 @@ export function bindUnit(syntax: SyntaxUnit, context: UnitContext): BoundUnit {
       role === 'global' ||
       role === 'enum' ||
       role === 'legacy-script' ||
+      role === 'extension-function' ||
       (role === 'function' &&
         scope === root &&
         context.kind === 'script' &&
@@ -118,8 +119,63 @@ export function bindUnit(syntax: SyntaxUnit, context: UnitContext): BoundUnit {
       }
     } else if (statement.kind === 'function') {
       const node = statement.expression;
-      if (node.name)
-        declare(node.name, node, scope, 'function', { docs: node.docs });
+      if (node.name) {
+        if (node.extension) {
+          const exports =
+            context.extensionFunctions?.filter(
+              (binding) => binding.sourceName === node.name!.text,
+            ) || [];
+          const first = exports[0];
+          const primary = declare(
+            { ...node.name, text: first?.name || node.name.text },
+            node,
+            scope,
+            'extension-function',
+            {
+              docs: node.docs,
+              extensionModule: context.assetName,
+              extensionSignature: first?.signatureKey,
+              hidden: first?.hidden ?? true,
+            },
+          );
+          for (const alias of exports.slice(1))
+            declare(
+              {
+                ...node.name,
+                id: `${node.name.id}:${alias.name}`,
+                text: alias.name,
+              },
+              node,
+              scope,
+              'extension-function',
+              {
+                docs: node.docs,
+                extensionModule: context.assetName,
+                extensionSignature: alias.signatureKey,
+                extensionTarget: `function:${primary.key}`,
+                hidden: alias.hidden,
+              },
+            );
+          // A definition may use a raw external name different from its public
+          // metadata aliases. Internal calls still address that implementation.
+          if (
+            first &&
+            !exports.some((binding) => binding.name === node.name!.text)
+          )
+            declare(
+              { ...node.name, id: `${node.name.id}:implementation` },
+              node,
+              scope,
+              'extension-function',
+              {
+                docs: node.docs,
+                extensionModule: context.assetName,
+                extensionTarget: `function:${primary.key}`,
+                hidden: true,
+              },
+            );
+        } else declare(node.name, node, scope, 'function', { docs: node.docs });
+      }
     } else if (statement.kind === 'block')
       statement.statements.forEach((child) => prepare(child, scope));
     else if (statement.kind === 'if') {
@@ -148,7 +204,9 @@ export function bindUnit(syntax: SyntaxUnit, context: UnitContext): BoundUnit {
       assigned || (node.name && declarationSites.get(node.name.id));
     const key = declaration?.key || `${context.unitId}:function:${node.id}`;
     const declaredFunction =
-      declaration?.role === 'function' || declaration?.role === 'legacy-script';
+      declaration?.role === 'function' ||
+      declaration?.role === 'legacy-script' ||
+      declaration?.role === 'extension-function';
     const typeKey = declaredFunction
       ? `function:${key}`
       : `function:${node.id}`;
@@ -157,7 +215,9 @@ export function bindUnit(syntax: SyntaxUnit, context: UnitContext): BoundUnit {
     const selfOwner = node.constructor
       ? `struct:${declaredFunction ? key : node.id}`
       : selfHint ||
-        (declaration?.role === 'function' && outer.selfOwner === globalOwner
+        ((declaration?.role === 'function' ||
+          declaration?.role === 'extension-function') &&
+        outer.selfOwner === globalOwner
           ? `${typeKey}:caller-self`
           : outer.selfOwner);
     const scope: MutableScope = {

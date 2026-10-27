@@ -1,6 +1,6 @@
 # Language analysis and editor integration
 
-Stitch analyzes GML as a project: scripts, object events, native specifications, extensions, configuration-specific macros, and resource relationships contribute to the same view. Syntax normalization, binding, type evaluation, legality checking, and publication are separate phases. A dependency worklist updates consumers when declarations, inferred returns, members, or previously missing names change.
+Stitch analyzes GML as a project: scripts, object events, room and instance creation code, timeline moments, GML extensions, native specifications, configuration-specific macros, and resource relationships contribute to the same view. Syntax normalization, binding, type evaluation, legality checking, and publication are separate phases. A dependency worklist updates consumers when declarations, inferred returns, members, or previously missing names change.
 
 ## Loading and updating
 
@@ -73,19 +73,39 @@ The profile uses a known runtime version first, then the IDE version, then nonbu
 
 Sources: [2.3 language changes](https://gamemaker.io/en/blog/gamemaker-studio-2-dot-3-new-gml-features), [2.3.7 runtime notes](https://gms.yoyogames.com/release-notes-2.3.7.474.json), [2023.4 release](https://gamemaker.io/en/blog/release-2023-4).
 
+## Resource-owned GML
+
+The current YYP and YY metadata select executable files. Unlisted event files, timeline moments, disabled instance creation files, and unrelated GML files remain outside the analysis. Nested room instance layers are included.
+
+| Source                 | Analysis context                                                                                                                          |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Script / object event  | Versioned script semantics or the declaring object's instance scope.                                                                      |
+| Instance creation code | A placed-instance scope derived from its object; assignments do not become fields of every instance of that object.                       |
+| Room creation code     | A separate room-creation scope. Explicit global writes contribute to project globals.                                                     |
+| Timeline moment        | A dynamic caller-instance scope shared by the listed moments. The caller's concrete object type is not inferred from timeline assignment. |
+| GML extension file     | Each `#define` section is a callable implementation within one physical source document, including on legacy targets.                     |
+
+Extension YY names and external implementation names are linked for navigation. Multiple public aliases retain their own parameter signatures, while implementation analysis combines the possible implicit argument types. Typed parameter entries retain their declared positions, including in legacy metadata with a zero `argCount`. A positive `argCount` supplies any additional untyped slots; those parameter types remain unknown. A negative count keeps the typed prefix and permits additional arguments. Hidden functions remain callable and navigable but are omitted from completion. Metadata-backed names are excluded from GML-only rename. Extension constants currently retain scalar or unknown metadata types; arbitrary extension macro bodies are not expanded as GML text.
+
+Metadata-only changes rebind source contexts. Removing a source from YY retires its analysis without deleting the file. Explicit source deletion updates the corresponding metadata, and room rename rewrites its creation-code path. Source lookup and refresh also follow project-relative paths outside a resource's directory.
+
+A physical file referenced in different execution contexts, within one resource or across resources, produces metadata warnings and is excluded from semantic analysis. Source deletion is rejected while another resource references the file; removing one metadata owner restores the surviving context. Missing optional creation-code files are warnings because metadata can retain empty or stale bodies. If a room's declared creation path is missing but its resource-local `RoomCreationCode.gml` exists, that file is analyzed with a warning; the target compiler's path resolution is not assumed to be verified.
+
+Sources: [room properties](https://manual.gamemaker.io/monthly/en/The_Asset_Editors/Room_Properties/Room_Properties.htm), [timelines](https://manual.gamemaker.io/monthly/en/The_Asset_Editors/Timelines.htm), [GML extensions](https://manual.gamemaker.io/monthly/en/The_Asset_Editors/Extension_Creation/Creating_An_Extension.htm).
+
 ## Object Variable Definitions
 
 Object-editor Variable Definitions contribute instance fields before Create-event analysis, including inherited definitions when a child has its own Create event without `event_inherited()`. This metadata inheritance is independent of executing the parent's Create code.
 
 Numeric, integer, and colour definitions start as `Real`; string and Boolean definitions start as `String` and `Bool`. Multiple-selection lists start as arrays of unknown elements. Expressions, assets, and single-selection lists retain unknown values when the metadata does not establish a reliable runtime type. Later GML assignments update the current flow value; project-wide storage summaries can include both initial and written types.
 
-`Signifier.resourceDefinition` records the declaring YY resource and field name. These fields participate in completion and type analysis, but GML rename is disabled because their authoritative declaration is metadata. Removing a definition or changing the parent refreshes its provenance. Default expressions, per-instance room overrides, and editor value choices are not executed by this analysis, and YY definition navigation/editing is not provided.
+`Signifier.resourceDefinition` records the declaring YY resource and field name. These fields participate in completion and type analysis, but GML rename is disabled because their authoritative declaration is metadata. Removing a definition or changing the parent refreshes its provenance. Default expressions and per-instance room overrides remain unparsed metadata: their embedded GML references and source locations are not analyzed. YY definition navigation/editing and editor value-choice validation are not provided.
 
 Source: [Object Variables](https://manual.gamemaker.io/monthly/en/The_Asset_Editors/Object_Properties/Object_Variables.htm).
 
 ## Macros and source locations
 
-Macro definitions are collected project-wide before expansion. Expansion supports forward and nested references, configuration qualifiers, and backslash continuations. Each invocation is analyzed in its own scope. Recursive expansion and conflicting definitions produce local diagnostics while recoverable surrounding code remains available.
+Macro definitions are collected project-wide before expansion. Expansion supports forward and nested references, configuration qualifiers, and backslash continuations, including trailing comments after a continuation marker. Each invocation is analyzed in its own scope. Recursive expansion and conflicting definitions produce local diagnostics while recoverable surrounding code remains available.
 
 ```gml
 #macro MOVE_SPEED 4
@@ -118,8 +138,14 @@ Return `false` only when rejecting before application. Throw when an application
 
 `planReferenceRename()` validates a complete reference set before producing edits. Pass the project's full reference collection when macros are involved. Storage collisions, lexical capture, incompatible overlapping roles, and ambiguous shared spellings in union members or macro expansions are rejected. Qualified type annotations preserve their namespace when the referenced declaration is renamed. Struct shorthand retains independent property and value identities, expanding to an explicit pair when required.
 
+## Type and flow inference
+
+User-defined functions support omitted and additional arguments according to GML semantics. Native signatures retain their required-argument checks. Callable guards establish callable values; constructor capability remains unknown until a concrete function contract establishes it. A self-only annotation describes a function's receiver, while a type annotation constrains the variable's stored value.
+
+Native `array_create` and `ds_*_create` container factories use distinct allocation-site storage, while assigned aliases retain shared storage. Container element summaries combine possible writes rather than modeling every runtime element. Known object arguments refine the results of `instance_create`, `instance_create_depth`, and `instance_create_layer`. Generic instance handles permit dynamic fields without changing the shared native specification or becoming arbitrary callable values. Unbound dependent native return types remain unknown.
+
+Flow analysis tracks writes, branches, loop exits, returns, and throws; annotations and known container keys supply additional type information. Constant switch selectors restrict reachable entries while preserving fallthrough. `with` accounts for zero, single, or repeated targets and owns its `break`/`continue` boundary; `return`, `throw`, and `exit` propagate outward. Nullish operators evaluate right-hand runtime effects only on paths where the left value can be `undefined` or `pointer_null`; `??=` retains the receiver and index captured before those effects.
+
 ## Conservative analysis boundaries
 
-GML's runtime-generated names, dynamic instance selection, and arbitrary string-based lookup can exceed static knowledge. Unknown values remain conservative. Enum analysis distinguishes compile-time eligibility from a runtime literal inferred for a user variable; uncertain native constant results retain explicit uncertainty instead of fabricated enum values. Operator grouping or numeric precision without sufficient target evidence is left unfolded.
-
-User-defined functions support omitted and additional arguments according to GML semantics. Native signatures retain their required-argument checks. Flow analysis tracks writes, branches, loop exits, returns, and throws; annotations and known container keys supply additional type information. `with` accounts for zero, single, or repeated targets and owns its `break`/`continue` boundary; `return`, `throw`, and `exit` propagate outward. Nullish operators evaluate right-hand runtime effects only on paths where the left value can be `undefined` or `pointer_null`; `??=` retains the receiver and index captured before those effects.
+GML's runtime-generated names, dynamic instance selection, and arbitrary string-based lookup can exceed static knowledge. Unknown values remain conservative. Recursive container types form finite type graphs. Type text uses `...` for recursive edges or after 8,192 displayed type nodes, keeping heavily shared graphs from expanding into exponential hover text. This presentation budget leaves inference and the underlying graph unchanged; `...` is a display marker rather than a Feather annotation. Enum analysis distinguishes compile-time eligibility from a runtime literal inferred for a user variable; uncertain native constant results retain explicit uncertainty instead of fabricated enum values. Operator grouping or numeric precision without sufficient target evidence is left unfolded.

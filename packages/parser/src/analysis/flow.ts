@@ -1,5 +1,5 @@
 import type { TypeStore } from '../types.js';
-import { fingerprint, join, value } from './values.js';
+import { fingerprints, join, value } from './values.js';
 
 export interface FlowState {
   readonly values: Map<string, TypeStore>;
@@ -36,8 +36,10 @@ export function mergeFlow(states: readonly FlowState[]): FlowState {
   return merged;
 }
 export function flowKey(state: FlowState): string {
-  return `${state.reachable}:${[...state.values]
-    .map(([key, current]) => `${key}=${fingerprint(current)}`)
+  const entries = [...state.values];
+  const summaries = fingerprints(entries.map(([, current]) => current));
+  return `${state.reachable}:${entries
+    .map(([key], index) => `${key}=${summaries[index]}`)
     .sort()
     .join(';')}`;
 }

@@ -7,6 +7,18 @@ export interface FileCstNode extends CstNode {
 
 export type FileCstChildren = {
   statements: StatementsCstNode[];
+  extensionFunction?: ExtensionFunctionCstNode[];
+};
+
+export interface ExtensionFunctionCstNode extends CstNode {
+  name: 'extensionFunction';
+  children: ExtensionFunctionCstChildren;
+}
+
+export type ExtensionFunctionCstChildren = {
+  Define: IToken[];
+  Identifier: IToken[];
+  statements: StatementsCstNode[];
 };
 
 export interface StatementsCstNode extends CstNode {
@@ -312,7 +324,8 @@ export interface IdentifierAccessorCstNode extends CstNode {
 
 export type IdentifierAccessorCstChildren = {
   New?: IToken[];
-  identifier: IdentifierCstNode[];
+  identifier?: IdentifierCstNode[];
+  parenthesizedExpression?: ParenthesizedExpressionCstNode[];
   accessorSuffixes?: AccessorSuffixesCstNode[];
   assignment?: AssignmentCstNode[];
 };
@@ -472,7 +485,7 @@ export type EnumStatementCstChildren = {
   Enum: IToken[];
   Identifier: IToken[];
   StartBrace: IToken[];
-  enumMember: EnumMemberCstNode[];
+  enumMember?: EnumMemberCstNode[];
   Comma?: IToken[];
   EndBrace: IToken[];
 };
@@ -861,6 +874,7 @@ export type CatchStatementCstChildren = {
 
 export interface GmlVisitor<IN, OUT> extends ICstVisitor<IN, OUT> {
   file(children: FileCstChildren, param?: IN): OUT;
+  extensionFunction(children: ExtensionFunctionCstChildren, param?: IN): OUT;
   statements(children: StatementsCstChildren, param?: IN): OUT;
   statement(children: StatementCstChildren, param?: IN): OUT;
   jsdoc(children: JsdocCstChildren, param?: IN): OUT;

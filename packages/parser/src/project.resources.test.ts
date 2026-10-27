@@ -1373,7 +1373,7 @@ describe('Project resource and edit host boundaries with owned temporary files',
       expect(initial).to.have.lengthOf(2);
       expect(
         initial.some((item) =>
-          /listed GML file is missing: Step_0\.gml/i.test(item.message),
+          /listed GML file is missing: .*Step_0\.gml/i.test(item.message),
         ),
       ).to.equal(true);
       expect(
@@ -1417,7 +1417,7 @@ describe('Project resource and edit host boundaries with owned temporary files',
       const filesOnly = project.publishedFor(yyUri);
       expect(filesOnly).to.have.lengthOf(1);
       expect(filesOnly[0].message).to.match(
-        /listed GML file is missing: Create_0\.gml/i,
+        /listed GML file is missing: .*Create_0\.gml/i,
       );
       expectRetired(project, oldCreate, oldReferences);
       expect(object.parent).to.equal(undefined);
@@ -1994,5 +1994,767 @@ describe('Project and Code rename callbacks with dirty host documents', function
       expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
       expect(batches).to.have.lengthOf(1); // Recovery is read/reconcile, never retrying or reversing the batch.
     }, options);
+  });
+});
+
+async function addExecutableResource(
+  fixture: ResourceFixture,
+  kind: 'rooms' | 'timelines' | 'extensions',
+  name: string,
+  metadata: Record<string, unknown>,
+  files: Record<string, string>,
+) {
+  const resource = { id: { name, path: `${kind}/${name}/${name}.yy` } };
+  const yy = Yy.schemas[kind].parse({ name, ...metadata });
+  await Yy.write(fixture.file(resource.id.path), yy, kind, fixture.project.yyp);
+  fixture.project.yyp.resources.push(resource);
+  for (const [file, text] of Object.entries(files))
+    await writeFile(fixture.file(`${kind}/${name}/${file}`), text, 'utf8');
+  return resource;
+}
+
+describe('YY-owned executable source contexts', function () {
+  it('loads nested instance creation in separate object-derived scopes and rebinds metadata-only changes', async function () {
+    await withFixture(async (fixture) => {
+      const first = await fixture.object('SourceFirst', {
+        'Create_0.gml': 'base_value = 1;',
+      });
+      const second = await fixture.object('SourceSecond', {
+        'Create_0.gml': 'base_value = "text";',
+      });
+      const room = await addExecutableResource(
+        fixture,
+        'rooms',
+        'SourceRoom',
+        {
+          layers: [
+            {
+              resourceType: 'GMRLayer',
+              name: 'Group',
+              layers: [
+                {
+                  resourceType: 'GMRInstanceLayer',
+                  name: 'Instances',
+                  instances: [
+                    {
+                      name: 'inst_first',
+                      objectId: first.id,
+                      hasCreationCode: true,
+                    },
+                    {
+                      name: 'inst_second',
+                      objectId: first.id,
+                      hasCreationCode: true,
+                    },
+                    {
+                      name: 'inst_unlisted',
+                      objectId: first.id,
+                      hasCreationCode: false,
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+          instanceCreationOrder: [
+            'inst_first',
+            'inst_second',
+            'inst_unlisted',
+          ].map((name) => ({ name, path: 'rooms/SourceRoom/SourceRoom.yy' })),
+        },
+        {
+          'InstanceCreationCode_inst_first.gml':
+            'var read_base = base_value; instance_only = 3;',
+          'InstanceCreationCode_inst_second.gml': 'other_only = "second";',
+          'InstanceCreationCode_inst_unlisted.gml':
+            'global.should_not_be_loaded = true;',
+        },
+      );
+      const project = await fixture.load();
+      const code = fixture.code(
+        'SourceRoom',
+        'InstanceCreationCode_inst_first.gml',
+      );
+      const other = fixture.code(
+        'SourceRoom',
+        'InstanceCreationCode_inst_second.gml',
+      );
+      expectValue(code, 'read_base', 'Real');
+      expect(
+        code.refs.find((ref) => ref.item.name === 'base_value')?.item.def?.file,
+      ).to.equal(fixture.code('SourceFirst', 'Create_0.gml'));
+      expect(project.self.getMember('instance_only')).to.equal(undefined);
+      expect(
+        fixture
+          .asset('SourceFirst', 'objects')
+          .variables?.getMember('instance_only'),
+      ).to.equal(undefined);
+      expect(
+        other
+          .getInScopeSymbolsAt(0)
+          .some((symbol) => symbol.name === 'instance_only'),
+      ).to.equal(false);
+      expect(project.self.getMember('should_not_be_loaded')).to.equal(
+        undefined,
+      );
+      const yy = await Yy.read(fixture.file(room.id.path), 'rooms');
+      const layer = (yy.layers[0] as { layers: unknown[] }).layers[0] as {
+        instances: { objectId: YypResource['id']; hasCreationCode: boolean }[];
+      };
+      layer.instances[0].objectId = second.id;
+      await Yy.write(fixture.file(room.id.path), yy, 'rooms', project.yyp);
+      await project.reloadResource(pathy(fixture.file(room.id.path)));
+      expect(
+        fixture.code('SourceRoom', 'InstanceCreationCode_inst_first.gml'),
+      ).to.equal(code);
+      expectValue(code, 'read_base', 'String');
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+      layer.instances[0].hasCreationCode = false;
+      await Yy.write(fixture.file(room.id.path), yy, 'rooms', project.yyp);
+      await project.reloadResource(pathy(fixture.file(room.id.path)));
+      expect(code.analysisState.status).to.equal('retired');
+      expect(project.getGmlFile(code.path)).to.equal(undefined);
+      expect(await readFile(code.path.absolute, 'utf8')).to.include(
+        'instance_only',
+      );
+      await project
+        .getAssetByName('SourceRoom', { assertExists: true })
+        .removeRoomInstance('inst_second');
+      expect(other.analysisState.status).to.equal('retired');
+      expect(await readFile(other.path.absolute, 'utf8')).to.include(
+        'other_only',
+      );
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+    });
+  });
+
+  it('selects only listed timeline moments and keeps dynamic caller fields out of globals', async function () {
+    await withFixture(async (fixture) => {
+      const timeline = await addExecutableResource(
+        fixture,
+        'timelines',
+        'SourceTimeline',
+        {
+          momentList: [
+            { moment: 1, evnt: { isDnD: false, eventNum: 1 } },
+            { moment: 10, evnt: { isDnD: false, eventNum: 10 } },
+          ],
+        },
+        {
+          'moment_1.gml':
+            'frozen = false; var caller_value = existing_caller_field;',
+          'moment_10.gml':
+            'timeline_running = false; global.timeline_marker = 1;',
+          'moment_99.gml': 'global.unlisted_moment = true;',
+        },
+      );
+      const project = await fixture.load();
+      const first = fixture.code('SourceTimeline', 'moment_1.gml');
+      expect(first.getDiagnostics().SYNTAX_ERROR).to.have.lengthOf(0);
+      expect(missing(first, 'existing_caller_field')).to.have.lengthOf(0);
+      expect(project.self.getMember('frozen')).to.equal(undefined);
+      expect(project.self.getMember('unlisted_moment')).to.equal(undefined);
+      expect(project.self.getMember('timeline_marker')?.def?.file).to.equal(
+        fixture.code('SourceTimeline', 'moment_10.gml'),
+      );
+      await first.remove();
+      const yy = await Yy.read(fixture.file(timeline.id.path), 'timelines');
+      expect(
+        (yy.momentList as { moment: number }[]).map((entry) => entry.moment),
+      ).to.deep.equal([10]);
+      expect(first.analysisState.status).to.equal('retired');
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+    });
+  });
+
+  it('binds extension callable sections, public aliases, hidden helpers and implicit arguments to their physical source', async function () {
+    await withFixture(async (fixture) => {
+      const extension = await addExecutableResource(
+        fixture,
+        'extensions',
+        'SourceExtension',
+        {
+          files: [
+            {
+              resourceType: 'GMExtensionFile',
+              kind: 2,
+              filename: 'Source.gml',
+              constants: [],
+              functions: [
+                {
+                  name: 'source_public',
+                  externalName: 'raw_echo',
+                  help: '',
+                  returnType: 1,
+                  args: [1],
+                  argCount: 1,
+                },
+                {
+                  name: 'source_alias',
+                  externalName: 'raw_echo',
+                  help: '',
+                  returnType: 1,
+                  args: [1, 2],
+                  argCount: 2,
+                },
+                {
+                  name: 'source_hidden',
+                  externalName: 'raw_hidden',
+                  help: '',
+                  returnType: 1,
+                  args: [],
+                  hidden: true,
+                },
+              ],
+            },
+          ],
+        },
+        {
+          'source.gml':
+            '#define raw_echo\nreturn argument0;\n#define raw_hidden\nreturn "hidden";\n',
+        },
+      );
+      await fixture.script(
+        'SourceConsumer',
+        'var first_result = source_public("one"); var alias_result = source_alias("two", 1); var hidden_result = source_hidden();',
+      );
+      const project = await fixture.load();
+      const code = fixture.code('SourceExtension', 'source.gml');
+      const consumer = fixture.code('SourceConsumer');
+      expect(code.getDiagnostics().SYNTAX_ERROR).to.have.lengthOf(0);
+      expect(code.getDiagnostics().INVALID_OPERATION).to.have.lengthOf(0);
+      expectValue(consumer, 'first_result', 'String');
+      expectValue(consumer, 'alias_result', 'String');
+      expectValue(consumer, 'hidden_result', 'String');
+      for (const name of ['source_public', 'source_alias', 'source_hidden']) {
+        expect(project.self.getMember(name)?.def?.file, name).to.equal(code);
+        expect(missing(consumer, name), name).to.have.lengthOf(0);
+      }
+      const names = consumer
+        .getCompletionCandidatesAt(0)
+        .map((candidate) => candidate.name);
+      expect(names).to.include('source_public');
+      expect(names).not.to.include('source_hidden');
+      expect(names).not.to.include('raw_echo');
+      expect(project.self.getMember('source_public')?.isRenameable).to.equal(
+        false,
+      );
+      expect(
+        project.self.getMember('source_public')?.type.type[0].listParameters(),
+      ).to.have.lengthOf(1);
+      expect(
+        project.self.getMember('source_alias')?.type.type[0].listParameters(),
+      ).to.have.lengthOf(2);
+      expect(consumer.getDiagnostics().TOO_MANY_ARGUMENTS).to.have.lengthOf(0);
+      expect(
+        consumer.getDiagnostics().MISSING_REQUIRED_ARGUMENT,
+      ).to.have.lengthOf(0);
+      await fixture.updateExtension(
+        fixture.asset('SourceExtension', 'extensions'),
+        (yy) => {
+          for (const func of yy.files[0].functions.slice(0, 2)) {
+            func.args = [2];
+            func.returnType = 2;
+          }
+        },
+      );
+      expect(fixture.code('SourceExtension', 'source.gml')).to.equal(code);
+      expectValue(consumer, 'first_result', 'Real');
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+      await code.remove();
+      expect(
+        (await Yy.read(fixture.file(extension.id.path), 'extensions')).files,
+      ).to.have.lengthOf(0);
+      expect(project.self.getMember('source_public')?.def).to.equal(undefined);
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+      await fixture.removeFromYyp(extension.id.name);
+      expect(code.analysisState.status).to.equal('retired');
+      expect(project.self.getMember('source_public')?.def).to.equal(undefined);
+    });
+  });
+
+  it('resolves project-relative room creation paths and rewrites their metadata on room rename', async function () {
+    await withFixture(async (fixture) => {
+      await addExecutableResource(
+        fixture,
+        'rooms',
+        'CreationBefore',
+        {
+          creationCodeFile:
+            '${project_dir}/rooms/CreationBefore/RoomCreationCode.gml',
+        },
+        {
+          'RoomCreationCode.gml':
+            'room_private = true; global.room_marker = 3;',
+        },
+      );
+      const project = await fixture.load();
+      const before = fixture.code('CreationBefore', 'RoomCreationCode.gml');
+      expect(project.self.getMember('room_private')).to.equal(undefined);
+      expect(project.getGmlFile(before.path)).to.equal(before);
+      await project.renameAsset('CreationBefore', 'CreationAfter');
+      const asset = project.getAssetByName('CreationAfter', {
+        assertExists: true,
+      });
+      expect((asset.yy as YyData<'rooms'>).creationCodeFile).to.equal(
+        '${project_dir}/rooms/CreationAfter/RoomCreationCode.gml',
+      );
+      const after = fixture.code('CreationAfter', 'RoomCreationCode.gml');
+      expect(project.self.getMember('room_marker')?.def?.file).to.equal(after);
+      expect(before.analysisState.status).to.equal('retired');
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+      await after.remove();
+      expect(
+        (await Yy.read(asset.yyPath.absolute, 'rooms')).creationCodeFile,
+      ).to.equal('');
+    });
+  });
+
+  it('diagnoses shared physical room code, rejects stale deletion and recovers the surviving owner', async function () {
+    await withFixture(async (fixture) => {
+      const first = await addExecutableResource(
+        fixture,
+        'rooms',
+        'SharedFirst',
+        {
+          creationCodeFile: 'rooms/SharedFirst/RoomCreationCode.gml',
+        },
+        { 'RoomCreationCode.gml': 'global.shared_marker = 1;' },
+      );
+      const second = await addExecutableResource(
+        fixture,
+        'rooms',
+        'SharedSecond',
+        {},
+        {},
+      );
+      const project = await fixture.load();
+      const before = fixture.code('SharedFirst', 'RoomCreationCode.gml');
+      const yy = await Yy.read(fixture.file(second.id.path), 'rooms');
+      yy.creationCodeFile = 'rooms/SharedFirst/RoomCreationCode.gml';
+      await Yy.write(fixture.file(second.id.path), yy, 'rooms', project.yyp);
+      await project.reloadResource(pathy(fixture.file(second.id.path)));
+      expect(project.getGmlFile(before.path)).to.equal(undefined);
+      expect(project.self.getMember('shared_marker')?.def).to.equal(undefined);
+      for (const resource of [first, second])
+        expect(
+          project
+            .publishedFor(pathy(fixture.file(resource.id.path)).absolute)
+            .some((item) =>
+              item.message.includes('shared by multiple resources'),
+            ),
+        ).to.equal(true);
+      let rejected = false;
+      try {
+        await before.remove();
+      } catch {
+        rejected = true;
+      }
+      expect(rejected).to.equal(true);
+      rejected = false;
+      try {
+        await project.removeAssetByName('SharedFirst');
+      } catch {
+        rejected = true;
+      }
+      expect(rejected).to.equal(true);
+      expect(project.getAssetByName('SharedFirst')).not.to.equal(undefined);
+      expect(await readFile(before.path.absolute, 'utf8')).to.equal(
+        'global.shared_marker = 1;',
+      );
+      await fixture.removeFromYyp('SharedFirst');
+      const survivor = fixture.code('SharedSecond', 'RoomCreationCode.gml');
+      expect(project.getGmlFile(survivor.path)).to.equal(survivor);
+      expect(project.self.getMember('shared_marker')?.def?.file).to.equal(
+        survivor,
+      );
+      await writeFile(
+        survivor.path.absolute,
+        'global.shared_marker = "changed";',
+      );
+      await project.reloadResource(survivor.path);
+      expect(
+        kinds(project.self.getMember('shared_marker')?.type),
+      ).to.deep.equal(['String']);
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+    });
+  });
+
+  it('retires all contexts when one room lists its instance code as room creation code', async function () {
+    await withFixture(async (fixture) => {
+      const object = await fixture.object('ContextObject', {
+        'Create_0.gml': 'base_value = 1;',
+      });
+      const room = await addExecutableResource(
+        fixture,
+        'rooms',
+        'RepeatedContext',
+        {
+          layers: [
+            {
+              resourceType: 'GMRInstanceLayer',
+              name: 'Instances',
+              instances: [
+                {
+                  name: 'inst_shared',
+                  objectId: object.id,
+                  hasCreationCode: true,
+                },
+              ],
+            },
+          ],
+          instanceCreationOrder: [
+            {
+              name: 'inst_shared',
+              path: 'rooms/RepeatedContext/RepeatedContext.yy',
+            },
+          ],
+        },
+        {
+          'InstanceCreationCode_inst_shared.gml': 'global.context_marker = 1;',
+        },
+      );
+      const project = await fixture.load();
+      const previous = fixture.code(
+        'RepeatedContext',
+        'InstanceCreationCode_inst_shared.gml',
+      );
+      const yy = await Yy.read(fixture.file(room.id.path), 'rooms');
+      yy.creationCodeFile =
+        'rooms/RepeatedContext/InstanceCreationCode_inst_shared.gml';
+      await Yy.write(fixture.file(room.id.path), yy, 'rooms', project.yyp);
+      await project.reloadResource(pathy(fixture.file(room.id.path)));
+      expect(previous.analysisState.status).to.equal('retired');
+      expect(project.getGmlFile(previous.path)).to.equal(undefined);
+      expect(project.self.getMember('context_marker')?.def).to.equal(undefined);
+      expect(
+        project
+          .publishedFor(pathy(fixture.file(room.id.path)).absolute)
+          .some(
+            (item) =>
+              item.severity === 'warning' &&
+              item.message.includes('multiple execution contexts'),
+          ),
+      ).to.equal(true);
+      yy.creationCodeFile = '';
+      await Yy.write(fixture.file(room.id.path), yy, 'rooms', project.yyp);
+      await project.reloadResource(pathy(fixture.file(room.id.path)));
+      const restored = fixture.code(
+        'RepeatedContext',
+        'InstanceCreationCode_inst_shared.gml',
+      );
+      expect(restored).not.to.equal(previous);
+      expect(restored.sourceContext.kind).to.equal('instance-creation');
+      expect(project.self.getMember('context_marker')?.def?.file).to.equal(
+        restored,
+      );
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+    });
+  });
+
+  it('supports GML extension sections on pre-2.3 targets without treating them as modern function syntax', async function () {
+    await withFixture(async (fixture) => {
+      fixture.project.config.runtimeVersion = '2.2.5.481';
+      await addExecutableResource(
+        fixture,
+        'extensions',
+        'LegacySource',
+        {
+          files: [
+            {
+              resourceType: 'GMExtensionFile',
+              kind: 2,
+              filename: 'legacy.gml',
+              constants: [],
+              functions: [
+                {
+                  name: 'legacy_export',
+                  externalName: 'legacy_impl',
+                  help: '',
+                  returnType: 1,
+                  args: [1],
+                  argCount: 1,
+                },
+              ],
+            },
+          ],
+        },
+        { 'legacy.gml': '#define legacy_impl\nreturn argument0;\n' },
+      );
+      await fixture.script(
+        'LegacyConsumer',
+        'var legacy_result = legacy_export("text");',
+      );
+      const project = await fixture.load();
+      const code = fixture.code('LegacySource', 'legacy.gml');
+      expect(code.getDiagnostics().SYNTAX_ERROR).to.have.lengthOf(0);
+      expect(code.getDiagnostics().INVALID_OPERATION).to.have.lengthOf(0);
+      expectValue(fixture.code('LegacyConsumer'), 'legacy_result', 'String');
+      expect(project.self.getMember('legacy_export')?.def?.file).to.equal(code);
+    });
+  });
+});
+
+describe('Native container allocation identity', function () {
+  it('keeps separate created maps independent while preserving assigned aliases', async function () {
+    await withFixture(async (fixture) => {
+      await fixture.script(
+        'SeparateMaps',
+        [
+          'var left = ds_map_create();',
+          'var right = ds_map_create();',
+          'left[? "field"] = 1;',
+          'right[? "field"] = "text";',
+          'var from_left = left[? "field"];',
+          'var from_right = right[? "field"];',
+          'var alias = left;',
+          'alias[? "field"] = true;',
+          'var from_alias = left[? "field"];',
+        ].join('\n'),
+      );
+      await fixture.load();
+      const code = fixture.code('SeparateMaps');
+      expectValue(code, 'from_left', 'Real');
+      expectValue(code, 'from_right', 'String');
+      // Container element summaries combine writes; an alias reaches the same
+      // container without importing values written to the unrelated map.
+      expect(kinds(definition(code, 'from_alias').item.type)).to.deep.equal([
+        'Bool',
+        'Real',
+      ]);
+    });
+  });
+
+  it('keeps array factory sites distinct and preserves reference-valued initialization', async function () {
+    await withFixture(async (fixture) => {
+      await fixture.script(
+        'SeparateArrays',
+        [
+          'var numbers = array_create(2, 1);',
+          'var texts = array_create(2, "text");',
+          'var number_value = numbers[0];',
+          'var text_value = texts[0];',
+          'var shared = ds_map_create();',
+          'shared[? "value"] = 1;',
+          'var references = array_create(2, shared);',
+          'var element = references[0];',
+          'element[? "value"] = true;',
+          'var shared_value = shared[? "value"];',
+        ].join('\n'),
+      );
+      const project = await fixture.load();
+      const code = fixture.code('SeparateArrays');
+      expectValue(code, 'number_value', 'Real');
+      expectValue(code, 'text_value', 'String');
+      expect(kinds(definition(code, 'shared_value').item.type)).to.deep.equal([
+        'Bool',
+        'Real',
+      ]);
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+    });
+  });
+});
+
+describe('Native instance return identity', function () {
+  it('preserves created object members, dynamic fields and assigned aliases without changing native storage', async function () {
+    await withFixture(async (fixture) => {
+      await fixture.object('CreatedObject', { 'Create_0.gml': 'payload = 1;' });
+      await fixture.script(
+        'CreateConsumer',
+        [
+          'var created = instance_create_depth(0,0,0,CreatedObject);',
+          'created.payload = "text";',
+          'var received = created.payload;',
+          'created.external_field = true;',
+          'var alias = created;',
+          'var external_value = alias.external_field;',
+          'var layered = instance_create_layer(0,0,"Instances",CreatedObject);',
+          'var layer_value = layered.payload;',
+        ].join('\n'),
+      );
+      const project = await fixture.load();
+      const code = fixture.code('CreateConsumer');
+      expect(code.getDiagnostics().INVALID_OPERATION).to.deep.equal([]);
+      expectValue(code, 'received', 'String');
+      expectValue(code, 'external_value', 'Bool');
+      expect(
+        definition(code, 'created').item.getTypeByKind('Id.Instance')?.name,
+      ).to.equal('CreatedObject');
+      expect(project.native.objectInstanceBase.isReadonly).to.equal(true);
+      expect(
+        project.native.objectInstanceBase.getMember('external_field'),
+      ).to.equal(undefined);
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+    });
+  });
+});
+
+describe('Callable capability knowledge', function () {
+  it('keeps guarded constructor capability unknown while rejecting a known ordinary function', async function () {
+    await withFixture(async (fixture) => {
+      await fixture.script(
+        'ConstructorKnowledge',
+        [
+          'function DynamicCtor(candidate){if(is_method(candidate))return new candidate();return undefined;}',
+          'function Ordinary(){return 1;}',
+          'function KnownCtor() constructor {payload=1;}',
+          'function Good(){return new KnownCtor();}',
+          'function Definite(){return new Ordinary();}',
+        ].join('\n'),
+      );
+      await fixture.load();
+      const code = fixture.code('ConstructorKnowledge');
+      const errors = code.getDiagnostics().INVALID_OPERATION;
+      expect(errors).to.have.length(1);
+      expect(errors[0].message).to.include('requires a constructor');
+      expect(errors[0].location.start.offset).to.be.greaterThan(
+        code.content.indexOf('function Definite'),
+      );
+    });
+  });
+});
+
+describe('Conditional expression normalization', function () {
+  it('keeps comparison conditions outside ternary branches and honors explicit RHS grouping', async function () {
+    await withFixture(async (fixture) => {
+      await fixture.script(
+        'ConditionalConsumer',
+        [
+          'var conditional = "p" + (1 > 0 ? "a" : "b");',
+          'var legacy = "p" + (1 = 0 ? "a" : "b");',
+          'var grouped = 1 > (0 ? 2 : 3);',
+          'var nested = "p" + (1 > 0 ? "a" : (1 < 0 ? "b" : "c"));',
+          'var invalid = "p" + (1 > (0 ? 2 : 3));',
+        ].join('\n'),
+      );
+      await fixture.load();
+      const code = fixture.code('ConditionalConsumer');
+      for (const name of ['conditional', 'legacy', 'nested'])
+        expectValue(code, name, 'String');
+      expectValue(code, 'grouped', 'Bool');
+      const errors = code.getDiagnostics().INVALID_OPERATION;
+      expect(errors).to.have.length(1);
+      expect(errors[0].location.start.offset).to.be.greaterThan(
+        code.content.indexOf('var invalid'),
+      );
+    });
+  });
+});
+
+describe('Extension argument metadata', function () {
+  it('retains positive arity when argument type metadata is absent', async function () {
+    await withFixture(async (fixture) => {
+      await addExecutableResource(
+        fixture,
+        'extensions',
+        'UntypedArguments',
+        {
+          files: [
+            {
+              resourceType: 'GMExtensionFile',
+              filename: 'arguments.gml',
+              kind: 2,
+              functions: [
+                {
+                  name: 'untyped_entry',
+                  externalName: 'untyped_impl',
+                  help: '',
+                  returnType: 2,
+                  argCount: 1,
+                  args: [],
+                },
+              ],
+            },
+          ],
+        },
+        { 'arguments.gml': '#define untyped_impl\nreturn argument0;' },
+      );
+      await fixture.script(
+        'ArityConsumer',
+        'var result = untyped_entry(false);',
+      );
+      const project = await fixture.load();
+      const code = fixture.code('ArityConsumer');
+      expect(code.getDiagnostics().TOO_MANY_ARGUMENTS).to.deep.equal([]);
+      expect(code.getDiagnostics().MISSING_REQUIRED_ARGUMENT).to.deep.equal([]);
+      const parameters = project.self
+        .getMember('untyped_entry')!
+        .getTypeByKind('Function')!
+        .listParameters();
+      expect(parameters).to.have.length(1);
+      expect(parameters[0]!.type.type[0].kind).to.equal('Any');
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+    });
+  });
+
+  it('preserves typed DLL and legacy GML parameters when argCount remains zero', async function () {
+    await withFixture(async (fixture) => {
+      await addExecutableResource(
+        fixture,
+        'extensions',
+        'TypedArguments',
+        {
+          files: [
+            {
+              resourceType: 'GMExtensionFile',
+              filename: 'fixture.dll',
+              kind: 1,
+              functions: [
+                {
+                  name: 'typed_dll_entry',
+                  externalName: 'typed_dll_impl',
+                  kind: 1,
+                  help: '',
+                  returnType: 2,
+                  args: [1, 2],
+                  argCount: 0,
+                },
+              ],
+            },
+            {
+              resourceType: 'GMExtensionFile',
+              filename: 'legacy.gml',
+              kind: 2,
+              functions: [
+                {
+                  name: 'typed_legacy_entry',
+                  externalName: 'typed_legacy_impl',
+                  kind: 2,
+                  help: '',
+                  returnType: 2,
+                  args: [1, 2],
+                  argCount: 0,
+                },
+              ],
+            },
+          ],
+        },
+        { 'legacy.gml': '#define typed_legacy_impl\nreturn argument1;' },
+      );
+      await fixture.script(
+        'TypedArityConsumer',
+        [
+          'var native_result=typed_dll_entry("text",1);',
+          'var legacy_result=typed_legacy_entry("text",1);',
+          'typed_dll_entry();',
+          'typed_dll_entry("text",1,2);',
+        ].join('\n'),
+      );
+      const project = await fixture.load();
+      const code = fixture.code('TypedArityConsumer');
+      expectValue(code, 'legacy_result', 'Real');
+      expect(code.getDiagnostics().MISSING_REQUIRED_ARGUMENT).to.have.length(1);
+      expect(code.getDiagnostics().TOO_MANY_ARGUMENTS).to.have.length(1);
+      for (const name of ['typed_dll_entry', 'typed_legacy_entry']) {
+        const parameters = project.self
+          .getMember(name)!
+          .getTypeByKind('Function')!
+          .listParameters();
+        expect(parameters).to.have.length(2);
+        expect(kinds(parameters[0]!.type)).to.deep.equal(['String']);
+        expect(kinds(parameters[1]!.type)).to.deep.equal(['Real']);
+      }
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+    });
   });
 });

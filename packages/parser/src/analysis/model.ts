@@ -54,6 +54,7 @@ export interface StructEntry extends SyntaxNode {
 }
 export interface FunctionExpression extends SyntaxNode {
   readonly kind: 'function';
+  readonly extension?: boolean;
   readonly name?: Name;
   readonly parameters: readonly Parameter[];
   readonly body: Statement;
@@ -231,7 +232,21 @@ export interface UnitContext {
   readonly unitId: string;
   readonly assetId: string;
   readonly assetName: string;
-  readonly kind: 'script' | 'object-event' | 'other';
+  readonly kind:
+    | 'script'
+    | 'object-event'
+    | 'room-creation'
+    | 'instance-creation'
+    | 'timeline'
+    | 'extension'
+    | 'other';
+  readonly dynamicSelf?: boolean;
+  readonly extensionFunctions?: readonly {
+    sourceName: string;
+    name: string;
+    hidden: boolean;
+    signatureKey: string;
+  }[];
   readonly eventName?: string;
   readonly selfOwner?: TypeKey;
   readonly definitiveSelf: boolean;
@@ -250,7 +265,8 @@ export type DeclarationRole =
   | 'enum'
   | 'enum-member'
   | 'annotation'
-  | 'legacy-script';
+  | 'legacy-script'
+  | 'extension-function';
 export interface Declaration {
   readonly id: string;
   readonly key: SymbolKey;
@@ -266,6 +282,10 @@ export interface Declaration {
   readonly exported: boolean;
   readonly parameterIndex?: number;
   readonly optional?: boolean;
+  readonly extensionModule?: string;
+  readonly extensionSignature?: string;
+  readonly extensionTarget?: string;
+  readonly hidden?: boolean;
 }
 export interface BindingScope {
   readonly key: string;

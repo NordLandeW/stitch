@@ -210,6 +210,48 @@ describe('macro preprocessing', function () {
     });
   }
 
+  for (const newline of ['\n', '\r\n']) {
+    it(`continues code before trailing comments without consuming later statements (${JSON.stringify(newline)})`, function () {
+      const definitions = document(
+        'commented-continuation',
+        [
+          '#macro APPLY if (ready) {\\ // open block',
+          '    value += 2;\\ // update the caller',
+          '  }\\\\ /* close block */',
+          '  value += 3;',
+          '#macro STOP 7 // a comment ending in \\',
+          'var outside = 9;',
+          '#macro TEXT "https://example.test/keep"',
+        ].join(newline),
+      );
+      const usage = document(
+        'commented-continuation-use',
+        'APPLY\nvar total = STOP; var text = TEXT;',
+      );
+      const collection = collectMacros(definitions);
+      assertMasked(collection);
+      expect(collection.diagnostics).to.deep.equal([]);
+      expect(collection.maskedText).to.include('var outside = 9;');
+      const result = new MacroEnvironment([
+        collection,
+        collectMacros(usage),
+      ]).expand(usage);
+      expect(result.diagnostics).to.deep.equal([]);
+      const tokens = parsedTokens(result);
+      expect(tokens.filter((token) => token.image === 'value')).to.have.length(
+        2,
+      );
+      expect(tokens.some((token) => token.image === 'outside')).to.equal(false);
+      expect(result.text).to.include('"https://example.test/keep"');
+      for (const number of ['2', '3', '7']) {
+        const token = tokens.find((token) => token.image === number)!;
+        expect(
+          result.sourceMap.origin(token.startOffset, token.endOffset!).spelling,
+        ).to.deep.equal(span(definitions, number));
+      }
+    });
+  }
+
   it('expands each occurrence in its invocation scope rather than caching the definition value', async function () {
     const definitions = document(
       'dynamic-definition',

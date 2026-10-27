@@ -16,6 +16,11 @@ import { logger } from './logger.js';
 import { parser, type GmlParsed } from './parser.js';
 import type { Asset } from './project.asset.js';
 import {
+  extensionDefinitionNames,
+  roomInstances,
+  type GmlSourceContext,
+} from './project.sources.js';
+import {
   Diagnostic,
   DiagnosticCollectionName,
   DiagnosticCollections,
@@ -73,6 +78,35 @@ export class Code {
   private _internalDiagnostics: Diagnostic[] = [];
   private _preprocessed?: PreprocessedDocument;
   protected _parsed!: GmlParsed;
+
+  private resourceContext?: GmlSourceContext;
+  private extensionNames?: { text: string; names: ReadonlySet<string> };
+  get extensionDefinitions(): ReadonlySet<string> {
+    if (this.extensionNames?.text !== this.content)
+      this.extensionNames = {
+        text: this.content,
+        names: extensionDefinitionNames(this.content),
+      };
+    return this.extensionNames.names;
+  }
+  get sourceContext(): GmlSourceContext {
+    return (
+      this.resourceContext ||
+      (this.isScript
+        ? { kind: 'script' }
+        : this.isObjectEvent
+          ? {
+              kind: 'object-event',
+              selfOwner: `object:${this.asset.name}:self`,
+            }
+          : { kind: 'other' })
+    );
+  }
+  setSourceContext(context: GmlSourceContext): void {
+    if (JSON.stringify(this.sourceContext) === JSON.stringify(context)) return;
+    this.resourceContext = Object.freeze({ ...context });
+    getProjectAnalysis(this.project).invalidate(this);
+  }
 
   get content(): string {
     return this._content;
@@ -420,7 +454,12 @@ export class Code {
         continue;
       const names = new Set<string>();
       for (const symbol of receiver.listMembers()) {
-        if (names.has(symbol.name) || (!symbol.def && !symbol.native)) continue;
+        if (
+          symbol.hidden ||
+          names.has(symbol.name) ||
+          (!symbol.def && !symbol.native)
+        )
+          continue;
         names.add(symbol.name);
         if (receiver === this.project.self) {
           const definedInProject = !symbol.native && !!symbol.def?.file;
@@ -490,6 +529,7 @@ export class Code {
     const uniqueSignifiers = new Map<string, Signifier>();
     for (const signifier of allSignifiers) {
       if (
+        !signifier.hidden &&
         !uniqueSignifiers.has(signifier.name) &&
         (signifier.def || signifier.native)
       ) {
@@ -771,6 +811,40 @@ export class Code {
   }
 
   protected async removeFromYy() {
+    const source = this.sourceContext;
+    if (source.kind === 'instance-creation') {
+      for (const instance of roomInstances(
+        (this.asset.yy as { layers: unknown[] }).layers,
+      ))
+        if (instance.name === source.instanceName)
+          instance.hasCreationCode = false;
+      await this.asset.saveYy();
+      return;
+    }
+    if (source.kind === 'room-creation') {
+      (this.asset.yy as { creationCodeFile: string }).creationCodeFile = '';
+      await this.asset.saveYy();
+      return;
+    }
+    if (source.kind === 'timeline') {
+      const yy = this.asset.yy as { momentList: { moment: number }[] };
+      yy.momentList = yy.momentList.filter(
+        (entry) => entry.moment !== source.moment,
+      );
+      await this.asset.saveYy();
+      return;
+    }
+    if (source.kind === 'extension') {
+      const yy = this.asset.yy as { files: { filename?: string }[] };
+      yy.files = yy.files.filter(
+        (entry) =>
+          !entry.filename ||
+          this.asset.dir.join(entry.filename).absolute.toLocaleLowerCase() !==
+            this.path.absolute.toLocaleLowerCase(),
+      );
+      await this.asset.saveYy();
+      return;
+    }
     if (!this.asset.isObject) return;
     const eventInfo = this.objectEventInfo;
     if (!eventInfo) {
@@ -792,14 +866,22 @@ export class Code {
   }
 
   async remove() {
-    // update yy file
-    await this.removeFromYy();
-    // remove from asset's list of files
-    this.asset.gmlFiles.delete(this.path.absolute.toLocaleLowerCase());
-    // remove file
-    await this.path.delete();
-    getProjectAnalysis(this.project).retire(this);
-    await getProjectAnalysis(this.project).analyze();
+    await this.project.withResourceUpdate(async () => {
+      assert(
+        this.analysisState.status !== 'retired' &&
+          this.project
+            .sourceOwners(this.path)
+            .every((owner) => owner === this.asset),
+        'A shared or retired GML source cannot be deleted through one resource.',
+      );
+      await this.removeFromYy();
+      await this.path.delete();
+      this.asset.gmlFiles.delete(this.path.absolute.toLocaleLowerCase());
+      getProjectAnalysis(this.project).retire(this);
+      // Explicit Code-only hosts own their registrations without disk metadata.
+      if (this.asset.sourceCandidates !== undefined)
+        await this.asset.reload(false);
+    });
   }
 
   /**

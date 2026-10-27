@@ -57,6 +57,7 @@ import {
   constantTruth,
   dynamic,
   fingerprint,
+  fingerprints,
   foldBitwiseNot,
   foldNumeric,
   join,
@@ -67,6 +68,7 @@ import {
   primitive,
   unknown,
   value,
+  valueFrom,
   withoutUndefined,
   type Value,
 } from './values.js';
@@ -120,19 +122,24 @@ export function evaluateUnit(
   );
   for (;;) {
     if (environment.cancelled()) throw new AnalysisCancelled();
-    const result = new Evaluator(bound, {
-      lookup: (request) => environment.lookup(request),
-      type: (key) =>
-        callableKeys.has(key)
-          ? previous?.types.get(key) || environment.type(key)
-          : environment.type(key),
-      observe: () => {},
-      cancelled: () => environment.cancelled(),
-    }).run();
+    const result = new Evaluator(
+      bound,
+      {
+        lookup: (request) => environment.lookup(request),
+        type: (key) =>
+          callableKeys.has(key)
+            ? previous?.types.get(key) || environment.type(key)
+            : environment.type(key),
+        observe: () => {},
+        cancelled: () => environment.cancelled(),
+      },
+      undefined,
+      previous?.types,
+    ).run();
     const key = JSON.stringify([
       result.summary,
-      [...callableKeys].map((typeKey) =>
-        fingerprint(result.types.get(typeKey)!),
+      fingerprints(
+        [...callableKeys].map((typeKey) => result.types.get(typeKey)!),
       ),
     ]);
     const recursive = result.dependencies.some(
@@ -211,6 +218,9 @@ class Evaluator {
   readonly knownTypes = new Map<string, Type>();
   readonly writtenTypes = new Set<string>();
   readonly reboundSelf = new Map<string, Type>();
+  readonly extensionViews = new Map<string, FunctionType[]>();
+  readonly extensionImplementations = new Map<string, string>();
+  readonly recursiveAllocations = new Set<string>();
   callsSuper = false;
   degraded = false;
 
@@ -218,6 +228,7 @@ class Evaluator {
     readonly bound: BoundUnit,
     readonly environment: SemanticEnvironment,
     readonly methodAnalyses = new Map<string, MethodAnalysis>(),
+    readonly priorTypes?: ReadonlyMap<string, Type>,
   ) {
     this.diagnostics.push(...bound.diagnostics);
     for (const declaration of bound.declarations)
@@ -231,7 +242,8 @@ class Evaluator {
     for (const fn of bound.functions.values()) {
       if (
         fn.declaration?.role === 'function' ||
-        fn.declaration?.role === 'legacy-script'
+        fn.declaration?.role === 'legacy-script' ||
+        fn.declaration?.role === 'extension-function'
       )
         this.functionByKey.set(fn.key, fn);
       this.functionByType.set(fn.typeKey, fn);
@@ -239,13 +251,43 @@ class Evaluator {
       const type = this.ensureType(fn.typeKey, 'Function') as FunctionType;
       type.name = fn.declaration?.name || fn.node.name?.text;
       type.callKind =
-        fn.declaration?.role === 'legacy-script' ? 'legacy' : 'user';
+        fn.declaration?.role === 'legacy-script' ||
+        fn.declaration?.role === 'extension-function'
+          ? 'legacy'
+          : 'user';
       type.isConstructor = fn.node.constructor;
       type.local = this.ensureType(fn.localOwner) as StructType;
       type.statics = this.ensureType(fn.staticOwner) as StructType;
       type.self = this.ensureType(fn.selfOwner) as WithableType;
       if (type.isConstructor) type.self.name = type.name;
       type.returns = pending();
+      if (fn.declaration?.extensionModule) {
+        // One implementation may be exported through different native signatures.
+        // Its implicit arguments see all possible entry contracts; public views
+        // below retain their own arity and parameter types.
+        for (const declaration of bound.declarations) {
+          if (
+            !(
+              declaration.key === fn.key ||
+              declaration.extensionTarget === fn.typeKey
+            ) ||
+            !declaration.extensionSignature
+          )
+            continue;
+          const signature = this.environment.type(
+            declaration.extensionSignature,
+          );
+          if (signature?.kind !== 'Function') continue;
+          for (const parameter of signature.listParameters()) {
+            if (!parameter) continue;
+            const previous = type.getParameter(parameter.idx!);
+            type.addParameter(parameter.idx!, parameter.name, {
+              type: value(previous?.type, parameter.type).type,
+              optional: previous?.optional || parameter.optional,
+            });
+          }
+        }
+      }
       type.functionSource = {
         bound,
         functionId: fn.node.id,
@@ -259,7 +301,7 @@ class Evaluator {
           this.namedTypes.set(`Struct.${type.name}`, fn.selfOwner);
       }
     }
-    if (bound.context.kind === 'object-event' && bound.context.selfOwner) {
+    if (bound.context.selfOwner) {
       const self = this.types.get(bound.context.selfOwner)!;
       self.setBaseView(this.environment.type(bound.context.selfOwner)?.extends);
     }
@@ -272,12 +314,51 @@ class Evaluator {
         if (
           !symbol.intrinsic &&
           (fn.declaration?.role === 'function' ||
-            fn.declaration?.role === 'legacy-script')
+            fn.declaration?.role === 'legacy-script' ||
+            fn.declaration?.role === 'extension-function')
         )
           symbol.item.setType(type);
         type.signifier = symbol.item;
         if (type.isConstructor && type.self) type.self.signifier = symbol.item;
       }
+    }
+    for (const declaration of bound.declarations) {
+      if (!declaration.extensionModule) continue;
+      const implementationKey =
+        declaration.extensionTarget || `function:${declaration.key}`;
+      const implementation = this.types.get(implementationKey) as
+        | FunctionType
+        | undefined;
+      const symbol = this.symbols.get(declaration.key);
+      if (!implementation || !symbol) continue;
+      const signature = declaration.extensionSignature
+        ? this.environment.type(declaration.extensionSignature)
+        : undefined;
+      let type = implementation;
+      if (signature?.kind === 'Function') {
+        const viewKey = `extension-view:${declaration.key}`;
+        type = this.ensureType(viewKey, 'Function') as FunctionType;
+        type.name = declaration.name;
+        type.callKind = 'native';
+        type.local = this.ensureType(`${viewKey}:locals`) as StructType;
+        type.self = implementation.self;
+        type.statics = implementation.statics;
+        type.functionSource = implementation.functionSource;
+        type.returns = pending();
+        type.signifier = symbol.item;
+        for (const parameter of signature.listParameters())
+          if (parameter)
+            type.addParameter(parameter.idx!, parameter.name, {
+              type: parameter.type.type,
+              optional: parameter.optional,
+            });
+        let views = this.extensionViews.get(implementationKey);
+        if (!views) this.extensionViews.set(implementationKey, (views = []));
+        views.push(type);
+        this.extensionImplementations.set(viewKey, implementationKey);
+      }
+      symbol.item.setType(type);
+      this.namedTypes.set(`Function.${declaration.name}`, type.semanticKey!);
     }
     for (const [name, key] of this.namedTypes)
       this.knownTypes.set(name, this.types.get(key)!);
@@ -293,8 +374,10 @@ class Evaluator {
       const documented = this.annotation(declaration.docs);
       if (
         documented.length &&
+        declaration.docs.kind !== 'self' &&
         declaration.role !== 'function' &&
-        declaration.role !== 'legacy-script'
+        declaration.role !== 'legacy-script' &&
+        declaration.role !== 'extension-function'
       ) {
         contribution.item.setType(documented);
         this.annotated.add(contribution.key);
@@ -337,9 +420,20 @@ class Evaluator {
       }
       this.scopes.set(id, { ...scope, memberTypes });
     }
+    const exported = [...this.symbols.values()].filter(
+      (symbol) => symbol.exported,
+    );
+    const summaryTypes = [
+      ...exported.map((symbol) => symbol.item.type),
+      ...[...this.namedTypes.values()].map((key) => this.types.get(key)!),
+      ...[...this.writtenTypes].map((key) => this.types.get(key)!),
+    ];
+    const summaries = fingerprints(summaryTypes);
+    const summaryOf = new Map(
+      summaryTypes.map((type, index) => [type, summaries[index]]),
+    );
     const summary = JSON.stringify([
-      [...this.symbols.values()]
-        .filter((symbol) => symbol.exported)
+      exported
         .map((symbol) => [
           symbol.key,
           symbol.item.readable,
@@ -351,16 +445,16 @@ class Evaluator {
             symbol.item.resourceDefinition.uri,
             symbol.item.resourceDefinition.name,
           ],
-          fingerprint(symbol.item.type),
+          summaryOf.get(symbol.item.type)!,
         ])
         .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
       [...this.namedTypes]
-        .map(([name, key]) => [name, fingerprint(this.types.get(key)!)])
+        .map(([name, key]) => [name, summaryOf.get(this.types.get(key)!)!])
         .sort((a, b) => a[0].localeCompare(b[0])),
       this.callsSuper,
       [...this.writtenTypes]
         .sort()
-        .map((key) => [key, fingerprint(this.types.get(key)!)]),
+        .map((key) => [key, summaryOf.get(this.types.get(key)!)!]),
     ]);
     return {
       unitId: this.bound.unitId,
@@ -487,11 +581,18 @@ class Evaluator {
       if (resource?.item.resourceDefinition) imported = resource;
     }
     if (!imported && declaration.role === 'field' && container.extends) {
-      const member = container.extends.getMember(declaration.name);
+      const member = this.nativeMember(container.extends, declaration.name);
       if (member?.native)
         imported = { key: this.keyOf(member), item: member, intrinsic: true };
     }
-    if (imported && (imported.intrinsic || imported.item.native)) {
+    if (
+      imported &&
+      (imported.intrinsic || imported.item.native) &&
+      !(
+        declaration.extensionModule &&
+        imported.item.native === declaration.extensionModule
+      )
+    ) {
       item.semanticKey = declaration.key;
       item.replaceMetadata(imported.item, value(imported.item.type));
       item.replaceDefinition(imported.item.def, imported.item.declaration);
@@ -521,6 +622,8 @@ class Evaluator {
     if (imported?.item.resourceDefinition)
       item.replaceMetadata(imported.item, value(imported.item.type));
     item.semanticKey = declaration.key;
+    if (declaration.extensionModule) item.native = declaration.extensionModule;
+    item.hidden = !!declaration.hidden;
     item.def = {};
     item.local =
       declaration.role === 'local' || declaration.role === 'parameter';
@@ -532,7 +635,8 @@ class Evaluator {
     item.instance = ['field', 'static'].includes(declaration.role);
     item.enum = declaration.role === 'enum';
     item.enumMember = declaration.role === 'enum-member';
-    item.writable = !item.enum && !item.enumMember;
+    item.writable =
+      !item.enum && !item.enumMember && !declaration.extensionModule;
     item.definitive =
       this.bound.context.definitiveSelf ||
       this.bound.scopes.get(declaration.scope)?.functionId !== undefined;
@@ -560,7 +664,11 @@ class Evaluator {
       item.setType(type);
       this.namedTypes.set(`Enum.${declaration.name}`, enumKey);
     } else if (item.enumMember) {
-      const type = new Type('EnumMember').named(declaration.name);
+      const type = this.ensureType(
+        `enum-member:${declaration.key}`,
+        'EnumMember',
+      );
+      type.name = declaration.name;
       type.signifier = item;
       item.setType(type);
     }
@@ -735,6 +843,65 @@ class Evaluator {
       return imported;
     return;
   }
+  needsInstanceView(type: Type): boolean {
+    if (
+      type.kind !== 'Id.Instance' ||
+      type.name ||
+      type.literalValue !== undefined
+    )
+      return false;
+    let storage = type;
+    const seen = new Set<Type>();
+    while (
+      storage.kind === 'Id.Instance' &&
+      storage.extends &&
+      !seen.has(storage)
+    ) {
+      seen.add(storage);
+      storage = storage.extends;
+    }
+    return !type.extends || type.isReadonly || storage.isReadonly;
+  }
+  /** A runtime handle owns writable storage; the shared specification remains
+   * an immutable base. The wrapper retains its non-callable instance kind. */
+  instanceView(source: Type, key: string): Type {
+    let view = this.types.get(key);
+    if (!view) {
+      view = source.deriveDetached();
+      view.semanticKey = key;
+      view.isReadonly = false;
+      view.replaceOwnMembers([]);
+      const storage = this.ensureType(`${key}:storage`);
+      storage.setBaseView(source);
+      view.setBaseView(storage);
+      this.types.set(key, view);
+    }
+    return view;
+  }
+  inputInstanceViews(current: Value, identity: string): Value {
+    return valueFrom(
+      current.type.map((type) =>
+        this.needsInstanceView(type)
+          ? this.instanceView(
+              type,
+              `instance-input:${this.bound.unitId}:${identity}:${this.keyOfType(type)}`,
+            )
+          : type,
+      ),
+    );
+  }
+  callInstanceViews(current: Value, node: SyntaxNode): Value {
+    return valueFrom(
+      current.type.map((type) =>
+        this.needsInstanceView(type)
+          ? this.instanceView(
+              type,
+              `instance:${this.bound.unitId}:${node.id}:${this.keyOfType(type)}`,
+            )
+          : type,
+      ),
+    );
+  }
   storageType(type: Type): Type {
     const seen = new Set<Type>();
     while (
@@ -746,6 +913,22 @@ class Evaluator {
       type = type.extends;
     }
     return type;
+  }
+  /** Declaration skeletons may provisionally contain names from the native
+   * instance base. They never replace that base's runtime member identity. */
+  nativeMember(type: Type, name: string): Signifier | undefined {
+    const seen = new Set<Type>();
+    let found: Signifier | undefined;
+    for (
+      let cursor: Type | undefined = type;
+      cursor && !seen.has(cursor);
+      cursor = cursor.extends
+    ) {
+      seen.add(cursor);
+      const member = cursor.getMember(name, true);
+      if (member?.native) found = member;
+    }
+    return found;
   }
   lookupMember(
     type: Type,
@@ -776,6 +959,14 @@ class Evaluator {
           facet: 'base',
         });
       }
+    const native = roots
+      .map((root) => this.nativeMember(root, name))
+      .find((member) => !!member);
+    if (native) {
+      const key = this.keyOf(native);
+      this.observe({ kind: 'lookup', owner, name, target: key });
+      return { key, item: native, intrinsic: true };
+    }
     const candidate =
       this.types.get(owner)?.getMember(name) || type.getMember(name);
     this.observe({
@@ -801,22 +992,22 @@ class Evaluator {
     if (fn && this.functionStatus.get(fn.node.id) !== 'running')
       this.evaluateFunction(fn);
     const stored = state.values.get(symbol.key) || value(symbol.item.type);
-    const current = value(
-      ...stored.type.map(
+    const current = valueFrom(
+      stored.type.map(
         (type) =>
           (type.semanticKey && this.types.get(type.semanticKey)) || type,
       ),
     );
     if (symbol.constant !== undefined || symbol.nullPointer !== undefined)
-      return value(
-        ...current.type.map((type) => {
+      return valueFrom(
+        current.type.map((type) => {
           const copy = type.deriveDetached();
           copy.literalValue = symbol.constant;
           copy.nullPointer = symbol.nullPointer;
           return copy;
         }),
       );
-    return current;
+    return this.inputInstanceViews(current, `symbol:${symbol.key}`);
   }
   unresolved(name: Name, frame: Frame): SymbolView {
     const self = this.storageType(
@@ -840,7 +1031,12 @@ class Evaluator {
     const auto = this.bound.context.autoDeclareGlobalsPrefixes?.some((prefix) =>
       name.text.startsWith(prefix),
     );
-    if (!auto)
+    const dynamicCaller =
+      this.bound.context.dynamicSelf &&
+      owner !== globalOwner &&
+      (owner === this.bound.context.selfOwner ||
+        owner.endsWith(':caller-self'));
+    if (!auto && !dynamicCaller)
       this.diagnostic(
         name.origin,
         owner === globalOwner
@@ -877,7 +1073,13 @@ class Evaluator {
         frame.self =
           (self.kind === 'Function' ? self.self : self) || frame.self;
     }
-    if (frame.self) type.self = frame.self as WithableType;
+    if (frame.self) {
+      frame.self = this.inputInstanceViews(
+        value(frame.self),
+        `receiver:${scope.key}`,
+      ).type[0];
+      type.self = frame.self as WithableType;
+    }
     const state = initialFlow();
     this.scope(fn.node.body, frame);
     for (let index = 0; index < fn.node.parameters.length; index++) {
@@ -1021,9 +1223,37 @@ class Evaluator {
         if (!type.self.getMember(member.name, true))
           type.self.setOwnMember(member);
     }
+    for (const view of this.extensionViews.get(fn.typeKey) || [])
+      view.setReturnType(value(type.returns));
     this.functionStatus.set(fn.node.id, 'done');
     return type;
   }
+  /** A recursive call refers to this pass's allocation, not a deeper copy of
+   * the previous pass. Only proven local feedback roots are rebound; unrelated
+   * equal-key objects and external inputs retain their own graphs. */
+  recursiveReturn(prior: Value): Value {
+    return valueFrom(
+      prior.type.map((type) => {
+        const key = type.semanticKey;
+        if (!key || this.priorTypes?.get(key) !== type) return type;
+        let current = this.types.get(key);
+        if (
+          !current &&
+          (key.startsWith('array:') || key.startsWith('allocation:'))
+        ) {
+          // The allocation expression can occur after its recursive arguments.
+          // Reserve its identity now; its normal evaluator fills the contents.
+          current = type.deriveDetached();
+          current.semanticKey = key;
+          current.items = pending();
+          this.types.set(key, current);
+          if (key.startsWith('allocation:')) this.recursiveAllocations.add(key);
+        }
+        return current || type;
+      }),
+    );
+  }
+
   hasBase(type: Type, searched: Type): boolean {
     const seen = new Set<Type>();
     for (
@@ -1181,7 +1411,7 @@ class Evaluator {
           node.arguments.forEach((argument) => {
             if (argument.value) this.expression(argument.value, state, frame);
           });
-          if (!dynamic(target))
+          if (state.reachable && !dynamic(target))
             this.diagnostic(
               node.origin,
               'This value is not callable.',
@@ -1236,11 +1466,17 @@ class Evaluator {
         if (node.operator === '??')
           return this.coalesce(left, node.right, state, frame);
         const rightState = copyFlow(state);
+        const logical = ['&&', 'and', '||', 'or'].includes(node.operator);
+        const requiresTrue = ['&&', 'and'].includes(node.operator);
+        if (logical) this.narrow(node.left, rightState, requiresTrue, frame);
         const right = this.expression(node.right, rightState, frame);
-        if (['&&', 'and', '||', 'or'].includes(node.operator)) {
-          const merged = mergeFlow([state, rightState]);
+        if (logical) {
+          const skipped = copyFlow(state);
+          this.narrow(node.left, skipped, !requiresTrue, frame);
+          const merged = mergeFlow([skipped, rightState]);
           state.values.clear();
           merged.values.forEach((entry, key) => state.values.set(key, entry));
+          state.reachable = merged.reachable;
         } else {
           state.values.clear();
           rightState.values.forEach((entry, key) =>
@@ -1353,10 +1589,16 @@ class Evaluator {
       const leftString = left.type.some((type) => type.kind === 'String');
       const rightString = right.type.some((type) => type.kind === 'String');
       const leftOther = left.type.some(
-        (type) => !['String', 'Any', 'Unknown', 'Mixed'].includes(type.kind),
+        (type) =>
+          !['String', 'Any', 'Unknown', 'Mixed', 'ArgumentIdentity'].includes(
+            type.kind,
+          ),
       );
       const rightOther = right.type.some(
-        (type) => !['String', 'Any', 'Unknown', 'Mixed'].includes(type.kind),
+        (type) =>
+          !['String', 'Any', 'Unknown', 'Mixed', 'ArgumentIdentity'].includes(
+            type.kind,
+          ),
       );
       const alternatives: Type[] = [];
       if ((leftString || dynamic(left)) && (rightString || dynamic(right))) {
@@ -1532,6 +1774,14 @@ class Evaluator {
 
   callable(type: FunctionType): FunctionType {
     if (type.methodSource) return this.evaluateMethod(type);
+    const implementation = this.extensionImplementations.get(
+      type.semanticKey || '',
+    );
+    if (implementation) {
+      const fn = this.functionByType.get(implementation);
+      if (fn) this.evaluateFunction(fn);
+      return type;
+    }
     const fn = type.semanticKey && this.functionByType.get(type.semanticKey);
     return fn ? this.evaluateFunction(fn) : type;
   }
@@ -1656,11 +1906,17 @@ class Evaluator {
       cancelled: () => this.environment.cancelled(),
     };
     const seen = new Set<string>();
+    let priorTypes: ReadonlyMap<string, Type> | undefined;
     record.active = true;
     try {
       for (;;) {
         this.checkCancellation();
-        const child = new Evaluator(bound, environment, this.methodAnalyses);
+        const child = new Evaluator(
+          bound,
+          environment,
+          this.methodAnalyses,
+          priorTypes,
+        );
         const target = self.deriveDetached();
         target.semanticKey = this.keyOfType(self);
         for (const member of self.listMembers(true)) {
@@ -1675,6 +1931,7 @@ class Evaluator {
         child.dynamicSelf.set(fn.selfOwner, target);
         child.reboundSelf.set(fn.node.id, target);
         const result = child.evaluateFunction(fn);
+        priorTypes = child.types;
         record.diagnostics = child
           .uniqueDiagnostics()
           .filter((diagnostic) => diagnostic.severity === 'error');
@@ -1893,13 +2150,104 @@ class Evaluator {
       const key = this.functionByKey.get(symbol.key)!.typeKey;
       const prior = this.environment.type(key)?.returns;
       this.observe({ kind: 'type', owner: key, facet: 'returns' });
-      if (prior) returns = prior;
+      if (prior) returns = this.recursiveReturn(prior);
     }
     if (!returns.hasTypes) return pending();
-    return normalizeType(
+    const normalized = normalizeType(
       replaceGenerics(returns, this.knownTypes, generics),
       this.knownTypes,
     );
+    // Native specifications use ArgumentIdentity for dependent results. Keep
+    // resolved alternatives; an unbound leaf carries no concrete type fact.
+    const resolved = valueFrom(
+      normalized.type.map((type) =>
+        type.kind === 'ArgumentIdentity' ? new Type('Unknown') : type,
+      ),
+    );
+    const instance = this.nativeInstanceResult(
+      callName,
+      argumentValues,
+      resolved,
+    );
+    if (instance) return this.callInstanceViews(instance, node);
+    // These native calls allocate fresh mutable containers. Their shared
+    // specification return type is a contract, not storage owned by every call.
+    // https://manual.gamemaker.io/monthly/en/GameMaker_Language/GML_Reference/Data_Structures/DS_Maps/ds_map_create.htm
+    // https://manual.gamemaker.io/monthly/en/GameMaker_Language/GML_Reference/Variable_Functions/array_create.htm
+    if (
+      callName === 'array_create' ||
+      /^ds_(map|list|grid|queue|stack|priority)_create$/.test(callName || '')
+    ) {
+      return value(
+        ...resolved.type.map((type) => {
+          if (type.kind !== 'Array' && !type.kind.startsWith('Id.Ds'))
+            return type;
+          const key = `allocation:${this.bound.unitId}:${node.id}:${type.kind}`;
+          let owned = this.types.get(key);
+          if (!owned || this.recursiveAllocations.delete(key)) {
+            owned ||= type.deriveDetached();
+            owned.semanticKey = key;
+            owned.items =
+              callName === 'array_create'
+                ? value(argumentValues[1] || primitive('Real'))
+                : undefined;
+            this.types.set(key, owned);
+          }
+          return owned;
+        }),
+      );
+    }
+    return this.callInstanceViews(resolved, node);
+  }
+
+  /** Create has completed before these calls return. Keep the selected resource
+   * instance view separate from the immutable generic native return contract. */
+  nativeInstanceResult(
+    name: string | undefined,
+    arguments_: readonly Value[],
+    fallback: Value,
+  ): Value | undefined {
+    const objectIndex =
+      name === 'instance_create_layer' || name === 'instance_create_depth'
+        ? 3
+        : name === 'instance_create'
+          ? 2
+          : undefined;
+    if (objectIndex === undefined) return undefined;
+    const objects = arguments_[objectIndex];
+    if (!objects?.hasTypes) return fallback;
+    const instances: Type[] = [];
+    let unknownObject = false;
+    for (const object of objects.type) {
+      const instance =
+        object.kind === 'Asset.GMObject' && object.name
+          ? this.readType(`Id.Instance.${object.name}`, 'members')
+          : undefined;
+      if (instance?.kind !== 'Id.Instance' || instance.name !== object.name) {
+        unknownObject = true;
+        continue;
+      }
+      instances.push(instance);
+      this.observe({
+        kind: 'type',
+        owner: this.keyOfType(object),
+        facet: 'members',
+      });
+      const seen = new Set<Type>();
+      for (
+        let current: Type | undefined = instance;
+        current && !seen.has(current);
+        current = current.extends
+      ) {
+        seen.add(current);
+        this.observe({
+          kind: 'type',
+          owner: this.keyOfType(current),
+          facet: 'members',
+        });
+      }
+    }
+    return valueFrom(unknownObject ? [...instances, fallback] : instances);
   }
 
   readTarget(target: Expression, state: FlowState, frame: Frame): Value {
@@ -2020,27 +2368,9 @@ class Evaluator {
             const item = new Signifier(owner, target.name.text);
             item.semanticKey = memberKey(actualOwner, target.name.text);
             item.instance = true;
-            item.replaceDefinition({});
-            const resolved = {
-              ...declaration,
-              key: item.semanticKey,
-              owner: actualOwner,
-            };
-            actual = {
-              key: item.semanticKey,
-              item,
-              origin: declaration.origin,
-              declaration: resolved,
-              bare: declaration.bare,
-            };
-            this.symbols.set(item.semanticKey, {
-              ...actual,
-              owner: actualOwner,
-              unitId: this.bound.unitId,
-              exported: true,
-            });
-            owner.setOwnMember(item);
+            actual = { key: item.semanticKey, item, bare: declaration.bare };
           }
+          actual = this.ownWrite(actual, target.name, frame) || actual;
           this.redirectSymbol(declaration.key, actual.key);
           symbol = actual;
         }
@@ -2100,6 +2430,37 @@ class Evaluator {
     );
     return current;
   }
+  /** Every real write owns a candidate site, even when another unit already
+   * supplied the member. Borrowed definition locations are never owned facts. */
+  ownWrite(
+    symbol: SymbolView,
+    node: SyntaxNode,
+    frame: Frame,
+  ): SymbolContribution | undefined {
+    let owned = this.symbols.get(symbol.key);
+    if (owned) return owned;
+    if (symbol.intrinsic || symbol.item.native) return;
+    const ownerKey = this.keyOfType(symbol.item.parent);
+    const owner =
+      this.types.get(ownerKey) || this.copyShape(symbol.item.parent);
+    const item = new Signifier(owner, symbol.item.name);
+    item.semanticKey = symbol.key;
+    item.replaceMetadata(symbol.item, pending());
+    item.replaceDefinition({});
+    item.definitive = this.bound.context.definitiveSelf || !!frame.function;
+    owned = {
+      key: symbol.key,
+      item,
+      owner: ownerKey,
+      unitId: this.bound.unitId,
+      exported: true,
+      bare: symbol.bare,
+      origin: node.origin,
+    };
+    this.symbols.set(symbol.key, owned);
+    owner.setOwnMember(item);
+    return owned;
+  }
   write(
     symbol: SymbolView,
     current: Value,
@@ -2117,36 +2478,45 @@ class Evaluator {
         'INVALID_OPERATION',
         'error',
       );
-    const constrained =
-      this.annotated.has(symbol.key) || symbol.intrinsic || symbol.item.native
-        ? value(symbol.item.type)
-        : current;
+    let constrained = current;
+    if (
+      this.annotated.has(symbol.key) ||
+      symbol.intrinsic ||
+      symbol.item.native
+    ) {
+      const contract = value(symbol.item.type);
+      const instanceAssignment =
+        contract.hasTypes &&
+        contract.type.every(
+          (type) =>
+            type.kind === 'Id.Instance' &&
+            !type.name &&
+            type.literalValue === undefined,
+        ) &&
+        current.hasTypes &&
+        current.type.every((type) => type.kind === 'Id.Instance');
+      // A generic instance annotation constrains the kind, not the identity of
+      // the assigned value. Preserve a proven alias rather than its schema slot.
+      constrained = instanceAssignment
+        ? current
+        : this.inputInstanceViews(contract, `assignment:${node.id}`);
+    }
+    let owned = this.symbols.get(symbol.key);
     if (state.reachable && symbol.item.writable) {
       state.values.set(symbol.key, constrained);
-      let owned = this.symbols.get(symbol.key);
-      if (!owned && !symbol.item.native) {
-        const ownerKey = this.keyOfType(symbol.item.parent);
-        const owner =
-          this.types.get(ownerKey) || this.copyShape(symbol.item.parent);
-        const item = new Signifier(owner, symbol.item.name);
-        item.semanticKey = symbol.key;
-        item.replaceMetadata(symbol.item, pending());
-        item.replaceDefinition(symbol.item.def, symbol.item.declaration);
-        owned = {
-          key: symbol.key,
-          item,
-          owner: ownerKey,
-          unitId: this.bound.unitId,
-          exported: true,
-          bare: symbol.bare,
-        };
-        this.symbols.set(symbol.key, owned);
-        owner.setOwnMember(item);
-      }
+      owned = this.ownWrite(symbol, node, frame);
       if (owned && !this.annotated.has(symbol.key))
         owned.item.setType(join(owned.item.type, current));
     }
-    definition = definition && !symbol.intrinsic && !symbol.item.native;
+    const candidate = owned?.origin?.spelling;
+    definition =
+      (definition ||
+        (!!candidate &&
+          candidate.uri === node.origin.spelling.uri &&
+          candidate.start === node.origin.spelling.start &&
+          candidate.end === node.origin.spelling.end)) &&
+      !symbol.intrinsic &&
+      !symbol.item.native;
     this.record(
       node,
       symbol,
@@ -2232,6 +2602,7 @@ class Evaluator {
         type =
           type.statics || this.ensureType(`${this.keyOfType(type)}:statics`);
       }
+      const unidentifiedInstance = this.needsInstanceView(type);
       type = this.storageType(type);
       receivers.push(type);
       if (
@@ -2272,6 +2643,12 @@ class Evaluator {
             this.importedLookup('global', globalOwner, key);
           if (candidate?.item.def || candidate?.item.native) member = candidate;
         }
+        if (!member && unidentifiedInstance) {
+          // A schema without a value/binding identity cannot own flow slots.
+          // Keep custom members unknown rather than inventing a must-alias heap.
+          result.push(unknown());
+          continue;
+        }
         if (
           !member &&
           write &&
@@ -2286,6 +2663,8 @@ class Evaluator {
           item.semanticKey = memberKey(owner, key);
           item.instance = true;
           item.def = {};
+          item.definitive =
+            this.bound.context.definitiveSelf || !!frame.function;
           const contribution: SymbolContribution = {
             key: item.semanticKey,
             item,
@@ -2428,6 +2807,30 @@ class Evaluator {
     truthy: boolean,
     frame: Frame,
   ): void {
+    const evaluated = this.expressionValues.get(condition.id);
+    const known = evaluated && constantTruth(evaluated);
+    if (known !== undefined && known !== truthy) state.reachable = false;
+    if (
+      condition.kind === 'binary' &&
+      ['&&', 'and', '||', 'or'].includes(condition.operator)
+    ) {
+      const conjunction = ['&&', 'and'].includes(condition.operator);
+      if (truthy === conjunction) {
+        this.narrow(condition.left, state, truthy, frame);
+        this.narrow(condition.right, state, truthy, frame);
+      } else {
+        const skipped = copyFlow(state),
+          evaluatedRight = copyFlow(state);
+        this.narrow(condition.left, skipped, truthy, frame);
+        this.narrow(condition.left, evaluatedRight, !truthy, frame);
+        this.narrow(condition.right, evaluatedRight, truthy, frame);
+        const merged = mergeFlow([skipped, evaluatedRight]);
+        state.values.clear();
+        merged.values.forEach((value, key) => state.values.set(key, value));
+        state.reachable = merged.reachable;
+      }
+      return;
+    }
     let name: Name | undefined;
     let kind: Type['kind'] | undefined;
     let keep = truthy;
@@ -2438,6 +2841,11 @@ class Evaluator {
       condition.target.kind === 'name' &&
       condition.arguments[0]?.value?.kind === 'name'
     ) {
+      const guard = this.lookupName(condition.target.name.text, frame);
+      if (!guard?.item.native) return;
+      // A named script function can be callable without being a method. The
+      // common Function kind alone does not prove the negative branch empty.
+      if (condition.target.name.text === 'is_method' && !truthy) return;
       name = condition.arguments[0].value.name;
       kind = (
         {
@@ -2447,6 +2855,8 @@ class Evaluator {
           is_bool: 'Bool',
           is_struct: 'Struct',
           is_array: 'Array',
+          is_callable: 'Function',
+          is_method: 'Function',
         } as Record<string, Type['kind']>
       )[condition.target.name.text];
     } else if (
@@ -2476,13 +2886,21 @@ class Evaluator {
     if (!symbol) return;
     const previous = this.symbolType(symbol, state);
     if (dynamic(previous)) {
-      if (keep) state.values.set(symbol.key, primitive(kind));
+      if (keep) {
+        const type = new Type(kind);
+        if (kind === 'Function') {
+          type.addParameter(0, '...', { type: Type.Any, optional: true });
+          type.returns = unknown();
+        }
+        state.values.set(symbol.key, value(type));
+      }
       return;
     }
-    state.values.set(
-      symbol.key,
-      value(...previous.type.filter((type) => (type.kind === kind) === keep)),
+    const narrowed = valueFrom(
+      previous.type.filter((type) => (type.kind === kind) === keep),
     );
+    state.values.set(symbol.key, narrowed);
+    if (!narrowed.hasTypes) state.reachable = false;
   }
 
   execute(node: Statement, state: FlowState, frame: Frame): Completion[] {
@@ -2678,7 +3096,7 @@ class Evaluator {
             (type.literalValue !== -3 || !!type.extends) &&
             ['Struct', 'Id.Instance', 'Asset.GMObject'].includes(type.kind),
         );
-        const self =
+        const selectedSelf =
           annotated ||
           receiver ||
           (legacy === -1
@@ -2689,6 +3107,10 @@ class Evaluator {
           this.ensureType(`with:${node.id}`);
         const innerScope =
           this.bound.scopes.get(`${node.id}:with`) || frame.scope;
+        const self = this.inputInstanceViews(
+          value(selectedSelf),
+          `receiver:${innerScope.key}`,
+        ).type[0];
         const inner: Frame = {
           ...frame,
           scope: innerScope,
@@ -2739,16 +3161,41 @@ class Evaluator {
         return results;
       }
       case 'switch': {
-        this.expression(node.expression, state, frame);
+        const selector = knownConstant(
+          this.expression(node.expression, state, frame),
+        );
+        const unmatched = copyFlow(state);
+        const entries = new Map<(typeof node.cases)[number], FlowState>();
+        let default_: (typeof node.cases)[number] | undefined;
+        for (const entry of node.cases) {
+          if (!entry.test) {
+            default_ ||= entry;
+            const recovery = copyFlow(state);
+            recovery.reachable = false;
+            entries.set(entry, recovery);
+            continue;
+          }
+          // GML case labels are fixed values. Analyze recovery expressions for
+          // references without letting invalid label effects enter runtime flow.
+          const labelState = copyFlow(state);
+          labelState.reachable = false;
+          const test = knownConstant(
+            this.expression(entry.test, labelState, frame),
+          );
+          const selected = copyFlow(unmatched);
+          if (selector !== undefined && test !== undefined) {
+            selected.reachable &&= selector === test;
+            if (selector === test) unmatched.reachable = false;
+          }
+          entries.set(entry, selected);
+        }
+        if (default_) entries.set(default_, copyFlow(unmatched));
         const results: Completion[] = [];
         let fallthrough: FlowState[] = [];
-        let default_ = false;
         for (const entry of node.cases) {
-          if (entry.test) this.expression(entry.test, state, frame);
-          else default_ = true;
           const current = this.execute(
             entry.body,
-            mergeFlow([copyFlow(state), ...fallthrough]),
+            mergeFlow([entries.get(entry)!, ...fallthrough]),
             frame,
           );
           fallthrough = current
@@ -2764,7 +3211,7 @@ class Evaluator {
               ),
           );
         }
-        if (!default_) fallthrough.push(state);
+        if (!default_) fallthrough.push(unmatched);
         if (fallthrough.length) results.push(...normal(mergeFlow(fallthrough)));
         return results;
       }

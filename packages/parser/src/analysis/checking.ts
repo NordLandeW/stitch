@@ -20,7 +20,9 @@ export function checkUnit(
   ) => diagnostics.push({ origin, message, severity, collection });
   for (const call of result.calls) {
     const fn = call.type;
-    if (call.kind === 'new' && !fn.isConstructor)
+    // A callable guard or an unqualified Function annotation does not establish
+    // constructor capability. Only a concrete call contract can reject `new`.
+    if (call.kind === 'new' && !fn.isConstructor && fn.callKind !== undefined)
       add(call.origin, 'The new operator requires a constructor function.');
     if (call.kind === 'call' && fn.isConstructor)
       add(call.origin, 'Constructor functions must be called with new.');
@@ -71,7 +73,15 @@ export function checkUnit(
   }
   function expression(node: Expression) {
     if (node.kind === 'function') {
-      if (bound.context.language.supports('functions') === false)
+      if (node.extension && bound.context.kind !== 'extension')
+        add(
+          node.origin,
+          '#define callable sections are only valid in GML extension files.',
+        );
+      if (
+        !node.extension &&
+        bound.context.language.supports('functions') === false
+      )
         add(
           node.origin,
           'Function expressions are unavailable in the selected language version.',

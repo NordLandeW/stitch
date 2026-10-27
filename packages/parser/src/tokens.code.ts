@@ -268,7 +268,11 @@ export const codeTokens = [
     pattern: /\bconstructor\b/,
     categories: [c.Keyword],
   }),
-  // TODO: Add separate parser modes for macros
+  createToken({
+    name: 'Define',
+    pattern: /#define\b/,
+    categories: [c.Keyword],
+  }),
   createToken({ name: 'Macro', pattern: /#macro\b/, categories: [c.Keyword] }),
   // TODO: Add separate parser modes for regions
   createToken({

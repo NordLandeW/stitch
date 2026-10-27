@@ -77,12 +77,56 @@ class MappedText {
   }
 }
 
+function withoutComments(
+  text: string,
+  lexed: ReturnType<typeof GmlLexer.tokenize>,
+): string {
+  const comments = [
+    ...(lexed.groups.comments || []),
+    ...lexed.tokens.filter(
+      (token) =>
+        token.tokenType.name === 'JsdocGmlLine' ||
+        token.tokenType.name === 'JsdocJs',
+    ),
+  ].sort((left, right) => left.startOffset - right.startOffset);
+  const chunks: string[] = [];
+  let cursor = 0;
+  for (const comment of comments) {
+    const end = (comment.endOffset ?? comment.startOffset) + 1;
+    chunks.push(
+      text.slice(cursor, comment.startOffset),
+      mask(text.slice(comment.startOffset, end)),
+    );
+    cursor = end;
+  }
+  chunks.push(text.slice(cursor));
+  return chunks.join('');
+}
+
 /** Collect directives before expansion: a macro is global, including forward uses. */
 export function collectMacros(document: SourceDocument): MacroCollection {
   const definitions: MacroDefinition[] = [];
   const diagnostics: MacroDiagnostic[] = [];
   const removals: { start: number; end: number }[] = [];
-  const tokens = GmlLexer.tokenize(document.text).tokens;
+  const lexed = GmlLexer.tokenize(document.text);
+  const tokens = lexed.tokens;
+  const commentFree = withoutComments(document.text, lexed);
+  const continuations = new Map<number, { start: number; end: number }>();
+  for (const token of tokens) {
+    if (token.tokenType.name !== 'Escape') continue;
+    const breakAt = document.text.slice(token.startOffset).search(/[\r\n]/);
+    if (breakAt < 0) continue;
+    const lineEnd = token.startOffset + breakAt;
+    if (
+      !continuations.has(lineEnd) &&
+      /^[\t \\]*$/.test(commentFree.slice(token.startOffset + 1, lineEnd))
+    ) {
+      continuations.set(lineEnd, {
+        start: token.startOffset,
+        end: lineEnd + (document.text.startsWith('\r\n', lineEnd) ? 2 : 1),
+      });
+    }
+  }
   let consumed = -1;
   for (const token of tokens) {
     if (token.tokenType.name !== 'Macro' || token.startOffset <= consumed)
@@ -90,15 +134,15 @@ export function collectMacros(document: SourceDocument): MacroCollection {
     const start = token.startOffset;
     let lineStart = start;
     let end = start;
+    const joined: { start: number; end: number }[] = [];
     while (true) {
       const breakAt = document.text.slice(lineStart).search(/[\r\n]/);
       const lineEnd = breakAt < 0 ? document.text.length : lineStart + breakAt;
       end = lineEnd;
-      const continued = /\\[\t ]*$/.test(
-        document.text.slice(lineStart, lineEnd),
-      );
-      if (!continued || lineEnd === document.text.length) break;
-      lineStart = lineEnd + (document.text.startsWith('\r\n', lineEnd) ? 2 : 1);
+      const continuation = continuations.get(lineEnd);
+      if (!continuation || lineEnd === document.text.length) break;
+      joined.push(continuation);
+      lineStart = continuation.end;
     }
     consumed = end - 1;
     removals.push({ start, end });
@@ -122,8 +166,8 @@ export function collectMacros(document: SourceDocument): MacroCollection {
     const body = document.text.slice(bodyStart, end);
     const mapped = new MappedText();
     let cursor = 0;
-    for (const continuation of body.matchAll(/\\[\t ]*\r?\n/g)) {
-      const offset = continuation.index!;
+    for (const continuation of joined) {
+      const offset = continuation.start - bodyStart;
       mapped.append(body.slice(cursor, offset), {
         spelling: span(
           document.uri,
@@ -133,14 +177,10 @@ export function collectMacros(document: SourceDocument): MacroCollection {
         editable: true,
       });
       mapped.append(' ', {
-        spelling: span(
-          document.uri,
-          bodyStart + offset,
-          bodyStart + offset + continuation[0].length - 1,
-        ),
+        spelling: span(document.uri, bodyStart + offset, continuation.end - 1),
         editable: false,
       });
-      cursor = offset + continuation[0].length;
+      cursor = continuation.end - bodyStart;
     }
     mapped.append(body.slice(cursor), {
       spelling: span(document.uri, bodyStart + cursor, end - 1),
@@ -156,15 +196,7 @@ export function collectMacros(document: SourceDocument): MacroCollection {
     // Ordinary comments must not leak into the invocation's surrounding line.
     // Named lexer groups preserve their exact spans without another GML lexer.
     const bodyLexed = GmlLexer.tokenize(result.text);
-    const comments = bodyLexed.groups.comments || [];
-    let cleaned = result.text;
-    for (const comment of [...comments].reverse()) {
-      const to = (comment.endOffset ?? comment.startOffset) + 1;
-      cleaned =
-        cleaned.slice(0, comment.startOffset) +
-        mask(cleaned.slice(comment.startOffset, to)) +
-        cleaned.slice(to);
-    }
+    const cleaned = withoutComments(result.text, bodyLexed);
     for (const error of bodyLexed.errors) {
       diagnostics.push({
         message: `Macro ${name}: ${error.message}`,

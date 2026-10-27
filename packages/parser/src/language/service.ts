@@ -41,6 +41,7 @@ import {
 } from './contributions.js';
 import { DependencyIndex } from './dependencies.js';
 import { LanguageProfile } from './version.js';
+import { WorklistHistory } from './worklist.js';
 
 interface UnitState {
   readonly code: Code;
@@ -277,7 +278,19 @@ export class ProjectAnalysis {
     }
     for (const asset of this.project.assets?.values() || []) {
       const key = `resource:${asset.assetKind}:${asset.name}`;
+      const implemented = new Set(
+        [...asset.gmlFiles.values()]
+          .filter((code) => code.sourceContext.kind === 'extension')
+          .flatMap((code) =>
+            (code.sourceContext.extensionFunctions || [])
+              .filter((binding) =>
+                code.extensionDefinitions.has(binding.sourceName),
+              )
+              .map((binding) => binding.name),
+          ),
+      );
       for (const [name, source] of asset.extensionSymbols || []) {
+        if (implemented.has(name)) continue;
         const symbol = new Signifier(global, name);
         symbol.replaceMetadata(source, source.type);
         symbol.replaceDefinition(source.def);
@@ -287,7 +300,8 @@ export class ProjectAnalysis {
       for (const [name, type] of asset.extensionTypes || []) {
         type.semanticKey = `${key}:extension:${name}`;
         roots.set(type.semanticKey, type);
-        names.set(name, type);
+        if (!implemented.has(name.replace(/^Function\./, '')))
+          names.set(name, type);
       }
       asset.assetType.semanticKey = `${key}:asset`;
       this.publicTypes.set(asset.assetType.semanticKey, asset.assetType);
@@ -392,6 +406,23 @@ export class ProjectAnalysis {
           id.override = true;
           self.setOwnMember(id);
         }
+      }
+    }
+    for (const asset of this.project.assets?.values() || []) {
+      for (const code of asset.gmlFiles.values()) {
+        const source = code.sourceContext;
+        if (!source.selfOwner || source.kind === 'object-event') continue;
+        const self = new Type('Struct');
+        self.semanticKey = source.selfOwner;
+        if (source.objectName) {
+          const object = this.project.getAssetByName(source.objectName);
+          if (object?.isObject) {
+            const base = new Type('Struct');
+            base.semanticKey = ProjectAnalysis.selfKey(object.name);
+            self.setBaseView(base);
+          } else self.setBaseView(this.project.native?.objectInstanceBase);
+        } else self.setBaseView(this.project.native?.objectInstanceBase);
+        roots.set(source.selfOwner, self);
       }
     }
     return collectInputContribution('$resources', roots, names);
@@ -645,6 +676,7 @@ export class ProjectAnalysis {
           processed.text,
           processed.sourceMap.segments,
           profile.key,
+          code.sourceContext,
         ]);
         const reusable =
           preprocessKey === state.preprocessKey
@@ -667,16 +699,16 @@ export class ProjectAnalysis {
             unitId: uri,
             assetId: code.asset.name,
             assetName: code.asset.name,
-            kind: code.isScript
-              ? 'script'
-              : code.isObjectEvent
-                ? 'object-event'
-                : 'other',
+            kind: code.sourceContext.kind,
+            extensionFunctions: code.sourceContext.extensionFunctions,
             eventName: code.name,
-            selfOwner: code.isObjectEvent
-              ? ProjectAnalysis.selfKey(code.asset.name)
-              : undefined,
-            definitiveSelf: code.isCreateEvent,
+            selfOwner: code.sourceContext.selfOwner,
+            dynamicSelf: ['timeline', 'extension'].includes(
+              code.sourceContext.kind,
+            ),
+            definitiveSelf:
+              code.isCreateEvent ||
+              code.sourceContext.kind === 'instance-creation',
             language: profile,
             autoDeclareGlobalsPrefixes:
               this.project.options?.settings?.autoDeclareGlobalsPrefixes,
@@ -702,14 +734,31 @@ export class ProjectAnalysis {
         ...keys(old?.evaluation || old?.declarations),
         ...keys(states.get(uri)?.declarations),
       ]);
-      for (const user of this.dependencies.affected(changeKeys))
+      // Stable user order keeps dependency-index registration history out of
+      // the scheduler state; the pending queue itself preserves exact order.
+      for (const user of [...this.dependencies.affected(changeKeys)].sort())
         queue.add(user);
     }
     const evaluated = new Set<string>();
-    const seenStates = new Map<string, Set<string>>();
+    const history = new WorklistHistory();
+    for (const [uri, state] of states)
+      history.setUnit(
+        uri,
+        state.evaluation,
+        keys(state.evaluation || state.declarations),
+      );
+    history.setResourceBases(
+      [...resources.types].map(
+        ([key, type]) => [key, type.extends?.semanticKey] as const,
+      ),
+    );
     while (queue.size) {
       if (cancelled()) throw new AnalysisCancelled();
       const uri = queue.values().next().value!;
+      if (history.repeats(queue))
+        throw new Error(
+          `Type inference did not converge for ${states.get(uri)?.code.name || uri}`,
+        );
       queue.delete(uri);
       const state = states.get(uri);
       if (!state?.bound || !state.declarations) continue;
@@ -737,6 +786,7 @@ export class ProjectAnalysis {
       this.metrics.evaluated++;
       evaluated.add(uri);
       dependencyIndex.replace(uri, result.dependencies);
+      history.setUnit(uri, result, keys(result));
       const before = index.units.get(uri);
       index.replace(uri, state.evaluation);
       if (
@@ -755,7 +805,12 @@ export class ProjectAnalysis {
         if (changedBases.size) {
           resources = next;
           index.replace('$resources', resources);
-          for (const user of dependencyIndex.affected(changedBases))
+          history.setResourceBases(
+            [...resources.types].map(
+              ([key, type]) => [key, type.extends?.semanticKey] as const,
+            ),
+          );
+          for (const user of [...dependencyIndex.affected(changedBases)].sort())
             queue.add(user);
           queue.add(uri);
         }
@@ -765,17 +820,8 @@ export class ProjectAnalysis {
           ...keys(before),
           ...keys(state.evaluation),
         ]);
-        for (const user of dependencyIndex.affected(changeKeys))
+        for (const user of [...dependencyIndex.affected(changeKeys)].sort())
           if (user !== uri) queue.add(user);
-        // Recursive SCCs can oscillate in an unsupported abstraction. Report an
-        // explicit failure instead of accepting an arbitrary fixed pass count.
-        let seen = seenStates.get(uri);
-        if (!seen) seenStates.set(uri, (seen = new Set()));
-        if (seen.has(result.summary))
-          throw new Error(
-            `Type inference did not converge for ${state.code.name}`,
-          );
-        seen.add(result.summary);
       }
       yield;
     }

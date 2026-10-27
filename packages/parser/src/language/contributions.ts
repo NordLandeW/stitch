@@ -162,6 +162,24 @@ export class ContributionGraph implements MaterializationHost {
       : undefined;
   }
   value(source: Type): Type {
+    // Enum copies are values of one declaration, including detached copies
+    // whose type key was dropped. Resolve through the current declaration so
+    // old consumers cannot perpetuate a previous generation's numeric value.
+    if (source.kind === 'Enum' || source.kind === 'EnumMember') {
+      const declaration = source.signifier?.semanticKey;
+      for (const contribution of declaration
+        ? this.symbolSources(declaration)
+        : []) {
+        for (const current of contribution.item.type.type) {
+          if (
+            current.kind === source.kind &&
+            current.semanticKey &&
+            this.typeSources(current.semanticKey).length
+          )
+            return this.type(current.semanticKey);
+        }
+      }
+    }
     if (source.semanticKey && this.typeSources(source.semanticKey).length)
       return this.type(source.semanticKey);
     let target = this.anonymous.get(source);

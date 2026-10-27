@@ -115,10 +115,24 @@ export function normalizeSyntax(input: SyntaxInput): SyntaxUnit {
     const b = () => base(node, node.name);
     switch (node.name) {
       case 'file':
-        return block(
-          node,
-          child(node, 'statements') ? [child(node, 'statements')!] : [],
-        );
+        return block(node, ordered(node).filter(isNode));
+      case 'extensionFunction': {
+        const body = child(node, 'statements');
+        return {
+          ...b(),
+          kind: 'function',
+          expression: {
+            ...b(),
+            kind: 'function',
+            extension: true,
+            name: name(token(node, 'Identifier'), node),
+            parameters: [],
+            constructor: false,
+            body: body ? statement(body) : empty(node),
+            docs: annotation,
+          },
+        };
+      }
       case 'statements':
         return block(node, children(node, 'statement'));
       case 'blockStatement':
@@ -704,7 +718,9 @@ export function normalizeSyntax(input: SyntaxInput): SyntaxUnit {
         return { ...metadata(), kind: 'name', name: identifier };
       }
       case 'identifierAccessor': {
-        let result = expression(child(node, 'identifier'));
+        let result = expression(
+          child(node, 'identifier') || child(node, 'parenthesizedExpression'),
+        );
         result = suffixes(
           result,
           children(node, 'accessorSuffixes'),
@@ -759,16 +775,11 @@ export function normalizeSyntax(input: SyntaxInput): SyntaxUnit {
         );
         for (const binary of children(node, 'binaryExpression')) {
           const right = expression(child(binary, 'assignmentRightHandSide'));
-          result = {
-            ...metadata(),
-            kind: 'binary',
-            operator: token(binary, 'BinaryOperator')?.image || '',
-            left: result,
+          result = binaryExpression(
+            token(binary, 'BinaryOperator')?.image || '',
+            result,
             right,
-            uncertainGrouping:
-              (result.kind === 'binary' && !result.grouped) ||
-              (right.kind === 'binary' && !right.grouped),
-          };
+          );
         }
         const ternary = child(node, 'ternaryExpression');
         if (ternary) {
@@ -814,6 +825,37 @@ export function normalizeSyntax(input: SyntaxInput): SyntaxUnit {
       }
     }
   }
+  function binaryExpression(
+    operator: string,
+    left: Expression,
+    right: Expression,
+  ): Expression {
+    const metadata = () =>
+      base({ startOffset: left.start, endOffset: right.end }, 'binary');
+    // The legacy CST recursively accepts a complete expression on a binary RHS.
+    // A following conditional applies to the complete condition, unless the RHS
+    // conditional is explicitly parenthesized. Keep target-dependent binary
+    // grouping conservative instead of substituting JavaScript precedence.
+    if (right.kind === 'conditional' && !right.grouped) {
+      return {
+        ...metadata(),
+        kind: 'conditional',
+        condition: binaryExpression(operator, left, right.condition),
+        yes: right.yes,
+        no: right.no,
+      };
+    }
+    return {
+      ...metadata(),
+      kind: 'binary',
+      operator,
+      left,
+      right,
+      uncertainGrouping:
+        (left.kind === 'binary' && !left.grouped) ||
+        (right.kind === 'binary' && !right.grouped),
+    };
+  }
   function applyAssignment(
     target: Expression,
     node: CstNode,
@@ -837,13 +879,7 @@ export function normalizeSyntax(input: SyntaxInput): SyntaxUnit {
           target,
           value: rhs,
         }
-      : {
-          ...base(node, 'comparison'),
-          kind: 'binary',
-          operator: '=',
-          left: target,
-          right: rhs,
-        };
+      : binaryExpression('=', target, rhs);
   }
   return { input, root: statement(input.cst), jsdocs, diagnostics };
 }

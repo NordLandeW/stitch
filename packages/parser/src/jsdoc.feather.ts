@@ -214,7 +214,7 @@ export function parseFeatherTypeString(
   return rootUnion;
 }
 
-export function typeToFeatherString(type: Type): string {
+function typeDisplayName(type: Type): string | undefined {
   // Functions, Structs, and Enums are the only types that can have names
   if (type.isGeneric && type.name) {
     return type.name;
@@ -233,11 +233,60 @@ export function typeToFeatherString(type: Type): string {
     }
     return `${type.kind}.${type.name}`;
   }
-  // Arrays etc can contain items of a type) {
-  if (type.items?.type.length) {
-    return `${type.kind}<${type.items.type
-      .map((t) => t.toFeatherString())
-      .join('|')}>`;
+  return undefined;
+}
+
+/** Render item graphs without consuming the JS call stack. An ellipsis marks
+ * recursive paths or an exhausted display budget. Shared DAGs can otherwise
+ * produce exponentially large text from a small finite graph. The budget only
+ * limits presentation; semantic types and inference retain the complete graph. */
+export function typeToFeatherString(type: Type): string {
+  const output: string[] = [];
+  const active = new Set<Type>();
+  let remainingNodes = 8192;
+  const stack: { type: Type; next: number; items?: Type[] }[] = [
+    { type, next: -1 },
+  ];
+  while (stack.length) {
+    const frame = stack[stack.length - 1];
+    const current = frame.type;
+    if (frame.next < 0) {
+      if (remainingNodes-- === 0) {
+        output.push('...');
+        stack.pop();
+        // Preserve balanced container delimiters while omitting pending siblings.
+        while (stack.length) {
+          if (stack.pop()!.next >= 0) output.push('>');
+        }
+        break;
+      }
+      const name = typeDisplayName(current);
+      if (name !== undefined) {
+        output.push(name);
+        stack.pop();
+      } else if (active.has(current)) {
+        output.push('...');
+        stack.pop();
+      } else {
+        const items = current.items?.type;
+        if (!items?.length) {
+          output.push(current.kind);
+          stack.pop();
+        } else {
+          active.add(current);
+          output.push(current.kind, '<');
+          frame.items = items;
+          frame.next = 0;
+        }
+      }
+    } else if (frame.next === frame.items!.length) {
+      output.push('>');
+      active.delete(current);
+      stack.pop();
+    } else {
+      if (frame.next) output.push('|');
+      stack.push({ type: frame.items![frame.next++], next: -1 });
+    }
   }
-  return type.kind;
+  return output.join('');
 }

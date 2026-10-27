@@ -1,6 +1,12 @@
 import { Pathy, pathy } from '@bscotch/pathy';
 import { readdir } from 'node:fs/promises';
 import { pathExists } from './project.edits.js';
+import {
+  resourceSources,
+  roomInstanceLayers,
+  type GmlSourceContext,
+  type ResourceSource,
+} from './project.sources.js';
 import { sequential } from '@bscotch/utility';
 import {
   Yy,
@@ -48,6 +54,9 @@ export class Asset<T extends YyResourceType = YyResourceType> {
   readonly $tag = 'Asset';
   readonly assetKind: T;
   readonly gmlFiles: Map<string, Code> = new Map();
+  /** Undefined until metadata discovery; explicit Code-only hosts own their registration. */
+  sourceCandidates?: readonly ResourceSource[];
+  sourcePaths: readonly Pathy[] = [];
   yy!: YyData<T>;
   yyPath: Pathy<YyData<T>>;
   readonly signifier: Signifier;
@@ -299,10 +308,7 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     const instances = new Map<string, Asset<'objects'>>();
     // Loop through each instance layer's instances to get IDs and objects
     const yy = this.yy as YyRoom;
-    for (const layer of (yy as YyRoom).layers) {
-      if (layer.resourceType !== 'GMRInstanceLayer') {
-        continue;
-      }
+    for (const layer of roomInstanceLayers(yy.layers)) {
       for (const instance of (layer as YyRoomInstanceLayer).instances || []) {
         const obj = this.project.getAssetByName(instance.objectId.name);
         if (isAssetOfKind(obj, 'objects')) {
@@ -366,10 +372,7 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     assert(this.isRoom, 'Can only rename object instances in rooms'); // Iterate through each instance layer and remove any instances with the given ID
     const yy = this.yy as YyRoom;
     let didUpdate = false;
-    for (const layer of yy.layers) {
-      if (layer.resourceType !== 'GMRInstanceLayer') {
-        continue;
-      }
+    for (const layer of roomInstanceLayers(yy.layers)) {
       layer.instances.forEach((instance) => {
         if (
           instance.objectId.name.toLowerCase() === oldObjectName.toLowerCase()
@@ -390,10 +393,7 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     assert(this.isRoom, 'Can only add object instances to rooms');
     const yy = this.yy as YyRoom;
     // Iterate through each instance layer and remove any instances with the given ID
-    for (const layer of yy.layers) {
-      if (layer.resourceType !== 'GMRInstanceLayer') {
-        continue;
-      }
+    for (const layer of roomInstanceLayers(yy.layers)) {
       layer.instances = (layer.instances || []).filter(
         (x) => x.name !== instanceId,
       );
@@ -403,6 +403,7 @@ export class Asset<T extends YyResourceType = YyResourceType> {
       (x) => x.name !== instanceId,
     );
     await this.saveYy();
+    await this.project.reloadResource(this.yyPath);
   }
 
   @sequential
@@ -735,15 +736,18 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     }
   }
 
-  protected addGmlFile(path: Pathy<string>): Code {
+  protected addGmlFile(path: Pathy<string>, context?: GmlSourceContext): Code {
     const existing = this.getGmlFile(path);
-    if (existing && existing.path.absolute !== path.absolute) {
+    if (
+      existing &&
+      (existing.path.absolute !== path.absolute ||
+        existing.analysisState.status === 'retired')
+    ) {
       this.project.analysis.retire(existing);
       this.gmlFiles.delete(path.absolute.toLocaleLowerCase());
     }
-    const gml =
-      this.getGmlFile(path) ||
-      new Code(this as Asset<'scripts' | 'objects'>, path);
+    const gml = this.getGmlFile(path) || new Code(this, path);
+    if (context) gml.setSourceContext(context);
     assert(path, 'Cannot add GML file, path does not exist');
     this.gmlFiles.set(path.absolute.toLocaleLowerCase(), gml);
     return gml;
@@ -765,44 +769,7 @@ export class Asset<T extends YyResourceType = YyResourceType> {
       ]);
       return;
     }
-    if (this.isScript || this.isObject) {
-      const children = await Asset.children(this.dir);
-      const oldFiles = new Map(this.gmlFiles);
-      const listed = this.isScript
-        ? [`${this.name}.gml`]
-        : this.listedEventFileNames();
-      const wanted: Pathy[] = [];
-      const diagnostics: Diagnostic[] = [];
-      for (const name of new Set(listed)) {
-        const matches = children.filter(
-          (path) =>
-            path.basename.toLocaleLowerCase() === name.toLocaleLowerCase(),
-        );
-        if (matches.length === 1) wanted.push(matches[0]);
-        else
-          diagnostics.push(
-            Asset.resourceDiagnostic(
-              matches.length
-                ? `Several files match the listed GML file: ${name}`
-                : `Listed GML file is missing: ${name}`,
-            ),
-          );
-      }
-      this.project.setResourceDiagnostics(
-        this.yyPath.absolute,
-        'files',
-        diagnostics,
-      );
-      const selected = new Set(
-        wanted.map((path) => path.absolute.toLocaleLowerCase()),
-      );
-      for (const [key, code] of oldFiles)
-        if (!selected.has(key)) {
-          this.gmlFiles.delete(key);
-          this.project.analysis.retire(code);
-        }
-      for (const path of wanted) this.addGmlFile(path as Pathy<string>);
-    } else if (this.assetKind === 'extensions') {
+    if (this.assetKind === 'extensions') {
       this.extensionSymbols.clear();
       this.extensionTypes.clear();
       const extensionSelf = new Type('Struct');
@@ -817,9 +784,6 @@ export class Asset<T extends YyResourceType = YyResourceType> {
       const yy = this.yy as YyExtension;
       for (const file of yy.files) {
         for (const constant of file.constants) {
-          if (constant.hidden) {
-            continue;
-          }
           try {
             // Get the type by parsing the value. For now we'll just check for number or string, else "Any".
             const type = constant.value.startsWith('"')
@@ -833,6 +797,7 @@ export class Asset<T extends YyResourceType = YyResourceType> {
               new Type(type),
             );
             signifier.macro = true;
+            signifier.hidden = constant.hidden;
             signifier.native = this.name;
             signifier.global = true;
             signifier.writable = false;
@@ -854,22 +819,32 @@ export class Asset<T extends YyResourceType = YyResourceType> {
           }
         }
         for (const func of file.functions) {
-          if (func.hidden) {
-            continue;
-          }
           try {
             const type = new Type('Function')
               .named(func.name)
               .describe(func.help);
             type.setReturnType(new Type(typeIndexToName(func.returnType)));
-            for (let i = 0; i < func.args.length; i++) {
+            // Typed parameter entries remain authoritative even when legacy
+            // metadata leaves argCount at its default zero. A positive count
+            // can supply additional slots whose types were not serialized.
+            const argumentCount = Math.max(func.args.length, func.argCount);
+            for (let i = 0; i < argumentCount; i++) {
               const typeIdx = func.args[i];
               type.addParameter(i, `argument${i}`, {
-                type: new Type(typeIndexToName(typeIdx)),
+                type:
+                  typeIdx === undefined
+                    ? Type.Any
+                    : new Type(typeIndexToName(typeIdx)),
               });
             }
+            if (func.argCount < 0)
+              type.addParameter(func.args.length, '...', {
+                type: Type.Any,
+                optional: true,
+              });
             type.callKind = 'native';
             const signifier = new Signifier(extensionSelf, func.name, type);
+            signifier.hidden = func.hidden;
             signifier.native = this.name;
             signifier.global = true;
             signifier.writable = false;
@@ -898,7 +873,36 @@ export class Asset<T extends YyResourceType = YyResourceType> {
         diagnostics,
       );
     }
-    await this.initiallyReadAndParseGml();
+    const selected = await resourceSources(this);
+    this.project.setResourceDiagnostics(
+      this.yyPath.absolute,
+      'files',
+      selected.diagnostics,
+    );
+    this.sourceCandidates = selected.sources;
+    this.sourcePaths = selected.paths;
+    await this.reconcileGmlSources(selected.sources, true);
+  }
+
+  /** Project ownership reconciliation can retire and restore contexts without disk edits. */
+  async reconcileGmlSources(
+    sources: readonly ResourceSource[],
+    reread = false,
+  ): Promise<void> {
+    const wanted = new Set(
+      sources.map((source) => source.path.absolute.toLocaleLowerCase()),
+    );
+    for (const [key, code] of this.gmlFiles) {
+      if (!wanted.has(key)) {
+        this.gmlFiles.delete(key);
+        this.project.analysis.retire(code);
+      }
+    }
+    for (const source of sources) {
+      const previous = this.getGmlFile(source.path);
+      const code = this.addGmlFile(source.path, source.context);
+      if (reread || code !== previous) await code.readContent();
+    }
   }
 
   /** Model-only retirement; watcher reconciliation must never delete user files. */
@@ -916,58 +920,6 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     this.retireModel();
     await this.dir.delete({ force: true, recursive: true });
     await this.project.analysis.analyze();
-  }
-
-  private listedEventFileNames(): string[] {
-    const prefixes = [
-      'Create',
-      'Destroy',
-      'Alarm',
-      'Step',
-      'Collision',
-      'Keyboard',
-      'Mouse',
-      'Other',
-      'Draw',
-      'KeyPress',
-      'KeyRelease',
-      'Trigger',
-      'CleanUp',
-      'Gesture',
-      'PreCreate',
-    ];
-    return (this.yy as YyObject).eventList.flatMap((event) => {
-      const suffix =
-        event.eventType === 4 ? event.collisionObjectId?.name : event.eventNum;
-      return suffix !== undefined && prefixes[event.eventType]
-        ? [`${prefixes[event.eventType]}_${suffix}.gml`]
-        : [];
-    });
-  }
-
-  protected addScriptFile(children: Pathy<string>[]) {
-    // Scripts should have exactly one GML file, which is the script itself,
-    // named the same as the script (though there could be casing variations)
-    const matches = children.filter(
-      (p) =>
-        p.basename.toLocaleLowerCase() ===
-        `${this.name?.toLocaleLowerCase?.()}.gml`,
-    );
-    if (matches.length !== 1) {
-      logger.error(
-        `Script ${this.name} has ${matches.length} GML files. Expected 1.`,
-      );
-    } else {
-      this.addGmlFile(matches[0]);
-    }
-  }
-
-  protected async initiallyReadAndParseGml() {
-    const parseWaits: Promise<any>[] = [];
-    for (const file of this.gmlFilesArray) {
-      parseWaits.push(file.readContent());
-    }
-    return await Promise.all(parseWaits);
   }
 
   get assetTypeKind() {
