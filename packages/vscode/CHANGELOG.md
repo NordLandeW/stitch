@@ -1,5 +1,26 @@
 # Stitch Changelog
 
+## Unreleased
+
+### Features
+
+- Use the project language-service pipeline for flow-aware completion, navigation, diagnostics, and version/configuration-specific macros.
+- Synchronize open buffers and pending resource changes before editor queries; cache semantic tokens and resolve completion details only for a current view.
+- Include object-editor Variable Definitions in completion and type analysis, including inherited definitions independent of parent Create calls.
+- Include all union-receiver completion candidates, merge shared-name types, and label members available in only some alternatives.
+- Analyze metadata-selected room and instance creation code, timeline moments, and GML extension sections with public aliases and hidden completion entries.
+
+### Fixes
+
+- Apply resource renames through editor-owned text and file operations, preserving unsaved documents and reporting partial failures.
+- Keep macro invocation locations and physical edit ranges distinct, and preserve independent struct shorthand roles during rename.
+- Show all known union-member definitions and hover types, reject ambiguous member renames, and preserve namespaces when renaming from type annotations.
+- Make activation and partial-registration cleanup own their resources, buffer load-time events, and dispose diagnostic collections, subscriptions, watchers, and timers reliably.
+- Treat workspace-symbol queries literally, honor cancellation, and retain useful contextual errors when logging unusual values.
+- Keep shared type graphs and enum contributions bounded, render recursive or very large type descriptions safely, preserve native container allocation identity, and reconcile source ownership across resource edits.
+- Preserve native member identity across load order, distinguish instance storage from shared schemas, and retain legacy extension parameter metadata.
+- Correct conditional-expression grouping, callable guards and constant switch flow; accept empty enums, parenthesized constructors, and trailing for-clause terminators.
+
 ## 1.81.0 (2026-01-11)
 
 ### Features

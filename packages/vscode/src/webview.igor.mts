@@ -153,7 +153,7 @@ export class StitchIgorView implements vscode.WebviewViewProvider {
     });
   }
 
-  static register(workspace: StitchWorkspace) {
+  static *register(workspace: StitchWorkspace) {
     const igorView = new StitchIgorView(workspace);
     stitchEvents.on('request-run-project-in-webview', (payload) => {
       igorView.run(payload);
@@ -162,18 +162,19 @@ export class StitchIgorView implements vscode.WebviewViewProvider {
       console.log('Killing runner', !!igorView.runner);
       igorView.kill();
     });
-    return [
-      vscode.window.registerWebviewViewProvider(igorView.viewType, igorView),
-      registerCommand('stitch.runner.toggleSearchWidget', () => {
-        igorView.container?.webview.postMessage({ kind: 'toggle-search' });
-      }),
-      registerCommand('stitch.runner.toggleLineWrap', () => {
-        igorView.container?.webview.postMessage({ kind: 'toggle-line-wrap' });
-      }),
-      registerCommand('stitch.runner.refresh', () => {
-        igorView.refreshConfig();
-      }),
-    ];
+    yield vscode.window.registerWebviewViewProvider(
+      igorView.viewType,
+      igorView,
+    );
+    yield registerCommand('stitch.runner.toggleSearchWidget', () => {
+      igorView.container?.webview.postMessage({ kind: 'toggle-search' });
+    });
+    yield registerCommand('stitch.runner.toggleLineWrap', () => {
+      igorView.container?.webview.postMessage({ kind: 'toggle-line-wrap' });
+    });
+    yield registerCommand('stitch.runner.refresh', () => {
+      igorView.refreshConfig();
+    });
   }
 }
 

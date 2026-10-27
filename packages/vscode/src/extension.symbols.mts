@@ -8,11 +8,14 @@ import {
 import vscode from 'vscode';
 import { stitchConfig } from './config.mjs';
 import type { GameMakerProject } from './extension.project.mjs';
+import {
+  WorkspaceSymbolSearch,
+  captureSymbolProjectGeneration,
+} from './extension.symbols.core.mjs';
 import type { StitchWorkspace } from './extension.workspace.mjs';
 import { locationOf } from './lib.mjs';
 import { info, warn } from './log.mjs';
 
-type SearchMatcher = (name: string) => boolean;
 type SymbolResults = Map<Signifier | Code | Asset, vscode.SymbolInformation>;
 
 export class StitchWorkspaceSymbolProvider
@@ -24,16 +27,19 @@ export class StitchWorkspaceSymbolProvider
     return this.provider.projects;
   }
 
-  protected variablesToSymbols(
+  protected async variablesToSymbols(
     variables: Type,
     symbols: SymbolResults,
-    isMatch: SearchMatcher,
-  ): SymbolResults {
+    search: WorkspaceSymbolSearch,
+  ): Promise<SymbolResults> {
     // Add any variables defined in this object
-    if (!variables) return symbols;
+    if (!variables || search.stopped) return symbols;
     for (const member of variables.listMembers(true)) {
+      const pending = search.checkpoint();
+      if (pending) await pending;
+      if (search.stopped) return symbols;
       if (symbols.has(member)) continue;
-      const symbol = this.signifierToSymbol(member, isMatch);
+      const symbol = this.signifierToSymbol(member, search);
       if (symbol) {
         symbols.set(member, symbol);
       }
@@ -41,17 +47,21 @@ export class StitchWorkspaceSymbolProvider
     return symbols;
   }
 
-  protected assetContentsToSymbols(
+  protected async assetContentsToSymbols(
     resource: Asset,
     symbols: SymbolResults,
-    isMatch: SearchMatcher,
-  ): SymbolResults {
+    search: WorkspaceSymbolSearch,
+  ): Promise<SymbolResults> {
+    if (search.stopped) return symbols;
     const start = new vscode.Position(0, 0);
 
     if (resource.assetKind === 'scripts') {
       // Add the script itself if it doesn't already include
       // a global function within it by the same name.
-      const canAdd = isMatch(resource.name) && !symbols.has(resource);
+      const canAdd =
+        !!resource.gmlFile &&
+        search.matches(resource.name) &&
+        !symbols.has(resource);
       const globalVarWithSameName = resource.project.self.getMember(
         resource.name,
       );
@@ -74,7 +84,7 @@ export class StitchWorkspaceSymbolProvider
       }
     } else if (isAssetOfKind(resource, 'shaders')) {
       // Go to the fragment shader
-      const canAdd = isMatch(resource.name) && !symbols.has(resource);
+      const canAdd = search.matches(resource.name) && !symbols.has(resource);
       const fragShad = resource.shaderPaths.fragment;
       if (canAdd && fragShad) {
         symbols.set(
@@ -89,8 +99,11 @@ export class StitchWorkspaceSymbolProvider
       }
     } else if (resource.assetKind === 'objects') {
       for (const file of resource.gmlFiles.values()) {
+        const pending = search.checkpoint();
+        if (pending) await pending;
+        if (search.stopped) return symbols;
         // Add the object event itself
-        const canAdd = isMatch(resource.name) && !symbols.has(file);
+        const canAdd = search.matches(resource.name) && !symbols.has(file);
         if (canAdd) {
           const symbol = new vscode.SymbolInformation(
             resource.name,
@@ -103,11 +116,11 @@ export class StitchWorkspaceSymbolProvider
 
         // Add any variables defined in this object
         if (!stitchConfig.symbolsIncludeInstanceVars) continue;
-        this.variablesToSymbols(file.asset.variables!, symbols, isMatch);
+        await this.variablesToSymbols(file.asset.variables!, symbols, search);
       }
     } else {
       // Add the asset yy file for all other asset types
-      const canAdd = isMatch(resource.name) && !symbols.has(resource);
+      const canAdd = search.matches(resource.name) && !symbols.has(resource);
       if (canAdd) {
         symbols.set(
           resource,
@@ -129,15 +142,19 @@ export class StitchWorkspaceSymbolProvider
   /**
    * Mutates the `symbols` map to include all global symbols in the project.
    */
-  protected globalsToSymbols(
+  protected async globalsToSymbols(
     project: GameMakerProject,
     symbols: SymbolResults,
-    isMatch: SearchMatcher,
-  ): SymbolResults {
+    search: WorkspaceSymbolSearch,
+  ): Promise<SymbolResults> {
+    if (search.stopped) return symbols;
     for (const item of project.self.listMembers()) {
+      const pending = search.checkpoint();
+      if (pending) await pending;
+      if (search.stopped) return symbols;
       // Assets are already handled by the resource cache.
       if (!symbols.has(item)) {
-        const symbol = this.signifierToSymbol(item, isMatch);
+        const symbol = this.signifierToSymbol(item, search);
         if (symbol) {
           symbols.set(item, symbol);
         }
@@ -150,7 +167,7 @@ export class StitchWorkspaceSymbolProvider
       const functionType = item.getTypeByKind('Function');
       if (functionType?.self && (item.mixin || functionType.isConstructor)) {
         // Add any variables defined in this object
-        this.variablesToSymbols(functionType.self, symbols, isMatch);
+        await this.variablesToSymbols(functionType.self, symbols, search);
       }
     }
     return symbols;
@@ -158,9 +175,13 @@ export class StitchWorkspaceSymbolProvider
 
   protected signifierToSymbol(
     item: Signifier,
-    isMatch?: SearchMatcher,
+    search?: WorkspaceSymbolSearch,
   ): vscode.SymbolInformation | undefined {
-    if (!item.def?.file || !item.name || (isMatch && !isMatch(item.name))) {
+    if (
+      !item.def?.file ||
+      !item.name ||
+      (search && !search.matches(item.name))
+    ) {
       return;
     }
 
@@ -186,85 +207,63 @@ export class StitchWorkspaceSymbolProvider
     );
   }
 
-  provideWorkspaceSymbols(query: string): vscode.SymbolInformation[] {
-    if (!query?.trim()) {
+  async provideWorkspaceSymbols(
+    query: string,
+    token?: vscode.CancellationToken,
+  ): Promise<vscode.SymbolInformation[]> {
+    if (!query?.trim() || token?.isCancellationRequested) {
       // No value in searching for nothing, unless we start doing
       // active-editor-dependent searching.
       return [];
     }
     try {
-      const symbols: SymbolResults = new Map();
-      query = query.trim();
-      const pattern = new RegExp(query.split('').join('.*'));
-      const isMatch: SearchMatcher = (name: string) =>
-        this.scoreResult(query, pattern, name) > 0;
-
       const project = this.provider.getActiveProject();
-      if (!project) {
+      if (
+        !project ||
+        !(await this.provider.ensureProjectAnalysis(project, token))
+      )
         return [];
-      }
+      const symbols: SymbolResults = new Map();
+      const isCurrentGeneration = captureSymbolProjectGeneration(project);
+      const search = new WorkspaceSymbolSearch(query, {
+        isCancelled: () => token?.isCancellationRequested ?? false,
+        isCurrent: () =>
+          this.provider.projects.includes(project) && isCurrentGeneration(),
+      });
 
-      this.globalsToSymbols(project, symbols, isMatch);
+      await this.globalsToSymbols(project, symbols, search);
+      if (search.stopped) return [];
       for (const resource of project.assets.values()) {
-        this.assetContentsToSymbols(resource, symbols, isMatch);
+        const pending = search.checkpoint();
+        if (pending) await pending;
+        if (search.stopped) return [];
+        await this.assetContentsToSymbols(resource, symbols, search);
       }
+      if (search.stopped) return [];
       if (stitchConfig.symbolsIncludeLocalVars) {
         // Add the local variables defined in the current document
         const activeFile = this.provider.getGmlFile(undefined);
         if (activeFile) {
           for (const scope of activeFile.scopes) {
-            this.variablesToSymbols(scope.local, symbols, isMatch);
+            const pending = search.checkpoint();
+            if (pending) await pending;
+            if (search.stopped) return [];
+            await this.variablesToSymbols(scope.local, symbols, search);
           }
         }
       }
 
-      // Sort by match quality and then only return the top results.
-      const filteredSymbols = [...symbols.values()].sort(
-        this.resultSorter(query, pattern),
-      );
-      info(`Found ${filteredSymbols.length} symbols matching "${query}"`);
-      const results = filteredSymbols.slice(
-        0,
+      const results = await search.rank(
+        symbols.values(),
         stitchConfig.symbolsMaxSearchResults,
       );
+      if (search.stopped) return [];
+      info(`Found ${symbols.size} symbols matching "${search.query}"`);
       return results;
     } catch (error) {
       warn(error);
       return [];
     }
-  }
-
-  scoreResult(query: string, pattern: RegExp, result: string) {
-    // Prioritize in order of:
-    // 1. Exact match
-    // 2. Size of matching substring (shorter is better)
-    // 3. Position of match (earlier is better)
-    let score = 0;
-    const patterns = [
-      // pattern without case sensitivity
-      new RegExp(pattern.source, 'i'),
-      // pattern with case sensitivity
-      // new RegExp(pattern.source),
-    ];
-    for (const pattern of patterns) {
-      const match = result.match(pattern);
-      if (!match) {
-        break;
-      }
-      const characterProximityScore = query.length / match[0].length;
-      const matchLengthScore = query.length / result.length;
-      const positionScore = 1 - match.index! / result.length;
-      score += characterProximityScore * 2 + positionScore + matchLengthScore;
-    }
-    return score;
-  }
-
-  resultSorter(query: string, pattern: RegExp) {
-    return (a: { name: string }, b: { name: string }) => {
-      const aScore = this.scoreResult(query, pattern, a.name);
-      const bScore = this.scoreResult(query, pattern, b.name);
-      return bScore - aScore || a.name.localeCompare(b.name);
-    };
   }
 
   static register(provider: StitchWorkspace) {

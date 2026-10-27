@@ -13,7 +13,8 @@ interface ChangeEvent {
 export class ChangeTracker {
   protected queue: ChangeEvent[] = [];
   protected timeout: NodeJS.Timeout | undefined;
-  private flushing = false;
+  private running: Promise<void> | undefined;
+  private readonly subscriptions: { off(): unknown }[] = [];
   private disposed = false;
   protected cache = {
     /**
@@ -25,13 +26,15 @@ export class ChangeTracker {
   };
 
   constructor(readonly provider: StitchWorkspace) {
-    stitchEvents.on(
-      'clean-project-start',
-      () => (this.cache.igorCacheIsClean = true),
-    );
-    stitchEvents.on(
-      'run-project-start',
-      () => (this.cache.igorCacheIsClean = false),
+    this.subscriptions.push(
+      stitchEvents.on(
+        'clean-project-start',
+        () => (this.cache.igorCacheIsClean = true),
+      ),
+      stitchEvents.on(
+        'run-project-start',
+        () => (this.cache.igorCacheIsClean = false),
+      ),
     );
   }
 
@@ -57,23 +60,23 @@ export class ChangeTracker {
     this.disposed = true;
     clearTimeout(this.timeout);
     this.queue = [];
+    for (const subscription of this.subscriptions.splice(0)) subscription.off();
   }
 
-  protected async flush() {
-    if (this.flushing || this.disposed) return;
-    this.flushing = true;
-    try {
-      await this.flushQueue();
-    } finally {
-      this.flushing = false;
-      if (this.queue.length && !this.disposed) {
-        clearTimeout(this.timeout);
-        this.timeout = setTimeout(
-          () => void this.flush().catch((error) => logger.error(error)),
-          stitchConfig.externalChangeDelay,
-        );
-      }
-    }
+  /** Query providers join the same reconciliation rather than seeing queued disk changes. */
+  async flush(): Promise<void> {
+    if (this.disposed) return;
+    do {
+      clearTimeout(this.timeout);
+      this.running ||= Promise.resolve()
+        .then(async () => {
+          while (this.queue.length && !this.disposed) await this.flushQueue();
+        })
+        .finally(() => {
+          this.running = undefined;
+        });
+      await this.running;
+    } while (!this.disposed && (this.queue.length || this.running));
   }
 
   private async flushQueue() {
@@ -82,7 +85,7 @@ export class ChangeTracker {
 
     // Sort by yyp, then yy, then gml files.
     queue.sort((a, b) => {
-      for (const ext of ['.atlas', '.png', '.gml', '.yy', '.yyp']) {
+      for (const ext of ['.yyp', '.yy', '.gml', '.atlas', '.png']) {
         const aExt = a.uri.path.endsWith(ext);
         const bExt = b.uri.path.endsWith(ext);
         if (aExt && !bExt) {
@@ -114,8 +117,17 @@ export class ChangeTracker {
         if (project.dir.join('datafiles').isParentOf(pathy(uri.fsPath))) {
           try {
             await project.syncIncludedFiles();
+            if (this.disposed) return;
             stitchEvents.emit('datafiles-changed', project);
-          } catch {}
+          } catch (error) {
+            logger.warn('Could not synchronize Included Files', error);
+          }
+          continue;
+        }
+
+        if (uri.path.endsWith('/stitch.config.json')) {
+          await project.reloadConfig();
+          await project.analysis.analyze();
           continue;
         }
 
@@ -124,36 +136,39 @@ export class ChangeTracker {
 
         // Change to the yyp file implies that we have deleted
         // or added an asset, so we need to respond to that.
-        if (type === 'change' && uri.path.endsWith('.yyp')) {
+        if (uri.path.endsWith('.yyp')) {
           logger.info(`yyp file changed on disk. Reloading!`);
           await project.reloadYyp();
+          if (this.disposed) return;
           stitchEvents.emit('project-changed', project);
           continue;
         }
 
-        // Creation/deletion of GML files must be accompanied
-        // by a change to yy/yyp files, so we can ignore them.
-        // They'll be incidentally handled by handling the yy/yyp changes.
-        if (['create', 'delete'].includes(type) && uri.path.endsWith('.gml')) {
+        // Broad GML watching includes metadata-owned paths outside resource
+        // directories. Generated caches and orphan files have no source owner.
+        if (
+          uri.path.endsWith('.gml') &&
+          !project.getGmlFile(pathy(uri.fsPath)) &&
+          !project.sourceOwners(pathy(uri.fsPath)).length
+        )
           continue;
+        // Reconcile the actual listed files even if the metadata watcher did
+        // not fire (for example an externally restored or removed event file).
+        if (['create', 'delete'].includes(type) && uri.path.endsWith('.gml')) {
+          await project.reloadResource(pathy(uri.fsPath));
         }
         // Changes to existing GML files can be handled immediately.
         if (type === 'change' && uri.path.endsWith('.gml')) {
           logger.info(`GML file "${uri.path}" changed on disk. Reloading!`);
           await this.provider.onChangeFile(uri);
         }
-        // Changes to yy files can be handled immediately.
-        // For now we
-        // only care about objects, since object yy files list
-        // their events.
-        if (type === 'change' && uri.path.endsWith('.yy')) {
+        // Metadata changes include extensions and parent/event removal.
+        if (uri.path.endsWith('.yy')) {
           logger.info(`yy file "${uri.path}" changed on disk. Reloading!`);
-          if (!asset) {
-            logger.warn(`No asset found for yy file "${uri.fsPath}".`);
-          }
-          await asset?.reload();
+          await project.reloadResource(pathy(uri.fsPath));
         }
 
+        if (this.disposed) return;
         // Changes to art assets should be accumulated with timestamps
         // until the user runs the project. Depending on config settings,
         // changes to .atlas files should result in an auto-clean, and changes
@@ -167,7 +182,9 @@ export class ChangeTracker {
             shouldClean ? 'Cleaning!' : 'Skipping cache-clean.',
           );
           if (shouldClean) {
-            void project.run({ clean: true });
+            void project
+              .run({ clean: true })
+              .catch((error) => logger.error(error));
             // Set the cache to clean so that we don't clean again while looping
             // through the queue.
             this.cache.igorCacheIsClean = true;

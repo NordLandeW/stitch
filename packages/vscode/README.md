@@ -29,9 +29,13 @@ There are a lot of ways you can support this project:
 
 Stitch provides Intellisense (auto-complete, hovertext, function signature helpers, go-to-definition, find-references, etc) for all built-in and user-defined symbols.
 
+Editor queries synchronize open buffers and pending resource changes before using a semantic view. Configuration, native-specification, and resource updates invalidate dependent results even when the current document text is unchanged. Removed files clear their diagnostics; internal analysis failures are reported in Problems and the Stitch output channel instead of appearing as a successful empty project.
+
 ### 📛 Renaming
 
-Since Stitch knows about all of your project's symbols, it can also rename them for you! Use the hotkey (`F2` by default) or the right-click context menu to "Rename" a symbol. You can also rename assets via the tree view (while maintaining parent/child relationships). Stitch will auto-rename all references to the symbol, including in JSDoc comments.
+Use `F2` or the right-click context menu to rename a symbol and its known references, including supported JSDoc type references. Struct shorthand keeps property names and local values independent. Rename checks collisions, lexical capture, and shared macro spellings before constructing edits; ambiguous bindings are rejected.
+
+Rename assets through the resource tree. The operation updates known GML references and structured resource links, including parent/child and collision-event relationships, through VS Code's editor APIs so unsaved buffers remain owned by the editor. Mixed text/file operations can fail after some resource changes have succeeded; an error identifies affected paths for inspection or undo before retrying.
 
 > ⚠️ Note that it's possible to write GML code where references to the same symbol are not discoverable by static analysis tools like Stitch, so you may need to do some manual cleanup after renaming.
 
@@ -40,8 +44,8 @@ Since Stitch knows about all of your project's symbols, it can also rename them 
 GameMaker includes a type system called "Feather", which Stitch builds upon. Stitch does take a different overall approach and provides some extensions to the Feather type system and additional features that are not currently available in GameMaker.
 
 - **Go to Type Definition:** Stitch implements the "Go To Type Definition" command, letting you quickly get from a variable to e.g. the constructor for its type.
-- **Declarations FTW:** Unlike Feather, Stitch only infers types at the time an identifier is _declared_. When a variable is declared without assignment, Stitch will infer its type using the first assignment it sees, but that might result in surprises! For best results, use the `@type` JSDoc tag to specify the type of a variable when it is declared if there is any ambiguity. (Typescript and JavaScript+JSDoc programmers will be familiar with this approach.)
-- **Union Type Support:** Feather technically supports "union" types (e.g. `String|Number`), but with limitations. Stitch tries to provide more robust support for union types, though this is a work in progress.
+- **Flow-aware inference:** Stitch tracks assignments, branches, loop exits, returns, and throws, and updates dependent callers and member reads when their inputs change. Hover and completion use the type at the current reference. Use `@type`, `@param`, `@returns`, or `@self` when dynamic names or contexts cannot be inferred statically.
+- **Union Type Support:** Dot completion shows members from all possible receiver types. A label such as `partial 1/2` means the member is known in one of two alternatives; the resolved detail includes the combined member type. Shared names appear once, while navigation retains their possible definitions. Unknown alternatives remain conservative.
 - **`InstanceType<>`, `ObjectType<>`:** Stitch provides custom "Utility Types" that you can use to get one type from another. For example, `InstanceType<Asset.GMObject.my_object>` evaluates to `Id.Instance.my_object`.
 - **`@self` tag for `with` statements:** the `with` statement changes the scope of your code, but Feather does not provide a way to tell it what that scope should be. Stitch allows you to use the `@self` (or `@context`) tag before a `with` statement to specify its context for cases where inference is insufficient:
   ```js
@@ -261,7 +265,7 @@ You can choose whether to run via VM or YYC, and which config to use.
 
 Check out Stitch settings to configure how your project is run. In particular:
 
-- `stitch.run.defaultConfig`: Choose a run configuration to use as the default (defaults to "Default"). This will remain the default until you update your Target.
+- `stitch.run.defaultConfig`: Choose an existing project configuration for builds and language analysis, including configuration-specific macros. The default is `null`: use the first child configuration, or `Default` when there are no children. A valid configuration saved by **Stitch: Set Runner Target** takes precedence. Changing this setting or selecting a target updates analysis; an explicit build configuration overrides the default for that run.
 - `stitch.run.defaultCompiler`: Choose whether to use the VM or YYC compiler (defaults to "VM"). This will remain the default until you update your Target.
 - `stitch.run.inTerminal`: By default Stitch opens a terminal in VSCode and runs your project there, using your default terminal settings. Set this to `false` to use the Stitch Runner Panel instead.
 
@@ -349,11 +353,11 @@ Stitch also provides commands for viewing the GameMaker release notes and settin
 
 ## ⚙️ Supported GameMaker versions
 
-Stitch supports projects that use recent versions of GameMaker, and makes no effort to support older versions.
+Stitch selects native functions, variables, structures, and enums from the project's runtime specifications. An explicit `runtimeVersion` in `stitch.config.json` takes precedence; the project's IDE version supplies the default runtime-discovery input. A separate capability profile distinguishes legacy callable scripts from 2.3 global-startup scripts, gates 2.3 language features, recognizes `??`/`??=` from 2.3.7, and recognizes template strings from 2023.4.
 
-It may not support _very_ recent versions, since we only add support once we bump the version of GameMaker we're using for our games. We only do that when new versions pass all of our tests -- sometimes that doesn't happen for a while.
+When the selected runtime specification is unavailable, Stitch reports its bundled fallback. Its metadata does not prove the target supports every listed API. Unknown versions and uncertain constant expressions receive conservative analysis. Native readability/writability, signatures, enum values, and deprecation come from the selected specification; opaque feature flags are not treated as confirmed target availability.
 
-Different GameMaker versions may have different features and built-in functions, constants, etc. This extension tries to infer the correct features for your project's GameMaker version, but it might give you incorrect autocompletes or surprising command outcomes if it cannot find a match!
+Project-file compatibility and platform-specific runtime behavior still depend on the GameMaker version. Headless parser/editor tests do not certify every runtime or replace compiling your game with its selected target. The [parser's compatibility and integration guide](https://github.com/NordLandeW/stitch/blob/nordev/packages/parser/docs/language-service.md) describes effective inputs and analysis boundaries.
 
 ## 📦 Recommended Extensions
 
@@ -370,10 +374,9 @@ The nice thing about being in the VSCode ecosystem is that there are TONS of oth
 To see the current list of known issues and feature requests, check out the [issues page](https://github.com/bscotch/stitch/issues?q=is%3Aopen+is%3Aissue+label%3A%22%3Akeyboard%3A+vscode%22).
 
 - 😕 **Code only**. Stitch leverages VSCode's power for editing _code_, and makes no attempt to provide visual editors for any type of GameMaker asset.
-- 😕 **Macro limitations**. The Stitch parser can only handle macros that are set to simple and complete expressions. There are no plans to extend the parser to support more complex macro usage.
-- 😕 **Variable Definitions** via the UI are not supported. Since instance variables can be defined in code (via Creation events) we don't also support defining them via the "Variable Definitions" feature of Objects. If for some reason you need that feature, please provide context on the [associated issue](https://github.com/bscotch/stitch/issues/205)!
-- 😕 **Extraneous Curlies**. To avoid some parser complexity, the Stitch parser does not support extraneous curly braces (`{}`). For example, if a random section of code (not following a `for`, `if`, etc) is wrapped in curlies, the parser will emit errors.
-- 😕 **IIFFEs**. Stitch does not support IIFEs (immediately-invoked function expressions), e.g. `(function(){})()`. This is due to parser complexity, but pull requests addressing this are welcome!
+- **Macros:** Stitch expands project-wide, forward, nested, configuration-qualified, and backslash-continued macros in their invoking scopes. Recursive or conflicting definitions produce diagnostics. Navigation preserves macro invocation and physical-definition locations; shared spellings with different bindings cannot be renamed safely.
+- **Object Variable Definitions:** Object-editor fields and inherited definitions contribute to completion and type analysis before Create, independently of `event_inherited()`. Known editor categories supply initial types; expressions, asset choices, and other unresolved values remain conservative. Later GML writes update flow types. Metadata-defined fields cannot be renamed through GML, and default expressions, room-instance overrides, and YY declaration editing are not evaluated or provided. See [language analysis](https://github.com/NordLandeW/stitch/blob/nordev/packages/parser/docs/language-service.md#object-variable-definitions) for details.
+- **GML syntax:** Standalone `{ ... }` and `begin ... end` blocks, struct/function expressions, immediately invoked functions, and documented accessor forms are parsed. The selected language profile diagnoses features unavailable in a known target version. Dynamic names and arbitrary runtime lookups remain conservative.
 - 📝 **Stitch settings**. Stitch provides a number of settings that you can use to customize your experience. You can find them by opening the command palette and searching for "Preferences: Open Settings".
 - 🪵 **How to view logs**. If you run into trouble, you can view the extension's logs by opening the Output panel and selecting "Stitch" from the dropdown menu. These are particularly helpful for providing context when leaving bug reports!
 - ⁉️ **Unexpected projects appear in the tree view**. If you're seeing extra projects in your tree view, it's likely that these are being discovered inside `node_modules` or other normally-hidden locations. Stitch excludes the same files that your VSCode setup does via the `files.exclude` setting, so if you want to prevent those projects from appearing add their parent folders to your excluded files.

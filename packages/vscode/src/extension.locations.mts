@@ -86,18 +86,16 @@ export class StitchLocationsProvider {
     await openPath(item.path, { assertLoudly: true });
   }
 
-  static register(workspace: StitchWorkspace) {
+  static *register(workspace: StitchWorkspace) {
     const releasesProvider = new StitchLocationsProvider(workspace);
-    return [
-      registerCommand('stitch.openLocation.gameMaker', () =>
-        releasesProvider.promptForGameMakerLocation(),
-      ),
-      registerCommand('stitch.openLocation.saveDirectory', () =>
-        releasesProvider.openProjectSaveDirectory(),
-      ),
-      registerCommand('stitch.openLocation.stitch', () =>
-        releasesProvider.openStitchConfigDirectory(),
-      ),
-    ];
+    yield registerCommand('stitch.openLocation.gameMaker', () =>
+      releasesProvider.promptForGameMakerLocation(),
+    );
+    yield registerCommand('stitch.openLocation.saveDirectory', () =>
+      releasesProvider.openProjectSaveDirectory(),
+    );
+    yield registerCommand('stitch.openLocation.stitch', () =>
+      releasesProvider.openStitchConfigDirectory(),
+    );
   }
 }

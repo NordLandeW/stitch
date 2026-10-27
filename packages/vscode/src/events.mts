@@ -1,4 +1,4 @@
-import { createEventEmitter } from '@bscotch/emitter';
+import { Emitter } from '@bscotch/emitter';
 import type { Asset, Code } from '@bscotch/gml-parser';
 import type { GameMakerRuntime } from '@bscotch/stitch-launcher';
 import type vscode from 'vscode';
@@ -76,4 +76,26 @@ export namespace StitchEvents {
   }
 }
 
-export const stitchEvents = createEventEmitter<StitchEvents.All>();
+class StitchEventBus {
+  private readonly emitter = new Emitter<StitchEvents.All>();
+  private readonly subscriptions = new Set<{ off(): unknown }>();
+  readonly emit: Emitter<StitchEvents.All>['emit'] = this.emitter.emit.bind(
+    this.emitter,
+  );
+  readonly on: Emitter<StitchEvents.All>['on'] = (name, listener) => {
+    const subscription = this.emitter.on(name, listener);
+    const off = subscription.off.bind(subscription);
+    subscription.off = () => {
+      this.subscriptions.delete(subscription);
+      return off();
+    };
+    this.subscriptions.add(subscription);
+    return subscription;
+  };
+  clear(): void {
+    for (const subscription of this.subscriptions) subscription.off();
+    this.subscriptions.clear();
+  }
+}
+
+export const stitchEvents = new StitchEventBus();

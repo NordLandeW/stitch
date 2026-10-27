@@ -574,7 +574,7 @@
             "null"
           ],
           "default": null,
-          "description": "The default project config to use for the GameMaker runtime. If not set, the first child config will be used. If no configs are found, the Default will be used. This can also be set via the `config` property on a task."
+          "description": "The default project config for GameMaker builds and language analysis, including configuration-specific macros. If unset, the first child config is used, or Default when there are no children. A valid target saved with Set Runner Target takes precedence. An explicit build config overrides the default for that run."
         },
         "stitch.yy.format.enable": {
           "title": "Enable yy/yyp formatting",

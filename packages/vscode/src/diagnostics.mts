@@ -4,8 +4,9 @@ import { rangeFrom } from './lib.mjs';
 
 import vscode from 'vscode';
 
-export const diagnosticCollection =
-  vscode.languages.createDiagnosticCollection('gml');
+export function createDiagnosticCollection() {
+  return vscode.languages.createDiagnosticCollection('gml');
+}
 
 export function normalizeDiagnosticsEvents(payload: DiagnosticsEventPayload) {
   assertInternalClaim(payload, 'diagnostics must be an array');
@@ -16,8 +17,8 @@ export function normalizeDiagnosticsEvents(payload: DiagnosticsEventPayload) {
       d.severity === 'error'
         ? vscode.DiagnosticSeverity.Error
         : d.severity === 'info'
-        ? vscode.DiagnosticSeverity.Information
-        : vscode.DiagnosticSeverity.Warning,
+          ? vscode.DiagnosticSeverity.Information
+          : vscode.DiagnosticSeverity.Warning,
     source: 'stitch',
   }));
 }

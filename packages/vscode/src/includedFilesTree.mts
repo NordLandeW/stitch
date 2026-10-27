@@ -7,9 +7,7 @@ import { StitchTreeItemBase } from './tree.base.mjs';
 
 type IncludedFileTreeItem = IncludedFileFolder | IncludedFile;
 
-export class StitchIncludedFilesTree
-  implements vscode.TreeDataProvider<IncludedFileTreeItem>
-{
+export class StitchIncludedFilesTree implements vscode.TreeDataProvider<IncludedFileTreeItem> {
   project: GameMakerProject | undefined;
   view!: vscode.TreeView<IncludedFileTreeItem>;
   private _onDidChangeTreeData: vscode.EventEmitter<
@@ -22,14 +20,24 @@ export class StitchIncludedFilesTree
   > = new vscode.EventEmitter<IncludedFileTreeItem | undefined | null | void>();
   readonly onDidCollapseElement = this._onDidCollapseElement.event;
 
-  protected constructor(readonly workspace: StitchWorkspace) {
-    this.view = vscode.window.createTreeView('bscotch-stitch-files', {
-      treeDataProvider: this,
-    });
+  private disposed = false;
+  private readonly subscriptions: { off(): unknown }[] = [];
+
+  protected constructor(readonly workspace: StitchWorkspace) {}
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const subscription of this.subscriptions.splice(0)) subscription.off();
+    this.project = undefined;
+    IncludedFileFolder.clear();
+    IncludedFile.clear();
+    this._onDidChangeTreeData.dispose();
+    this._onDidCollapseElement.dispose();
   }
 
   reveal(element: IncludedFileTreeItem | undefined) {
-    if (element) {
+    if (!this.disposed && element) {
       this.view.reveal(element, { expand: true, focus: true });
     }
   }
@@ -48,7 +56,7 @@ export class StitchIncludedFilesTree
   getChildren(
     element?: IncludedFileTreeItem | undefined,
   ): IncludedFileTreeItem[] | undefined {
-    if (!this.project) {
+    if (this.disposed || !this.project) {
       return;
     }
     if (element && !(element instanceof IncludedFileFolder)) {
@@ -75,6 +83,7 @@ export class StitchIncludedFilesTree
   }
 
   rebuild() {
+    if (this.disposed) return;
     // Convert the project's included files into a tree,
     // consisting of folders and files.
     IncludedFileFolder.clear();
@@ -93,46 +102,40 @@ export class StitchIncludedFilesTree
     this._onDidChangeTreeData.fire(undefined);
   }
 
-  static register(workspace: StitchWorkspace): vscode.Disposable[] {
+  static *register(workspace: StitchWorkspace): Generator<vscode.Disposable> {
     const tree = new StitchIncludedFilesTree(workspace);
+    yield tree;
+    if (tree.disposed) return;
+    tree.view = vscode.window.createTreeView('bscotch-stitch-files', {
+      treeDataProvider: tree,
+    });
+    yield tree.view;
     tree.project = workspace.getActiveProject();
-    const activeEditorMonitor = vscode.window.onDidChangeActiveTextEditor(
-      () => {
-        // Rebuild if we switched projects
-        const nowActiveProject = workspace.getActiveProject();
-        if (nowActiveProject && nowActiveProject !== tree.project) {
-          tree.project = nowActiveProject;
-          tree.rebuild();
-        }
-      },
-    );
-
-    tree.rebuild();
-
-    stitchEvents.on('datafiles-changed', (project) => {
-      if (tree.project === project) {
+    yield vscode.window.onDidChangeActiveTextEditor(() => {
+      if (tree.disposed) return;
+      const nowActiveProject = workspace.getActiveProject();
+      if (nowActiveProject && nowActiveProject !== tree.project) {
+        tree.project = nowActiveProject;
         tree.rebuild();
       }
     });
-
-    // Return subscriptions to owned events and this view
-    const subscriptions = [
-      tree.view,
-      activeEditorMonitor,
-      registerCommand(
-        'stitch.includedFiles.revealInExplorerView',
-        (item?: IncludedFile) => {
-          if (item instanceof IncludedFile) {
-            // Call the vscode command to show the file in the explorer view
-            vscode.commands.executeCommand(
-              'revealInExplorer',
-              vscode.Uri.file(item.path.absolute),
-            );
-          }
-        },
-      ),
-    ];
-    return subscriptions;
+    tree.rebuild();
+    tree.subscriptions.push(
+      stitchEvents.on('datafiles-changed', (project) => {
+        if (!tree.disposed && tree.project === project) tree.rebuild();
+      }),
+    );
+    yield registerCommand(
+      'stitch.includedFiles.revealInExplorerView',
+      (item?: IncludedFile) => {
+        if (item instanceof IncludedFile)
+          return vscode.commands.executeCommand(
+            'revealInExplorer',
+            vscode.Uri.file(item.path.absolute),
+          );
+        return undefined;
+      },
+    );
   }
 }
 

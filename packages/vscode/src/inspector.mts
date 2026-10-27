@@ -166,9 +166,7 @@ export class ObjectSpriteItem extends StitchTreeItemBase<'asset-sprites'> {
   }
 }
 
-export class GameMakerInspectorProvider
-  implements vscode.TreeDataProvider<InspectorItem>
-{
+export class GameMakerInspectorProvider implements vscode.TreeDataProvider<InspectorItem> {
   asset: Asset<'objects'> | undefined;
   view!: vscode.TreeView<InspectorItem>;
   private _onDidChangeTreeData: vscode.EventEmitter<
@@ -180,10 +178,22 @@ export class GameMakerInspectorProvider
     InspectorItem | undefined | null | void
   > = new vscode.EventEmitter<InspectorItem | undefined | null | void>();
   readonly onDidCollapseElement = this._onDidCollapseElement.event;
+  private disposed = false;
+  private readonly subscriptions: { off(): unknown }[] = [];
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const subscription of this.subscriptions.splice(0)) subscription.off();
+    this.asset = undefined;
+    this._onDidChangeTreeData.dispose();
+    this._onDidCollapseElement.dispose();
+  }
 
   constructor(readonly provider: StitchWorkspace) {}
 
   onUpdate(updated: InspectorItem) {
+    if (this.disposed) return;
     this._onDidChangeTreeData.fire(updated);
   }
 
@@ -194,7 +204,7 @@ export class GameMakerInspectorProvider
   getChildren(
     element?: InspectorItem | undefined,
   ): InspectorItem[] | undefined {
-    if (!this.asset) {
+    if (this.disposed || !this.asset) {
       return;
     }
     if (!element) {
@@ -238,6 +248,7 @@ export class GameMakerInspectorProvider
   }
 
   rebuild() {
+    if (this.disposed) return;
     const currentAsset = this.provider.getCurrentAsset();
     if (!currentAsset || !isAssetOfKind(currentAsset, 'objects')) {
       return;
@@ -249,34 +260,27 @@ export class GameMakerInspectorProvider
     this.view.title = `Inspector: ${this.asset.name}`;
   }
 
-  register(): vscode.Disposable[] {
+  *register(): Generator<vscode.Disposable> {
+    yield this;
+    if (this.disposed) return;
     this.view = vscode.window.createTreeView('bscotch-stitch-inspector', {
       treeDataProvider: this,
     });
-    const activeEditorMonitor = vscode.window.onDidChangeActiveTextEditor(() =>
-      this.rebuild(),
-    );
-
+    yield this.view;
+    yield vscode.window.onDidChangeActiveTextEditor(() => this.rebuild());
     this.rebuild();
-
-    // Handle emitted events
-    stitchEvents.on('asset-deleted', (asset) => {
-      if (this.asset === asset) {
-        this.asset = undefined;
-      }
-      // Just always rebuild. It's a rare event, and it's
-      // a bit complicated to do this in a sparse way (e.g. we'd
-      // need to check parents/children etc)
-      this.rebuild();
-    });
-    stitchEvents.on('code-file-deleted', (code) => {
-      if (this.asset === code.asset) {
+    this.subscriptions.push(
+      stitchEvents.on('asset-deleted', (asset) => {
+        if (this.disposed) return;
+        if (this.asset === asset) this.asset = undefined;
+        // Parents and children can be affected as well as the selected asset.
         this.rebuild();
-      }
-    });
-
-    // Return subscriptions to owned events and this view
-    const subscriptions = [this.view, activeEditorMonitor];
-    return subscriptions;
+      }),
+    );
+    this.subscriptions.push(
+      stitchEvents.on('code-file-deleted', (code) => {
+        if (!this.disposed && this.asset === code.asset) this.rebuild();
+      }),
+    );
   }
 }

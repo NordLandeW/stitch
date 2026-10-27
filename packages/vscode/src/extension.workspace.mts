@@ -15,7 +15,7 @@ import { assertLoudly } from './assert.mjs';
 import { ChangeTracker } from './changes.mjs';
 import { stitchConfig } from './config.mjs';
 import {
-  diagnosticCollection,
+  createDiagnosticCollection,
   normalizeDiagnosticsEvents,
 } from './diagnostics.mjs';
 import { stitchEvents } from './events.mjs';
@@ -42,24 +42,34 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
       ? -Infinity
       : Infinity,
   );
-  readonly diagnosticCollection = diagnosticCollection;
+  readonly diagnosticCollection = createDiagnosticCollection();
   readonly externalChangeTracker = new ChangeTracker(this);
 
   projects: GameMakerProject[] = [];
 
   private disposed = false;
-  private readonly diagnosticTimers = new Map<Project, NodeJS.Timeout>();
+  private lifetime = 0;
   private readonly diskReads = new WeakMap<Code, object>();
   private readonly analysis = new DocumentAnalysisQueue<Code>({
-    content: (code) => code.content,
+    content: (code) =>
+      code.project.analysis.isCurrent &&
+      ['complete', 'degraded'].includes(code.analysisState.status)
+        ? code.content
+        : undefined,
     analyze: async (code, snapshot) => {
-      await code.reload(snapshot.text);
+      if (snapshot.version === undefined) {
+        code.releaseBuffer();
+        code.content = snapshot.text;
+        await code.project.analysis.analyze();
+      } else {
+        await code.readContent(snapshot.text);
+        await code.project.analysis.analyze();
+      }
       if (
         !this.disposed &&
         this.projects.some((project) => project === code.project)
       ) {
         this.semanticHighlightProvider.refresh();
-        this.scheduleDiagnostics(code.project);
       }
     },
     delay: () => stitchConfig.reprocessOnTypeDelay,
@@ -97,7 +107,7 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     const suppresedGroups = stitchConfig.suppressDiagnosticsInGroups;
     for (const group of suppresedGroups) {
       if (payload.code?.asset.isInFolder(group)) {
-        // Then skip this file!
+        this.diagnosticCollection.delete(vscode.Uri.file(payload.filePath));
         return;
       }
     }
@@ -108,10 +118,12 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
   }
 
   clearProjects() {
+    this.lifetime++;
     this.analysis.clear();
-    for (const timer of this.diagnosticTimers.values()) clearTimeout(timer);
-    this.diagnosticTimers.clear();
+    for (const project of this.projects) project.dispose();
     this.projects = [];
+    this.diagnosticCollection.clear();
+    this.semanticHighlightProvider.clear();
     void vscode.commands.executeCommand(
       'setContext',
       'stitch.projectCount',
@@ -121,6 +133,7 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
 
   async loadProject(yypPath: vscode.Uri, onDiagnostics: OnDiagnostics) {
     let project!: GameMakerProject;
+    const lifetime = this.lifetime;
     await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
@@ -133,7 +146,10 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
         });
         project = await GameMakerProject.from(
           yypPath,
-          onDiagnostics,
+          (payload) => {
+            if (!this.disposed && lifetime === this.lifetime)
+              onDiagnostics(payload);
+          },
           (percent, message) => {
             progress.report({
               increment: percent,
@@ -141,15 +157,25 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
             });
           },
         );
+        if (this.disposed || lifetime !== this.lifetime) {
+          project.dispose();
+          throw new Error('Project loading was cancelled');
+        }
         try {
           await project.syncIncludedFiles();
-        } catch {}
+        } catch (error) {
+          logger.warn('Could not synchronize Included Files', error);
+        }
         progress.report({
           increment: 100,
           message: 'Done!',
         });
       },
     );
+    if (this.disposed || lifetime !== this.lifetime) {
+      project.dispose();
+      throw new Error('Project loading was cancelled');
+    }
     this.projects.push(project);
     void vscode.commands.executeCommand(
       'setContext',
@@ -216,19 +242,31 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
       document.uri.scheme !== 'file'
     )
       return;
+    await this.externalChangeTracker.flush();
+    if (this.disposed || document.isClosed || token?.isCancellationRequested)
+      return;
     const code = this.getGmlFile(document);
     if (!code) return;
     this.diskReads.delete(code);
     const version = document.version;
     const snapshot = { version, text: document.getText() };
-    if (immediate) await this.analysis.flush(code, snapshot);
-    else await this.analysis.wait(code, snapshot, token);
+    this.stageOpenBuffers(code.project);
+    try {
+      if (immediate) await this.analysis.flush(code, snapshot);
+      else await this.analysis.wait(code, snapshot, token);
+      if (token?.isCancellationRequested) return;
+      await code.project.analysis.analyze();
+    } catch {
+      return;
+    }
     if (
       this.disposed ||
       document.isClosed ||
       token?.isCancellationRequested ||
       document.version !== version ||
-      this.getGmlFile(document) !== code
+      this.getGmlFile(document) !== code ||
+      !code.project.analysis.isCurrent ||
+      !['complete', 'degraded'].includes(code.analysisState.status)
     )
       return;
     return code;
@@ -241,7 +279,51 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
   ) {
     const version = document.version;
     const project = this.getProject(document);
-    if (!project) return;
+    if (!project || !(await this.ensureProjectAnalysis(project, token))) return;
+    if (
+      document.version !== version ||
+      document.isClosed ||
+      token?.isCancellationRequested
+    )
+      return;
+    return this.ensureDocumentCurrent(document, token);
+  }
+
+  private stageOpenBuffers(project: Project): void {
+    for (const document of vscode.workspace.textDocuments) {
+      if (
+        document.isClosed ||
+        document.languageId !== 'gml' ||
+        document.uri.scheme !== 'file' ||
+        this.getProject(document) !== project
+      )
+        continue;
+      const code = this.getGmlFile(document);
+      if (!code) continue;
+      this.diskReads.delete(code);
+      code.setBufferContent(document.getText());
+    }
+  }
+
+  /** Join the project closure after staging every authoritative open buffer. */
+  async ensureProjectAnalysis(
+    project: GameMakerProject,
+    token?: vscode.CancellationToken,
+  ): Promise<boolean> {
+    if (
+      this.disposed ||
+      token?.isCancellationRequested ||
+      !this.projects.includes(project)
+    )
+      return false;
+    await this.externalChangeTracker.flush();
+    if (
+      this.disposed ||
+      token?.isCancellationRequested ||
+      !this.projects.includes(project)
+    )
+      return false;
+    this.stageOpenBuffers(project);
     const buffers = vscode.workspace.textDocuments.filter(
       (other) =>
         other.languageId === 'gml' &&
@@ -250,17 +332,20 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
         this.getProject(other) === project,
     );
     const versions = buffers.map((other) => other.version);
-    for (const other of buffers) {
-      if (!(await this.ensureDocumentCurrent(other, token))) return;
+    try {
+      await project.analysis.analyze();
+    } catch {
+      return false;
     }
-    if (
-      buffers.some(
-        (other, index) => other.isClosed || other.version !== versions[index],
+    return (
+      !this.disposed &&
+      !token?.isCancellationRequested &&
+      this.projects.includes(project) &&
+      project.analysis.isCurrent &&
+      buffers.every(
+        (other, index) => !other.isClosed && other.version === versions[index],
       )
-    )
-      return;
-    if (document.version !== version || token?.isCancellationRequested) return;
-    return this.ensureDocumentCurrent(document, token);
+    );
   }
 
   private openDocument(uri: vscode.Uri) {
@@ -270,58 +355,99 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     );
   }
 
+  private async updateOpenBuffer(document: vscode.TextDocument): Promise<void> {
+    const code = this.getGmlFile(document);
+    if (!code) return;
+    this.diskReads.delete(code);
+    this.stageOpenBuffers(code.project);
+    await this.analysis.flush(code, {
+      version: document.version,
+      text: document.getText(),
+    });
+  }
+
   /** Open buffers are authoritative, including when a watcher races a save or edit. */
   async onChangeFile(uri: vscode.Uri): Promise<void> {
     if (this.disposed) return;
     const open = this.openDocument(uri);
     if (open) {
-      await this.ensureDocumentCurrent(open);
+      await this.updateOpenBuffer(open);
       return;
     }
     const code = this.getGmlFile(uri);
     if (!code) return;
     const read = {};
     this.diskReads.set(code, read);
-    const text = await code.path.read();
-    if (this.disposed || this.diskReads.get(code) !== read) return;
-    const openedDuringRead = this.openDocument(uri);
-    if (openedDuringRead) {
-      await this.ensureDocumentCurrent(openedDuringRead);
-    } else if (this.getGmlFile(uri) === code) {
-      await this.analysis.flush(code, { text });
-    }
+    await code.project.withResourceUpdate(async () => {
+      const text = await code.path.read();
+      if (
+        this.disposed ||
+        this.diskReads.get(code) !== read ||
+        this.getGmlFile(uri) !== code
+      )
+        return;
+      const openedDuringRead = this.openDocument(uri);
+      if (openedDuringRead) code.setBufferContent(openedDuringRead.getText());
+      else {
+        code.releaseBuffer();
+        code.content = text;
+      }
+    });
+    if (!this.disposed) this.semanticHighlightProvider.refresh();
   }
 
   async onCloseDoc(document: vscode.TextDocument): Promise<void> {
     if (document.languageId !== 'gml' || document.uri.scheme !== 'file') return;
     const code = this.getGmlFile(document);
-    if (code) this.analysis.forget(code);
+    if (code) {
+      this.analysis.forget(code);
+      code.releaseBuffer();
+    }
     // Closing an unsaved buffer must restore the on-disk model as well.
     await this.onChangeFile(document.uri);
   }
 
-  private scheduleDiagnostics(project: Project) {
-    clearTimeout(this.diagnosticTimers.get(project));
-    this.diagnosticTimers.set(
-      project,
-      setTimeout(() => {
-        this.diagnosticTimers.delete(project);
-        if (this.disposed) return;
-        try {
-          project.drainDirtyFileUpdateQueue();
-        } catch (error) {
-          logger.error(error);
-        }
-      }, stitchConfig.reprocessOnTypeDelay),
-    );
+  async onConfigurationChanged(
+    event: vscode.ConfigurationChangeEvent,
+  ): Promise<void> {
+    if (this.disposed || !event.affectsConfiguration('stitch')) return;
+    const semantic =
+      event.affectsConfiguration('stitch.run.defaultConfig') ||
+      event.affectsConfiguration(
+        'stitch.diagnostics.autoDeclaredGlobalsPatterns',
+      );
+    for (const project of [...this.projects]) {
+      if (semantic) {
+        if (project.options)
+          (project.options.settings ||= {}).autoDeclareGlobalsPrefixes =
+            stitchConfig.autoDeclaredGlobalsPrefixes;
+        project.analysis.invalidate();
+        if (project.options)
+          (project.options.settings ||= {}).analysisConfiguration =
+            stitchConfig.runConfigDefault || undefined;
+        await project.setAnalysisConfiguration(
+          project.defaultAnalysisConfiguration,
+        );
+      }
+      if (this.disposed || !this.projects.includes(project)) return;
+      for (const asset of project.assets.values())
+        for (const code of asset.gmlFiles.values()) code.publishDiagnostics();
+    }
+    this.semanticHighlightProvider.clear();
+    this.semanticHighlightProvider.refresh();
   }
 
   dispose() {
+    if (this.disposed) return;
     this.disposed = true;
+    this.clearProjects();
     this.analysis.dispose();
-    for (const timer of this.diagnosticTimers.values()) clearTimeout(timer);
-    this.diagnosticTimers.clear();
     this.externalChangeTracker.dispose();
+    this.semanticHighlightProvider.dispose();
+    this.signatureHelpStatus.dispose();
+    this.diagnosticCollection.dispose();
+    stitchEvents.clear();
+    if (StitchWorkspace.provider === this) StitchWorkspace.provider = undefined;
   }
 
   getActiveDocument(): vscode.TextDocument | undefined {
@@ -475,7 +601,7 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     return file;
   }
 
-  getRefFromSelection(
+  async getRefFromSelection(
     document?: vscode.TextDocument,
     selection?: readonly vscode.Selection[],
   ) {
@@ -487,15 +613,19 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     ) {
       return;
     }
-    const file = this.getGmlFile(document);
-    if (!file) return;
-
-    // Get the reference at the cursor
-    selection ||= vscode.window.activeTextEditor?.selections;
-    if (!selection) return;
-    const start = selection[0].start;
-    const ref = file.getReferenceAt(start.line + 1, start.character);
-    return ref;
+    const editor = vscode.window.activeTextEditor;
+    selection ||= editor?.document === document ? editor.selections : undefined;
+    const start = selection?.[0]?.start;
+    if (!start) return;
+    const file = await this.ensureDocumentCurrent(document);
+    if (
+      !file ||
+      (editor?.document === document &&
+        (vscode.window.activeTextEditor !== editor ||
+          !editor.selection.start.isEqual(start)))
+    )
+      return;
+    return file.getReferenceAt(document.offsetAt(start));
   }
 
   /** Record every text change; explicit completion triggers can bypass the delay. */
@@ -526,11 +656,10 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
       !('contentChanges' in event) ||
       (event.contentChanges.length === 1 &&
         triggers.includes(event.contentChanges[0].text));
-    this.analysis.enqueue(
-      code,
-      { version: document.version, text: document.getText() },
-      immediate,
-    );
+    const snapshot = { version: document.version, text: document.getText() };
+    // Input generations advance immediately; debounce only delays analysis.
+    code.setBufferContent(snapshot.text);
+    this.analysis.enqueue(code, snapshot, immediate);
   }
 
   async createNewProject() {
@@ -635,16 +764,43 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
   /**
    * Only allow a single instance at a time.
    */
-  protected static provider: StitchWorkspace;
+  protected static provider: StitchWorkspace | undefined;
+  private static activation: Promise<StitchWorkspace> | undefined;
 
-  static async activate(ctx: vscode.ExtensionContext) {
+  static activate(ctx: vscode.ExtensionContext): Promise<StitchWorkspace> {
     info('Activating extension...');
+    // An allocated instance is not a readiness result. Concurrent callers
+    // share the same initialization, cancellation and failure ownership.
+    if (this.activation) return this.activation;
     if (this.provider) {
       info('Extension already active!');
-      return this.provider;
+      return Promise.resolve(this.provider);
     }
-    this.provider = new StitchWorkspace(ctx);
-    await activateStitchExtension(this.provider, ctx);
-    return this.provider;
+    const provider = new StitchWorkspace(ctx);
+    this.provider = provider;
+    const activation = Promise.resolve()
+      .then(async () => {
+        try {
+          await activateStitchExtension(provider, ctx);
+          if (provider.disposed)
+            throw new Error('Extension activation was cancelled');
+          return provider;
+        } catch (error) {
+          provider.dispose();
+          for (const subscription of ctx.subscriptions.splice(0)) {
+            try {
+              subscription.dispose();
+            } catch (cleanupError) {
+              logger.warn(cleanupError);
+            }
+          }
+          throw error;
+        }
+      })
+      .finally(() => {
+        if (this.activation === activation) this.activation = undefined;
+      });
+    this.activation = activation;
+    return activation;
   }
 }

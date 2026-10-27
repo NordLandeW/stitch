@@ -1,4 +1,4 @@
-import { Reference, ReferenceableType } from '@bscotch/gml-parser';
+import { Reference, type Code, type Range } from '@bscotch/gml-parser';
 import { literal } from '@bscotch/utility';
 import vscode from 'vscode';
 import type { StitchWorkspace } from './extension.workspace.mjs';
@@ -43,6 +43,18 @@ export class GameMakerSemanticTokenProvider
   private _onDidChangeSemanticTokens: vscode.EventEmitter<void> =
     new vscode.EventEmitter();
   readonly onDidChangeSemanticTokens = this._onDidChangeSemanticTokens.event;
+  private cache = new WeakMap<
+    Code,
+    { key: string; tokens: vscode.SemanticTokens }
+  >();
+
+  clear(): void {
+    this.cache = new WeakMap();
+  }
+  dispose(): void {
+    this.clear();
+    this._onDidChangeSemanticTokens.dispose();
+  }
 
   refresh() {
     this._onDidChangeSemanticTokens.fire();
@@ -62,76 +74,54 @@ export class GameMakerSemanticTokenProvider
         return;
       }
 
-      const tokensBuilder = new vscode.SemanticTokensBuilder(
-        semanticTokensLegend,
-      );
-      const cache = new Map<
-        ReferenceableType,
-        { type: SemanticTokenType; mods: Set<SemanticTokenModifier> }
-      >();
-      for (const ref of file.refs) {
-        if (
-          !ref.start ||
-          isNaN(ref.start.line) ||
-          !ref.end ||
-          isNaN(ref.end.line)
-        ) {
-          continue;
-        }
-        // Get the location as a vscode range
+      const key = `${document.version}:${JSON.stringify(file.analysisState)}:${file.project.analysis.generation}`;
+      const cached = this.cache.get(file);
+      if (cached?.key === key) return cached.tokens;
+      const builder = new vscode.SemanticTokensBuilder(semanticTokensLegend);
+      const emitted = new Set<string>();
+      const references = [
+        ...file.refs,
+        ...file.project.analysis.spellingReferences(file.path.absolute),
+      ];
+      for (const ref of references) {
+        if (token.isCancellationRequested) return;
+        const source: Range =
+          ref.ownerUnitId === file.path.absolute ? ref.queryRange || ref : ref;
+        if (source.file !== file) continue;
         const signifier = ref.item;
-
-        // Exclude some types that don't make sense to override
         if (
-          signifier.name &&
           ['self', 'other', 'noone', 'all', 'global'].includes(signifier.name)
-        ) {
+        )
           continue;
-        }
-        const range = locationOf(ref)!.range;
-        // If we've already seen this symbol, use the cached semantic details
-        if (cache.has(signifier)) {
-          const { type, mods } = cache.get(signifier)!;
-          try {
-            tokensBuilder.push(range, type, [...mods]);
-          } catch (error) {
-            warn(error);
-            warn('CACHE ERROR');
-            console.dir({ range, type, mods });
-          }
+        const location = locationOf(source);
+        if (!location) continue;
+        const range = location.range;
+        if (
+          !range.isSingleLine ||
+          range.start.line < 0 ||
+          range.end.line >= document.lineCount ||
+          range.start.character < 0 ||
+          range.end.character > document.lineAt(range.end.line).text.length
+        )
           continue;
-        }
-
-        // Figure out what the semantic details are
-        let tokenType = inferSemanticToken(ref);
-        if (tokenType === 'variable' && signifier.instance) {
-          tokenType = 'property';
-        }
-        const tokenModifiers = inferSemanticModifiers(ref);
-        const isAsset = signifier.type.type.find((t) =>
-          t.kind.startsWith('Asset.'),
-        );
-        if (isAsset) {
-          tokenModifiers.add('asset');
-        }
-        if (!tokenType) {
-          warn('No token type for symbol', signifier);
-          continue;
-        }
-        try {
-          tokensBuilder.push(range, tokenType, [...tokenModifiers]);
-          cache.set(signifier, { type: tokenType, mods: tokenModifiers });
-        } catch (err) {
-          warn(err);
-          warn('PUSH ERROR');
-          console.dir({
-            range,
-            tokenType,
-            tokenModifiers,
-          });
-        }
+        const span = `${source.start.offset}:${source.end.offset}`;
+        if (emitted.has(span)) continue;
+        emitted.add(span);
+        let type = inferSemanticToken(ref);
+        if (type === 'variable' && signifier.instance) type = 'property';
+        const modifiers = inferSemanticModifiers(ref);
+        if (ref.isDef) modifiers.add('declaration');
+        if (signifier.deprecated) modifiers.add('deprecated');
+        if (
+          (ref.evaluatedType || signifier.type).type.some((value) =>
+            value.kind.startsWith('Asset.'),
+          )
+        )
+          modifiers.add('asset');
+        builder.push(range, type, [...modifiers]);
       }
-      const tokens = tokensBuilder.build();
+      const tokens = builder.build();
+      this.cache.set(file, { key, tokens });
       return tokens;
     } catch (error) {
       warn(error);
@@ -151,7 +141,9 @@ export class GameMakerSemanticTokenProvider
 
 function inferSemanticToken(ref: Reference): SemanticTokenType {
   const signifier = ref.item;
-  const functionType = signifier.getTypeByKind('Function');
+  const functionType = (ref.evaluatedType || signifier.type).type.find(
+    (type) => type.kind === 'Function',
+  );
 
   if (signifier.enum) {
     return 'enum';
