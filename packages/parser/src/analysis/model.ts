@@ -279,6 +279,8 @@ export interface Declaration {
   readonly node: SyntaxNode;
   readonly docs?: JsdocSummary;
   readonly bare: boolean;
+  /** A qualified write to global storage (global.name or startup self.name). */
+  readonly explicitGlobal?: boolean;
   readonly exported: boolean;
   readonly parameterIndex?: number;
   readonly optional?: boolean;
@@ -470,6 +472,11 @@ export class AnalysisCancelled extends Error {
   }
 }
 export const globalOwner = 'global';
+/** Built-in bare names have identities independent of user global storage. */
+export const nativeGlobalOwner = 'native:global';
+export function nativeGlobalKey(name: string): SymbolKey {
+  return memberKey(nativeGlobalOwner, name);
+}
 export function globalKey(name: string): SymbolKey {
   return `global:${name}`;
 }

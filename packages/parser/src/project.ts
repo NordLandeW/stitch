@@ -144,11 +144,11 @@ export class Project {
    */
   nativeWaiter?: Promise<void>;
   /**
-   * The type of the 'global' struct, which contains all globalvars
-   * and globally defined functions. */
+   * Bare-name presentation of native symbols and project globals.
+   * `analysis.globalStorage` exposes the independent user global storage. */
   self!: StructType;
   /**
-   * The `global` symbol, which has type `self`. */
+   * The `global` symbol, whose committed type is `analysis.globalStorage`. */
   symbol!: Signifier;
   /**
    * Non-native global types, which can be referenced in JSDocs

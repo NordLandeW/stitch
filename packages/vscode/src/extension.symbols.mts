@@ -62,9 +62,8 @@ export class StitchWorkspaceSymbolProvider
         !!resource.gmlFile &&
         search.matches(resource.name) &&
         !symbols.has(resource);
-      const globalVarWithSameName = resource.project.self.getMember(
-        resource.name,
-      );
+      const globalVarWithSameName =
+        resource.project.analysis.globalStorage.getMember(resource.name);
       const containsGlobalFunctionWithSameName =
         !!globalVarWithSameName &&
         globalVarWithSameName.def?.file === resource.gmlFile;
@@ -148,7 +147,7 @@ export class StitchWorkspaceSymbolProvider
     search: WorkspaceSymbolSearch,
   ): Promise<SymbolResults> {
     if (search.stopped) return symbols;
-    for (const item of project.self.listMembers()) {
+    for (const item of project.analysis.globalStorage.listMembers()) {
       const pending = search.checkpoint();
       if (pending) await pending;
       if (search.stopped) return symbols;

@@ -140,6 +140,7 @@ async function compileSubjects(
       'extension.hover',
       'extension.typeDefs',
       'extension.completions',
+      'extension.symbols',
     ])
       stubs.delete(module);
   if (realTrees) {
@@ -193,7 +194,7 @@ async function compileSubjects(
     export { ChangeTracker } from ${JSON.stringify(source('changes.mts'))};
     export { stitchEvents } from ${JSON.stringify(source('events.mts'))};
     export { applyProjectEdits } from ${JSON.stringify(source('extension.edits.mts'))};
-    export { GameMakerProject, Code };
+    export { GameMakerProject, Code, Type, Signifier };
     ${
       realAdapters
         ? `
@@ -203,6 +204,7 @@ async function compileSubjects(
       export { StitchHoverProvider } from ${JSON.stringify(source('extension.hover.mts'))};
       export { StitchTypeDefinitionProvider } from ${JSON.stringify(source('extension.typeDefs.mts'))};
       export { StitchCompletionProvider } from ${JSON.stringify(source('extension.completions.mts'))};
+      export { StitchWorkspaceSymbolProvider } from ${JSON.stringify(source('extension.symbols.mts'))};
       export { GameMakerSemanticTokenProvider, semanticTokensLegend } from ${JSON.stringify(source('extension.highlighting.mts'))};
     `
         : ''
@@ -656,6 +658,28 @@ export async function createHost(
       Function: 3,
       Variable: 4,
       Interface: 5,
+    },
+    SymbolInformation: class {
+      constructor(
+        public name: string,
+        public kind: number,
+        public containerName: string,
+        public location: Location,
+      ) {}
+    },
+    SymbolKind: {
+      File: 0,
+      Module: 1,
+      Class: 4,
+      Method: 5,
+      Property: 6,
+      Field: 7,
+      Constructor: 8,
+      Enum: 9,
+      Function: 11,
+      Variable: 12,
+      Constant: 13,
+      EnumMember: 21,
     },
     ExtensionMode: { Development: 2, Production: 1 },
     DiagnosticSeverity: { Error: 0, Warning: 1, Information: 2 },

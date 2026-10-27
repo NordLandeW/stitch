@@ -20,6 +20,8 @@ import {
   globalKey,
   globalOwner,
   memberKey,
+  nativeGlobalKey,
+  nativeGlobalOwner,
   type Argument,
   type BindingScope,
   type BoundFunction,
@@ -211,6 +213,7 @@ class Evaluator {
   readonly functionByType = new Map<string, BoundFunction>();
   readonly constructorBySelf = new Map<string, BoundFunction>();
   readonly declarationsByKey = new Map<string, Declaration>();
+  readonly nativeDeclarations = new Map<string, SymbolView>();
   readonly externalKeys = new WeakMap<Signifier, string>();
   readonly expressionValues = new Map<string, Value>();
   readonly symbolAliases = new Map<string, string>();
@@ -440,6 +443,7 @@ class Evaluator {
           symbol.item.writable,
           symbol.item.static,
           symbol.item.override,
+          symbol.bare,
           symbol.item.resourceDefinition && [
             symbol.item.resourceDefinition.unitId,
             symbol.item.resourceDefinition.uri,
@@ -522,9 +526,11 @@ class Evaluator {
     return (
       item.semanticKey ||
       this.externalKeys.get(item) ||
-      (item.global || item.native
-        ? globalKey(item.name)
-        : memberKey(this.keyOfType(item.parent), item.name))
+      (item.native && !item.instance
+        ? nativeGlobalKey(item.name)
+        : item.global
+          ? globalKey(item.name)
+          : memberKey(this.keyOfType(item.parent), item.name))
     );
   }
   readType(
@@ -542,7 +548,7 @@ class Evaluator {
     return imported;
   }
   importedLookup(
-    namespace: 'global' | 'member' | 'static',
+    namespace: 'global' | 'member' | 'static' | 'native',
     owner: string,
     name: string,
   ): SymbolView | undefined {
@@ -560,9 +566,70 @@ class Evaluator {
     if (found) this.externalKeys.set(found.item, found.key);
     return found;
   }
-  installDeclaration(declaration: Declaration): SymbolContribution {
+  installDeclaration(declaration: Declaration): SymbolView {
+    // `var` declarations cannot reuse built-in names. Parameters and static
+    // declarations have different compiler rules; catch/doc names are not var
+    // declarations. Keep a local recovery symbol without mutating the native.
+    if (
+      declaration.role === 'local' &&
+      'name' in declaration.node &&
+      this.importedLookup('native', nativeGlobalOwner, declaration.name)
+    ) {
+      this.diagnostic(
+        declaration.origin,
+        `Cannot redeclare built-in symbol \`${declaration.name}\`.`,
+        'INVALID_OPERATION',
+        'error',
+      );
+    }
+    const assignment = declaration.node as Partial<
+      Extract<Expression, { kind: 'assign' }>
+    >;
+    const bareWrite =
+      declaration.role === 'field' &&
+      assignment.kind === 'assign' &&
+      assignment.target?.kind === 'name';
+    if (
+      (declaration.owner === globalOwner && !declaration.explicitGlobal) ||
+      bareWrite
+    ) {
+      const native = this.importedLookup(
+        'native',
+        nativeGlobalOwner,
+        declaration.name,
+      );
+      if (
+        native &&
+        (!bareWrite || !native.item.instance) &&
+        declaration.role !== 'function' &&
+        !(
+          declaration.extensionModule &&
+          native.item.native === declaration.extensionModule
+        )
+      ) {
+        this.nativeDeclarations.set(declaration.id, native);
+        if (declaration.role !== 'global' && !bareWrite) {
+          this.diagnostic(
+            declaration.origin,
+            `Cannot redeclare built-in symbol \`${declaration.name}\`.`,
+            'INVALID_OPERATION',
+            'error',
+          );
+          this.namedTypes.delete(`Function.${declaration.name}`);
+          this.namedTypes.delete(`Struct.${declaration.name}`);
+        }
+        return native;
+      }
+    }
     const existing = this.symbols.get(declaration.key);
-    if (existing) return existing;
+    if (existing) {
+      if (declaration.bare && !existing.bare) {
+        const alias = { ...existing, bare: true };
+        this.symbols.set(declaration.key, alias);
+        return alias;
+      }
+      return existing;
+    }
     const container = this.ensureType(
       declaration.owner,
       declaration.role === 'enum-member' ? 'Enum' : 'Struct',
@@ -826,11 +893,16 @@ class Evaluator {
   lookupName(name: string, frame: Frame): SymbolView | undefined {
     const local = this.local(name, frame);
     if (local) return local;
+    // Native bare names are not aliases of global.name or self.name. A legal
+    // same-name function owns user storage without replacing the built-in call.
+    const native = this.importedLookup('native', nativeGlobalOwner, name);
+    if (native && !native.item.instance) return native;
     const self = frame.self || this.types.get(frame.scope.selfOwner);
     if (self && frame.scope.selfOwner !== globalOwner) {
       const found = this.lookupMember(self, name);
       if (found) return found;
     }
+    if (native && frame.scope.selfOwner !== globalOwner) return native;
     const own = this.symbols.get(globalKey(name));
     if (own?.item.def && (own.bare || frame.scope.selfOwner === globalOwner))
       return own;
@@ -1297,8 +1369,8 @@ class Evaluator {
           // native schemas otherwise describe both simply as Id.Instance.
           // https://manual.gamemaker.io/monthly/en/GameMaker_Language/GML_Overview/Instance_Keywords.htm
           const candidate = this.importedLookup(
-            'global',
-            globalOwner,
+            'native',
+            nativeGlobalOwner,
             node.name.text,
           );
           const symbol = candidate?.item.native ? candidate : undefined;
@@ -2351,13 +2423,18 @@ class Evaluator {
     if (target.kind === 'name') {
       const declaration = this.bound.declarationSites.get(target.name.id);
       let symbol = declaration
-        ? this.symbols.get(this.resolveAlias(declaration.key))
+        ? this.nativeDeclarations.get(declaration.id) ||
+          this.symbols.get(this.resolveAlias(declaration.key))
         : this.lookupName(target.name.text, frame);
       if (!symbol)
         symbol =
           this.lookupName(target.name.text, frame) ||
           this.unresolved(target.name, frame);
-      if (declaration?.role === 'field' && frame.self) {
+      if (
+        declaration?.role === 'field' &&
+        frame.self &&
+        !this.nativeDeclarations.has(declaration.id)
+      ) {
         const storage = this.storageType(frame.self);
         const actualOwner = this.keyOfType(storage);
         if (actualOwner !== declaration.owner) {
@@ -2661,7 +2738,8 @@ class Evaluator {
             this.types.get(owner) === type ? type : this.copyShape(type);
           const item = new Signifier(owned, key);
           item.semanticKey = memberKey(owner, key);
-          item.instance = true;
+          item.global = owner === globalOwner;
+          item.instance = owner !== globalOwner;
           item.def = {};
           item.definitive =
             this.bound.context.definitiveSelf || !!frame.function;
@@ -2671,6 +2749,7 @@ class Evaluator {
             origin: keyNode.origin,
             owner,
             unitId: this.bound.unitId,
+            bare: owner === globalOwner ? false : undefined,
             exported: !owner.startsWith('struct:' + this.bound.unitId),
           };
           this.symbols.set(contribution.key, contribution);
@@ -2938,7 +3017,17 @@ class Evaluator {
         for (const declaration of node.declarations) {
           const bound = this.bound.declarationSites.get(declaration.name.id);
           if (!bound) continue;
-          const symbol = this.symbols.get(bound.key)!;
+          const native = this.nativeDeclarations.get(bound.id);
+          const symbol = native || this.symbols.get(bound.key)!;
+          if (native && !declaration.value) {
+            this.record(
+              declaration.name,
+              native,
+              value(native.item.type),
+              'declaration',
+            );
+            continue;
+          }
           const current =
             node.storage === 'static' && state.values.has(symbol.key)
               ? state.values.get(symbol.key)!
@@ -3360,7 +3449,10 @@ class Evaluator {
       }
       case 'doc': {
         const declaration = this.bound.declarationSites.get(`${node.id}:name`);
-        const symbol = declaration && this.symbols.get(declaration.key);
+        const symbol =
+          declaration &&
+          (this.nativeDeclarations.get(declaration.id) ||
+            this.symbols.get(declaration.key));
         if (symbol && declaration)
           this.record(
             {
@@ -3371,7 +3463,7 @@ class Evaluator {
             symbol,
             value(symbol.item.type),
             'declaration',
-            true,
+            !symbol.item.native,
           );
         for (const range of node.docs.typeRanges) {
           const type = this.knownTypes.get(range.content);

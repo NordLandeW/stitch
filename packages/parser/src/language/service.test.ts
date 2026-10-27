@@ -87,7 +87,7 @@ class MemoryProject extends Project {
   async prepareBundledNative() {
     this.native = await Native.from(
       [Native.fallbackGmlSpecPath],
-      this.self,
+      new Type('Struct').named('global'),
       this.types,
     );
     this.languageProfile = new LanguageProfile({
@@ -350,6 +350,179 @@ function expectChain(project: MemoryProject, kind: string) {
 }
 
 describe('ProjectAnalysis through real Project and Code models', function () {
+  it('separates explicit global storage from native bare reads, writes, completion and rename', async function () {
+    const source =
+      'global.fps="user value";var explicit=global.fps;var builtin=fps;fps=30;';
+    const project = await createProject({ Scope: source });
+    const code = project.testCode('Scope');
+    expectValue(code, 'explicit', 'String');
+    expectValue(code, 'builtin', 'Real');
+    const errors = code.getDiagnostics().INVALID_OPERATION;
+    expect(errors).to.have.length(1);
+    expect(errors[0].message).to.include('read-only');
+    expect(errors[0].location.start.offset).to.equal(source.lastIndexOf('fps'));
+    const refs = code.refs.filter((ref) => ref.item.name === 'fps');
+    expect(refs).to.have.length(4);
+    const user = refs[0].item;
+    const builtin = refs[2].item;
+    expect(user).not.to.equal(builtin);
+    expect(user.native).to.equal(undefined);
+    expect(user.isRenameable).to.equal(true);
+    expect(builtin.native).to.equal('Base');
+    expect(builtin.isRenameable).to.equal(false);
+    expect(refs[1].item).to.equal(user);
+    expect(refs[3].item).to.equal(builtin);
+    expect(user.def?.file).to.equal(code);
+    expect(project.analysis.globalStorage.getMember('fps')).to.equal(user);
+    expect(project.self.getMember('fps')).to.equal(builtin);
+    expect([...user.refs]).to.have.length(2);
+    expect(planReferenceRename(user.refs, 'user_fps')).to.have.length(2);
+    const dot = code.getCompletionCandidatesAt(
+      source.indexOf('global.fps') + 'global.'.length,
+    );
+    expect(dot.find((item) => item.name === 'fps')?.symbols).to.deep.equal([
+      user,
+    ]);
+    const bare = code.getCompletionCandidatesAt(
+      source.indexOf('builtin=fps') + 'builtin='.length,
+    );
+    expect(bare.find((item) => item.name === 'fps')?.symbols).to.deep.equal([
+      builtin,
+    ]);
+  });
+
+  it('keeps user/native global identities stable across edits, removal and cold load order', async function () {
+    const sources = {
+      Storage: 'global.fps="user";globalvar ordinary;ordinary=7;',
+      Reader:
+        'var stored=global.fps;var native_value=fps;var aliased=global.ordinary;var bare_alias=ordinary;',
+    };
+    const project = await createProject(sources);
+    const reader = project.testCode('Reader');
+    expectValue(reader, 'stored', 'String');
+    expectValue(reader, 'native_value', 'Real');
+    expect(kinds(definition(reader, 'aliased').item.type)).to.deep.equal([
+      'Real',
+      'Undefined',
+    ]);
+    expect(kinds(definition(reader, 'bare_alias').item.type)).to.deep.equal([
+      'Real',
+      'Undefined',
+    ]);
+    expect(
+      reader.refs
+        .filter((ref) => ref.item.name === 'ordinary')
+        .map((ref) => ref.item),
+    ).to.deep.equal([
+      project.self.getMember('ordinary'),
+      project.self.getMember('ordinary'),
+    ]);
+    const native = reader.refs.find(
+      (ref) => ref.text === 'fps' && ref.item.native,
+    )!.item;
+    const reversed = await createProject(sources, {
+      fileOrder: ['Reader', 'Storage'],
+      resourceOrder: ['Reader', 'Storage'],
+    });
+    expect(snapshot(reversed)).to.deep.equal(snapshot(project));
+    await project
+      .testCode('Storage')
+      .parse('global.fps=true;globalvar ordinary;ordinary=7;');
+    await project.analysis.analyze();
+    expectValue(reader, 'stored', 'Bool');
+    expect(
+      reader.refs.find((ref) => ref.item.native && ref.text === 'fps')!.item,
+    ).to.equal(native);
+    expect(snapshot(project)).to.deep.equal(
+      snapshot(await createProject(currentSources(project))),
+    );
+    await project.testCode('Storage').parse('globalvar ordinary;ordinary=7;');
+    await project.analysis.analyze();
+    expect(missing(reader, 'fps')).to.have.length(1);
+    expectValue(reader, 'native_value', 'Real');
+    expect(snapshot(project)).to.deep.equal(
+      snapshot(await createProject(currentSources(project))),
+    );
+    await project.testCode('Storage').parse(sources.Storage);
+    await project.analysis.analyze();
+    expect(snapshot(project)).to.deep.equal(snapshot(reversed));
+  });
+
+  it('permits native-named top-level functions while binding bare calls to the native function', async function () {
+    const sources = {
+      Declaration:
+        'function string_split(_text,_separator){return ds_list_create();}',
+      Use: 'var builtin=string_split("a",";");var native_fn=string_split;var indirect=native_fn("a",";");var custom=global.string_split("a",";");',
+    };
+    const project = await createProject(sources);
+    const declaration = definition(
+      project.testCode('Declaration'),
+      'string_split',
+    );
+    const code = project.testCode('Use');
+    const refs = code.refs.filter((ref) => ref.text === 'string_split');
+    expect(refs).to.have.length(3);
+    expect(refs[0].item.native).to.equal('Base');
+    expect(refs[1].item).to.equal(refs[0].item);
+    expect(refs[2].item).to.equal(declaration.item);
+    expect(declaration.item.native).to.equal(undefined);
+    expect(declaration.item.isRenameable).to.equal(true);
+    expectValue(code, 'builtin', 'Array');
+    expectValue(code, 'custom', 'Id.DsList');
+    expectValue(code, 'indirect', 'Array');
+    for (const file of project.testCodes.values())
+      expect(file.getDiagnostics().INVALID_OPERATION).to.deep.equal([]);
+    expect(
+      [...declaration.item.refs].filter((ref) => !ref.isDef),
+    ).to.deep.equal([refs[2]]);
+    expect(snapshot(project)).to.deep.equal(
+      snapshot(
+        await createProject(sources, { fileOrder: ['Use', 'Declaration'] }),
+      ),
+    );
+    await project
+      .testCode('Declaration')
+      .parse('function string_split(_text,_separator){return "changed";}');
+    await project.analysis.analyze();
+    expectValue(code, 'builtin', 'Array');
+    expectValue(code, 'custom', 'String');
+    expect(snapshot(project)).to.deep.equal(
+      snapshot(await createProject(currentSources(project))),
+    );
+    await project
+      .testCode('Declaration')
+      .parse('function user_split(_text,_separator){return "changed";}');
+    await project.analysis.analyze();
+    expect(missing(code, 'string_split')).to.have.length(1);
+    expectValue(code, 'builtin', 'Array');
+    expect(snapshot(project)).to.deep.equal(
+      snapshot(await createProject(currentSources(project))),
+    );
+  });
+
+  it('accepts globalvar native aliases without treating the declaration as an assignment', async function () {
+    const project = await createProject({
+      Alias:
+        'globalvar os_type;var current=os_type;global.os_type="user";os_type=1;',
+    });
+    const code = project.testCode('Alias');
+    expectValue(code, 'current', 'Real');
+    const errors = code.getDiagnostics().INVALID_OPERATION;
+    expect(errors).to.have.length(1);
+    expect(errors[0].message).to.include('read-only');
+    expect(errors[0].location.start.offset).to.equal(
+      code.content.lastIndexOf('os_type'),
+    );
+    const native = code.refs.filter(
+      (ref) => ref.item.name === 'os_type' && ref.item.native,
+    );
+    expect(native).to.have.length(3);
+    expect(native.every((ref) => !ref.isDef)).to.equal(true);
+    await code.parse('globalvar os_type;var current=os_type;');
+    await project.analysis.analyze();
+    expect(code.getDiagnostics().INVALID_OPERATION).to.deep.equal([]);
+  });
+
   it('converges A → B → C → D forward returns independently of resource and file registration order', async function () {
     const forward = await createProject(chain);
     expectChain(forward, 'Real');

@@ -9,6 +9,7 @@ import {
   globalKey,
   globalOwner,
   memberKey,
+  nativeGlobalOwner,
   type MaterializationHost,
   type SymbolContribution,
   type UnitEvaluation,
@@ -216,7 +217,7 @@ export class ContributionGraph implements MaterializationHost {
     }
     // Global names are indexed directly. A miss must not materialize every
     // unrelated native function and project symbol merely to return undefined.
-    if (owner === globalOwner) return;
+    if (owner === globalOwner || owner === nativeGlobalOwner) return;
     for (const source of this.typeSources(owner)) {
       const own = source
         .listMembers(true)

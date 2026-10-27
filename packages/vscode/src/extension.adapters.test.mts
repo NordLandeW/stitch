@@ -4,12 +4,17 @@ import { createHost } from './test/host.mjs';
 
 const token = { isCancellationRequested: false };
 
-async function fixture(t: TestContext, sources: Record<string, string>) {
+async function fixture(
+  t: TestContext,
+  sources: Record<string, string>,
+  configure?: (project: any, host: any) => void,
+) {
   const host = await createHost({ realAdapters: true });
   t.after(() => host.dispose());
   const workspace = host.newWorkspace();
   const project = await host.project();
   workspace.projects.push(project);
+  configure?.(project, host);
   const files: Record<string, any> = {};
   const documents: Record<string, any> = {};
   const byUri = new Map<string, any>();
@@ -731,5 +736,121 @@ test(
       locationSpan(f.byUri, result),
       span(f.documents.Extension, 'external_impl'),
     );
+  },
+);
+
+// Native bare lookup and explicit global storage must survive every adapter.
+test(
+  'native-name user functions retain workspace symbols and qualified navigation and rename',
+  { timeout: 30_000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      {
+        Definitions: 'function string_split() { return 7; }',
+        Consumer:
+          'var native_call = string_split("text", ",");\nvar user_call = global.string_split();',
+      },
+      (project, host) => {
+        const { Type, Signifier } = host.subject;
+        const fn = new Type('Function');
+        fn.addParameter(0, 'text', { type: Type.String });
+        fn.addParameter(1, 'separator', { type: Type.String });
+        fn.setReturnType(Type.String);
+        const native = new Signifier(project.self, 'string_split', fn);
+        native.native = 'Base';
+        native.writable = false;
+        fn.signifier = native;
+        project.self.setOwnMember(native);
+        project.analysis.captureNative();
+      },
+    );
+    const definitions = f.documents.Definitions;
+    const consumer = f.documents.Consumer;
+    const declaration = span(definitions, 'string_split');
+    const bare = span(consumer, 'string_split');
+    const qualified = span(consumer, 'string_split', bare.end);
+    f.host.vscode.window.activeTextEditor = { document: consumer };
+    const search = new f.host.subject.StitchWorkspaceSymbolProvider(
+      f.workspace,
+    );
+    const symbols = await search.provideWorkspaceSymbols('string_split', token);
+    assert.equal(symbols.length, 1);
+    assert.equal(symbols[0].name, 'string_split');
+    assert.equal(symbols[0].kind, f.host.vscode.SymbolKind.Function);
+    const result = locationSpan(f.byUri, symbols[0].location);
+    assert.equal(result.uri, declaration.uri);
+    assert(result.start <= declaration.start && result.end >= declaration.end);
+    assert.equal(
+      await f.definitions.provideDefinition(
+        consumer,
+        consumer.positionAt(bare.start),
+        token,
+      ),
+      undefined,
+    );
+    assert.deepEqual(
+      locationSpan(
+        f.byUri,
+        await f.definitions.provideDefinition(
+          consumer,
+          consumer.positionAt(qualified.start),
+          token,
+        ),
+      ),
+      declaration,
+    );
+    const edits = await f.rename.provideRenameEdits(
+      definitions,
+      definitions.positionAt(declaration.start),
+      'custom_split',
+      token,
+    );
+    assert.deepEqual(
+      editSpans(f, edits),
+      sorted(
+        [declaration, qualified].map((entry) => ({
+          ...entry,
+          newText: 'custom_split',
+        })),
+      ),
+    );
+  },
+);
+
+test(
+  'ignored prefixes distinguish canonical global storage from local and same-file declarations',
+  { timeout: 30_000 },
+  async (t) => {
+    const f = await fixture(t, {
+      Definitions: 'function _foreign() { return 1; }',
+      Consumer:
+        'function _same() { return 2; }\nvar _local = 3;\nvar result = _same();\nvar global_value = global._foreign;',
+    });
+    f.host.settings.set('editing.autocomplete.ignoredPrefix', '_');
+    const document = f.documents.Consumer;
+    const provider = new f.host.subject.StitchCompletionProvider(f.workspace);
+    const label = (item: any) =>
+      typeof item.label === 'string' ? item.label : item.label.label;
+    const bare = await provider.provideCompletionItems(
+      document,
+      position(document, 'result'),
+      token,
+      { triggerKind: 1 },
+    );
+    const bareNames = bare.map(label);
+    assert(bareNames.includes('_same'));
+    assert(bareNames.includes('_local'));
+    assert(!bareNames.includes('_foreign'));
+    const dot = await provider.provideCompletionItems(
+      document,
+      position(document, '_foreign'),
+      token,
+      { triggerKind: 1, triggerCharacter: '.' },
+    );
+    const dotNames = dot.map(label);
+    assert(dotNames.includes('_same'));
+    assert(!dotNames.includes('_foreign'));
+    assert(!dotNames.includes('_local'));
   },
 );

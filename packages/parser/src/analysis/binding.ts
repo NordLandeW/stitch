@@ -284,14 +284,21 @@ export function bindUnit(syntax: SyntaxUnit, context: UnitContext): BoundUnit {
       target.target.kind === 'name' &&
       target.target.name.text === 'global'
     ) {
-      return declare(target.name, node, scope, 'global', { docs, bare: false });
+      return declare(target.name, node, scope, 'global', {
+        docs,
+        bare: false,
+        explicitGlobal: true,
+      });
     }
     if (
       target.kind === 'member' &&
       target.target.kind === 'name' &&
       target.target.name.text === 'self'
     ) {
-      return declare(target.name, node, scope, 'field', { docs });
+      return declare(target.name, node, scope, 'field', {
+        docs,
+        explicitGlobal: scope.selfOwner === globalOwner,
+      });
     }
     return;
   }

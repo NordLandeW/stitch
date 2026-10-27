@@ -1,6 +1,10 @@
 import type { Pathy } from '@bscotch/pathy';
 import { YyObject } from '@bscotch/yy';
-import type { CodeSemanticView } from './analysis/model.js';
+import {
+  globalOwner,
+  nativeGlobalOwner,
+  type CodeSemanticView,
+} from './analysis/model.js';
 import { value } from './analysis/values.js';
 import type { AnalysisState, AnalysisStatus } from './language/state.js';
 import {
@@ -461,7 +465,7 @@ export class Code {
         )
           continue;
         names.add(symbol.name);
-        if (receiver === this.project.self) {
+        if (receiver.semanticKey === globalOwner) {
           const definedInProject = !symbol.native && !!symbol.def?.file;
           const canLiveOnGlobal =
             !symbol.macro && !getTypeOfKind(symbol, ['Enum']);
@@ -516,8 +520,16 @@ export class Code {
     const allSignifiers = [
       // Local variables
       ...(scopeRange.local.listMembers() || []),
+      // Built-in bare names do not alias an explicit same-name self member.
+      ...this.project.self
+        .listMembers()
+        .filter(
+          (symbol) =>
+            symbol.parent.semanticKey === nativeGlobalOwner && !symbol.instance,
+        ),
       // Self variables, if not global
-      ...((scopeRange.self !== this.project.self
+      ...((scopeRange.self.semanticKey !== globalOwner &&
+      scopeRange.self !== this.project.self
         ? scopeRange.self.listMembers()
         : []) || []),
       // Project globals

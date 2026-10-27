@@ -73,6 +73,16 @@ The profile uses a known runtime version first, then the IDE version, then nonbu
 
 Sources: [2.3 language changes](https://gamemaker.io/en/blog/gamemaker-studio-2-dot-3-new-gml-features), [2.3.7 runtime notes](https://gms.yoyogames.com/release-notes-2.3.7.474.json), [2023.4 release](https://gamemaker.io/en/blog/release-2023-4).
 
+### Native names and user global storage
+
+Bare native names and explicitly qualified user globals have separate identities. For example, writing `global.fps` defines user storage while the bare `fps` remains the runtime's read-only value. A `globalvar` declaration does not make a native constant writable.
+
+A top-level named function can share a native name. Its declaration and `global.name` references identify the user function; a bare reference to that name still identifies the native function. This distinction also applies when a bare function reference is stored in another variable. Compiler-generated code on the 2024.14 and 2026 runtime lines confirms these separate lookup paths. A `var` declaration cannot reuse a built-in name; parameter and static declarations follow their distinct compiler rules.
+
+`project.analysis.globalStorage` exposes the canonical user-global container, initially empty before publication. Use it to enumerate user declarations, including functions whose names collide with native names. `project.self` is the combined bare-name presentation used by ordinary completion. Qualified completion, definition, references, and rename retain the underlying storage identity.
+
+Sources: [global variables and the global struct](https://manual.gamemaker.io/lts/en/GameMaker_Language/GML_Overview/Variables/Global_Variables.htm), [script functions and methods](https://manual.gamemaker.io/lts/en/GameMaker_Language/GML_Overview/Script_Functions_vs_Methods.htm).
+
 ## Resource-owned GML
 
 The current YYP and YY metadata select executable files. Unlisted event files, timeline moments, disabled instance creation files, and unrelated GML files remain outside the analysis. Nested room instance layers are included.

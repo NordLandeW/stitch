@@ -19,6 +19,7 @@
 - Treat workspace-symbol queries literally, honor cancellation, and retain useful contextual errors when logging unusual values.
 - Keep shared type graphs and enum contributions bounded, render recursive or very large type descriptions safely, preserve native container allocation identity, and reconcile source ownership across resource edits.
 - Preserve native member identity across load order, distinguish instance storage from shared schemas, and retain legacy extension parameter metadata.
+- Separate native bare names from user global storage, retaining same-name user functions in workspace symbols and qualified navigation without changing native read-only contracts.
 - Correct conditional-expression grouping, callable guards and constant switch flow; accept empty enums, parenthesized constructors, and trailing for-clause terminators.
 
 ## 1.81.0 (2026-01-11)

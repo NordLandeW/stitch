@@ -19,6 +19,8 @@ import {
 import {
   globalKey,
   memberKey,
+  nativeGlobalKey,
+  nativeGlobalOwner,
   type MaterializationHost,
   type SemanticEnvironment,
   type SymbolView,
@@ -62,7 +64,13 @@ function analyze(
   const environment: SemanticEnvironment = {
     lookup: ({ owner, name }) => {
       const global = external.get(name);
-      if (global) return global;
+      if (
+        global &&
+        (owner === nativeGlobalOwner
+          ? !!global.item.native
+          : owner === 'global' && !global.item.native)
+      )
+        return global;
       const member = externalTypes.get(owner)?.getMember(name);
       return (
         member && {
@@ -135,7 +143,7 @@ function native(name: string, parameterCount = 0): SymbolView {
   fn.setReturnType(Type.Real);
   const item = new Signifier(owner, name, fn);
   item.native = 'Base';
-  item.semanticKey = globalKey(name);
+  item.semanticKey = nativeGlobalKey(name);
   fn.signifier = item;
   return { key: item.semanticKey, item };
 }
@@ -998,16 +1006,18 @@ describe('Transactional GML semantics', function () {
     }
   });
 
-  it('preserves intrinsic identity and readonly metadata after invalid source declarations', function () {
+  it('preserves native identity through legal globalvar declarations and rejects readonly writes', function () {
     const item = new Signifier(Type.Struct, 'os_type', Type.Real);
-    item.semanticKey = globalKey('os_type');
+    item.semanticKey = nativeGlobalKey('os_type');
     item.native = 'Base';
     item.writable = false;
     const result = analyze(
       'globalvar os_type; os_type=1;',
       new Map([['os_type', { key: item.semanticKey, item, intrinsic: true }]]),
     );
-    const published = result.result.symbols.get(item.semanticKey)!.item;
+    const published = result.view.refs.find(
+      (ref) => ref.item.name === 'os_type',
+    )!.item;
     expect(published.native).to.equal('Base');
     expect(published.writable).to.equal(false);
     expect(published.isRenameable).to.equal(false);
@@ -1021,16 +1031,25 @@ describe('Transactional GML semantics', function () {
       result.result.diagnostics.some((diagnostic) =>
         diagnostic.message.includes('Cannot redeclare'),
       ),
-    ).to.equal(true);
+    ).to.equal(false);
+    expect(
+      result.result.diagnostics.filter((diagnostic) =>
+        diagnostic.message.includes('read-only'),
+      ),
+    ).to.have.length(1);
     const documented = analyze(
       '/** @type {String} */\nglobalvar os_type;',
       new Map([['os_type', { key: item.semanticKey, item, intrinsic: true }]]),
     );
     expect(
-      kinds(documented.result.symbols.get(item.semanticKey)!.item.type),
+      kinds(
+        documented.view.refs.find((ref) => ref.item.name === 'os_type')!.item
+          .type,
+      ),
     ).to.deep.equal(['Real']);
     const writable = new Signifier(Type.Struct, 'score', Type.Real);
-    writable.semanticKey = globalKey('score');
+    expect(documented.result.diagnostics).to.have.length(0);
+    writable.semanticKey = nativeGlobalKey('score');
     writable.native = 'Base';
     writable.writable = true;
     expect(
@@ -1044,6 +1063,107 @@ describe('Transactional GML semantics', function () {
         ]),
       ).result.diagnostics,
     ).to.have.length(0);
+  });
+
+  it('rejects native names in var declarations while retaining legal parameter and static declarations', function () {
+    const fps = new Signifier(Type.Struct, 'fps', Type.Real);
+    fps.native = 'Base';
+    fps.semanticKey = nativeGlobalKey('fps');
+    fps.writable = false;
+    const x = new Signifier(Type.Struct, 'x', Type.Real);
+    x.native = 'Base';
+    x.instance = true;
+    x.semanticKey = nativeGlobalKey('x');
+    const external = new Map<string, SymbolView>([
+      ['fps', { key: fps.semanticKey, item: fps, intrinsic: true }],
+      ['x', { key: x.semanticKey, item: x, intrinsic: true }],
+      ['string_split', native('string_split')],
+    ]);
+    for (const name of external.keys()) {
+      for (const source of [
+        `var ${name}=1;`,
+        `function Probe(){var ${name}=1;return ${name};}`,
+      ]) {
+        const result = analyze(source, external);
+        expect(
+          result.result.diagnostics.map((diagnostic) => diagnostic.message),
+        ).to.deep.equal([`Cannot redeclare built-in symbol \`${name}\`.`]);
+      }
+    }
+    for (const source of [
+      'function Probe(fps){return fps;}',
+      'function Probe(){static fps=1;return fps;}',
+      'var ordinary=1;global.fps=2;',
+    ])
+      expect(analyze(source, external).result.diagnostics).to.have.length(0);
+    expect(fps.writable).to.equal(false);
+    expect(kinds(fps.type)).to.deep.equal(['Real']);
+  });
+
+  it('keeps native constants and same-name user functions independent, including aliases and startup self', function () {
+    const item = new Signifier(Type.Struct, 'os_type', Type.Real);
+    item.native = 'Base';
+    item.semanticKey = nativeGlobalKey(item.name);
+    item.writable = false;
+    const source =
+      'function os_type(){return "user";}globalvar os_type;var builtin=os_type;var custom=global.os_type();var startup=self.os_type();';
+    const result = analyze(
+      source,
+      new Map([[item.name, { key: item.semanticKey, item, intrinsic: true }]]),
+    );
+    expect(result.result.diagnostics).to.have.length(0);
+    const refs = result.view.refs.filter((ref) => ref.item.name === 'os_type');
+    const declared = refs.find((ref) => ref.isDef)!.item;
+    expect(declared).not.to.equal(item);
+    expect(declared.isRenameable).to.equal(true);
+    expect(refs.filter((ref) => ref.item === item)).to.have.length(2);
+    expect(refs.filter((ref) => ref.item === declared)).to.have.length(3);
+    expect(kinds(result.returns('os_type'))).to.deep.equal(['String']);
+    expect(result.result.namedTypes.has('Function.os_type')).to.equal(true);
+  });
+
+  it('retains a globalvar bare alias when explicit global storage was declared first', function () {
+    const result = analyze(
+      'global.alias=1;globalvar alias;function Read(){return alias;}',
+    );
+    expect(result.result.diagnostics).to.have.length(0);
+    expect(result.result.symbols.get(globalKey('alias'))!.bare).to.equal(true);
+    const refs = result.view.refs.filter((ref) => ref.item.name === 'alias');
+    expect(refs).to.have.length(3);
+    expect(refs.every((ref) => ref.item === refs[0].item)).to.equal(true);
+  });
+
+  it('keeps bare native writes separate from qualified storage inside functions and object events', function () {
+    const item = new Signifier(Type.Struct, 'fps', Type.Real);
+    item.native = 'Base';
+    item.semanticKey = nativeGlobalKey(item.name);
+    item.writable = false;
+    const external = new Map([
+      [item.name, { key: item.semanticKey, item, intrinsic: true }],
+    ]);
+    for (const qualified of ['global.fps', 'self.fps']) {
+      for (const context of [
+        {},
+        { kind: 'object-event' as const, selfOwner: 'object:test:self' },
+      ]) {
+        const source = `${qualified}="user";fps=30;var current=fps;var stored=${qualified};`;
+        const result = analyze(source, external, '2024.13.0.0', context);
+        expect(
+          result.result.diagnostics.map((diagnostic) => diagnostic.message),
+        ).to.deep.equal(['Cannot assign to read-only symbol `fps`.']);
+        expect(
+          result.view.refs.filter((ref) => ref.item === item),
+        ).to.have.length(2);
+      }
+      const result = analyze(
+        `function Probe(){${qualified}="user";fps=30;return ${qualified};}`,
+        external,
+      );
+      expect(
+        result.result.diagnostics.map((diagnostic) => diagnostic.message),
+      ).to.deep.equal(['Cannot assign to read-only symbol `fps`.']);
+      expect(kinds(result.returns('Probe'))).to.deep.equal(['String']);
+    }
   });
 
   it('preserves native instance storage through object-event assignments', function () {
@@ -1403,7 +1523,7 @@ describe('Transactional GML semantics', function () {
   it('preserves readable metadata and checks reads separately from writes and fallback evidence', function () {
     const output = new Signifier(Type.Struct, 'output', Type.Real);
     output.native = 'Fixture';
-    output.semanticKey = globalKey('output');
+    output.semanticKey = nativeGlobalKey('output');
     output.readable = false;
     output.writable = true;
     const external = new Map<string, SymbolView>([
@@ -1411,15 +1531,12 @@ describe('Transactional GML semantics', function () {
     ]);
     const written = analyze('output=1;', external);
     expect(written.result.diagnostics).to.have.length(0);
-    expect(
-      written.result.symbols.get(output.semanticKey)!.item.readable,
-    ).to.equal(false);
-    expect(
-      written.result.symbols.get(output.semanticKey)!.item.writable,
-    ).to.equal(true);
-    expect(
-      written.result.symbols.get(output.semanticKey)!.item.isRenameable,
-    ).to.equal(false);
+    const writtenOutput = written.view.refs.find(
+      (ref) => ref.item.name === 'output',
+    )!.item;
+    expect(writtenOutput.readable).to.equal(false);
+    expect(writtenOutput.writable).to.equal(true);
+    expect(writtenOutput.isRenameable).to.equal(false);
     const read = analyze('var copy=output;', external);
     expect(
       read.result.diagnostics.filter(
@@ -1463,8 +1580,8 @@ describe('Transactional GML semantics', function () {
       ),
     ).to.have.length(0);
     output.writable = false;
-    const reserved = analyze('globalvar output;', external).result.symbols.get(
-      output.semanticKey,
+    const reserved = analyze('globalvar output;', external).view.refs.find(
+      (ref) => ref.item.name === 'output',
     )!.item;
     expect(reserved.readable).to.equal(false);
     expect(reserved.writable).to.equal(false);

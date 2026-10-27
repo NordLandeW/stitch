@@ -16,6 +16,7 @@ import { normalizeSyntax } from '../analysis/syntax.js';
 import {
   AnalysisCancelled,
   globalOwner,
+  nativeGlobalOwner,
   type BoundUnit,
   type CodeSemanticView,
   type MaterializationHost,
@@ -123,7 +124,17 @@ export class ProjectAnalysis {
   >();
   private macroEnvironment?: MacroEnvironment;
 
-  constructor(readonly project: Project) {}
+  private readonly globalStorageType = new Type('Struct').named('global');
+
+  constructor(readonly project: Project) {
+    this.globalStorageType.semanticKey = globalOwner;
+  }
+
+  /** User global storage, including declarations whose bare name is native.
+   * The stable handle is empty until the first committed analysis. */
+  get globalStorage(): Type {
+    return this.globalStorageType;
+  }
 
   private disposed = false;
   dispose(): void {
@@ -225,7 +236,7 @@ export class ProjectAnalysis {
     this.nativeIdentity = identity;
     const nativeTypes = this.project.native?.types || this.project.types;
     const roots = new Map<string, Type>([
-      [globalOwner, this.project.native?.globalSelf || this.project.self],
+      [nativeGlobalOwner, this.project.native?.globalSelf || this.project.self],
     ]);
     for (const [name, type] of nativeTypes || [])
       roots.set(`native:${name}`, type);
@@ -876,7 +887,7 @@ export class ProjectAnalysis {
           [...symbol.refs].filter((ref) => !ref.isDef).length,
         );
     }
-    this.publicTypes.set(globalOwner, this.project.self);
+    this.publicTypes.set(globalOwner, this.globalStorage);
     let replacedHandles = false;
     for (const [key, source] of staged.types) {
       const previous = this.publicTypes.get(key);
@@ -895,7 +906,14 @@ export class ProjectAnalysis {
       const previous = this.publicSymbols.get(key);
       if (
         !previous ||
-        previous.parent !== owner ||
+        (previous.parent !== owner &&
+          // Resource Signifiers are stable public handles allocated by Asset
+          // against project.self before the storage graph is materialized.
+          !(
+            previous.asset &&
+            previous.parent === this.project.self &&
+            owner.semanticKey === globalOwner
+          )) ||
         previous.name !== source.name
       ) {
         const item = new Signifier(owner, source.name);
@@ -941,6 +959,19 @@ export class ProjectAnalysis {
         host,
       );
     }
+    // Public project.self is the bare-name presentation view. It is not an
+    // analysis input or the storage receiver returned by the global keyword.
+    const globals = this.publicTypes.get(globalOwner);
+    const native = this.publicTypes.get(nativeGlobalOwner);
+    const presented = new Map(
+      (globals?.listMembers(true) || []).map((symbol) => [symbol.name, symbol]),
+    );
+    for (const symbol of native?.listMembers(true) || [])
+      presented.set(symbol.name, symbol);
+    this.project.self.semanticKey = 'presentation:global';
+    this.project.self.replaceOwnMembers(presented.values());
+    this.project.self.setBaseView(undefined);
+    if (globals) this.project.symbol?.setType(globals);
     for (const code of this.retired) {
       this.removeRefs(code.path.absolute);
       code.retireAnalysis();

@@ -44,7 +44,7 @@ export class StitchCompletionProvider implements vscode.CompletionItemProvider {
       const scopeSymbols = stitchConfig.autocompleteIgnoredPrefix
         ? completionScopeSymbols(
             gmlFile.getScopeRangeAt(offset),
-            gmlFile.project.self,
+            gmlFile.project.analysis.globalStorage,
           )
         : undefined;
       const isCurrent = captureCompletionView(
