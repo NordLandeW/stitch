@@ -146,9 +146,10 @@ export class Code {
     if (typeof offset === 'number' && typeof column === 'number') {
       offset = { line: offset, column };
     }
-    assert(this.refs, 'Refs must be an array');
-    for (let i = 0; i < this.refs.length; i++) {
-      const ref = this.refs[i];
+    const refs = this.refs;
+    assert(refs, 'Refs must be an array');
+    for (let i = 0; i < refs.length; i++) {
+      const ref = refs[i];
       if (this.isInRange(ref, offset)) {
         return ref;
       } else if (this.isBeforeRange(ref, offset)) {
