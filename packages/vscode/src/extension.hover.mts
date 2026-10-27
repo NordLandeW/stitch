@@ -6,10 +6,12 @@ import type { StitchWorkspace } from './extension.workspace.mjs';
 export class StitchHoverProvider implements vscode.HoverProvider {
   protected constructor(readonly provider: StitchWorkspace) {}
 
-  provideHover(
+  async provideHover(
     document: vscode.TextDocument,
     position: vscode.Position,
-  ): vscode.ProviderResult<vscode.Hover> {
+    token: vscode.CancellationToken,
+  ): Promise<vscode.Hover | undefined> {
+    if (!(await this.provider.ensureDocumentCurrent(document, token))) return;
     const item = this.provider.getSignifier(document, position);
     if (!item) {
       return;

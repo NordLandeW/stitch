@@ -3,8 +3,8 @@ import type { StitchWorkspace } from './extension.workspace.mjs';
 import { copyToClipboard } from './lib.mjs';
 
 export function createCopyAsTypeCallback(provider: StitchWorkspace) {
-  return (file: vscode.Uri) => {
-    const type = uriToType(provider, file);
+  return async (file: vscode.Uri) => {
+    const type = await uriToType(provider, file);
     if (type) {
       copyToClipboard(type);
     }
@@ -12,8 +12,8 @@ export function createCopyAsTypeCallback(provider: StitchWorkspace) {
 }
 
 export function createCopyAsJsdocSelfCallback(provider: StitchWorkspace) {
-  return (file: vscode.Uri) => {
-    const type = uriToType(provider, file);
+  return async (file: vscode.Uri) => {
+    const type = await uriToType(provider, file);
     if (type && type.match(/^(Struct|Id.Instance|Asset.GMObject)/)) {
       copyToClipboard(`/// @self ${type}`);
     } else if (type) {
@@ -26,19 +26,25 @@ export function createCopyAsJsdocSelfCallback(provider: StitchWorkspace) {
 }
 
 export function createCopyAsJsdocTypeCallback(provider: StitchWorkspace) {
-  return (file: vscode.Uri) => {
-    const type = uriToType(provider, file);
+  return async (file: vscode.Uri) => {
+    const type = await uriToType(provider, file);
     if (type) {
       copyToClipboard(`/// @type {${type}}`);
     }
   };
 }
 
-function uriToType(provider: StitchWorkspace, file: vscode.Uri) {
+async function uriToType(provider: StitchWorkspace, file: vscode.Uri) {
+  const document = vscode.workspace.textDocuments.find(
+    (doc) => doc.uri.toString() === file.toString(),
+  );
   const position = vscode.window.activeTextEditor?.selection.active;
-  if (!position) {
+  if (
+    !document ||
+    !position ||
+    !(await provider.ensureDocumentCurrent(document))
+  )
     return;
-  }
   const ref = provider.getReference(file, position);
   if (!ref) {
     return;

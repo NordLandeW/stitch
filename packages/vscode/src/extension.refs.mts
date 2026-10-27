@@ -5,10 +5,13 @@ import { locationOf } from './lib.mjs';
 export class StitchReferenceProvider implements vscode.ReferenceProvider {
   constructor(readonly workspace: StitchWorkspace) {}
 
-  provideReferences(
+  async provideReferences(
     document: vscode.TextDocument,
     position: vscode.Position,
-  ): vscode.ProviderResult<vscode.Location[]> {
+    _context: vscode.ReferenceContext,
+    token: vscode.CancellationToken,
+  ): Promise<vscode.Location[] | undefined> {
+    if (!(await this.workspace.ensureProjectCurrent(document, token))) return;
     const symbol = this.workspace.getSignifier(document, position);
     if (!symbol) {
       return;

@@ -19,9 +19,7 @@ export class StitchCompletionProvider implements vscode.CompletionItemProvider {
     token: CancellationToken,
     context: CompletionContext,
   ): Promise<vscode.CompletionItem[] | undefined> {
-    // If we're already processing this file, wait for it to finish so that we get up-to-date completions.
-    await this.provider.processingFiles.get(document.uri.fsPath);
-    const gmlFile = this.provider.getGmlFile(document);
+    const gmlFile = await this.provider.ensureDocumentCurrent(document, token);
     const offset = document.offsetAt(position);
     if (!gmlFile) {
       return undefined;

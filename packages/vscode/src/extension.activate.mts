@@ -180,9 +180,16 @@ export async function activateStitchExtension(
     //   }
     //   const code = provider.getGmlFile(editor.document);
     // }),
+    workspace,
     vscode.workspace.onDidChangeTextDocument((event) =>
       workspace.onChangeDoc(event),
     ),
+    vscode.workspace.onDidOpenTextDocument((document) =>
+      workspace.onChangeDoc(document),
+    ),
+    vscode.workspace.onDidCloseTextDocument((document) => {
+      void workspace.onCloseDoc(document).catch((error) => logger.error(error));
+    }),
     // vscode.workspace.onDidOpenTextDocument((event) => {
     //   // provider.onChangeDoc(event),
     // }),
@@ -434,7 +441,7 @@ export async function activateStitchExtension(
       // Get the signature helper.
       const signatureHelp = swallowThrown(
         () =>
-          workspace.provideSignatureHelp(
+          workspace.getSignatureHelp(
             e.textEditor.document,
             e.selections[0].start,
           )!,
@@ -466,6 +473,10 @@ export async function activateStitchExtension(
     }),
     workspace.diagnosticCollection,
   );
+
+  for (const document of vscode.workspace.textDocuments) {
+    workspace.onChangeDoc(document);
+  }
 
   t.seconds('Extension activated in');
   return workspace;

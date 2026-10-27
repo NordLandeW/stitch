@@ -7,12 +7,13 @@ export class StitchTypeDefinitionProvider
 {
   constructor(readonly workspace: StitchWorkspace) {}
 
-  provideTypeDefinition(
+  async provideTypeDefinition(
     document: vscode.TextDocument,
     position: vscode.Position,
-  ): vscode.ProviderResult<vscode.Definition | vscode.LocationLink[]> {
+    token: vscode.CancellationToken,
+  ): Promise<vscode.Definition | vscode.LocationLink[] | undefined> {
+    const file = await this.workspace.ensureDocumentCurrent(document, token);
     const offset = document.offsetAt(position);
-    const file = this.workspace.getGmlFile(document);
     const ref = file?.getReferenceAt(offset);
     const item = ref?.item;
     if (!item) return;

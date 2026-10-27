@@ -48,11 +48,16 @@ export class GameMakerSemanticTokenProvider
     this._onDidChangeSemanticTokens.fire();
   }
 
-  provideDocumentSemanticTokens(
+  async provideDocumentSemanticTokens(
     document: vscode.TextDocument,
-  ): vscode.SemanticTokens | undefined {
+    token: vscode.CancellationToken,
+  ): Promise<vscode.SemanticTokens | undefined> {
     try {
-      const file = this.provider.getGmlFile(document);
+      const file = await this.provider.ensureDocumentCurrent(
+        document,
+        token,
+        false,
+      );
       if (!file) {
         return;
       }

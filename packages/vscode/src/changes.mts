@@ -13,6 +13,8 @@ interface ChangeEvent {
 export class ChangeTracker {
   protected queue: ChangeEvent[] = [];
   protected timeout: NodeJS.Timeout | undefined;
+  private flushing = false;
+  private disposed = false;
   protected cache = {
     /**
      * If `true`, then the project has not been run since the last clean
@@ -34,15 +36,47 @@ export class ChangeTracker {
   }
 
   addChange(event: ChangeEvent) {
-    this.queue.push(event);
+    if (this.disposed) return;
+    const duplicate =
+      event.type === 'change' &&
+      event.uri.path.endsWith('.gml') &&
+      this.queue.some(
+        (pending) =>
+          pending.type === 'change' &&
+          pending.uri.toString() === event.uri.toString(),
+      );
+    if (!duplicate) this.queue.push(event);
     clearTimeout(this.timeout);
     this.timeout = setTimeout(
-      () => this.flush(),
+      () => void this.flush().catch((error) => logger.error(error)),
       stitchConfig.externalChangeDelay,
     );
   }
 
+  dispose() {
+    this.disposed = true;
+    clearTimeout(this.timeout);
+    this.queue = [];
+  }
+
   protected async flush() {
+    if (this.flushing || this.disposed) return;
+    this.flushing = true;
+    try {
+      await this.flushQueue();
+    } finally {
+      this.flushing = false;
+      if (this.queue.length && !this.disposed) {
+        clearTimeout(this.timeout);
+        this.timeout = setTimeout(
+          () => void this.flush().catch((error) => logger.error(error)),
+          stitchConfig.externalChangeDelay,
+        );
+      }
+    }
+  }
+
+  private async flushQueue() {
     const queue = this.queue;
     this.queue = [];
 
@@ -65,79 +99,85 @@ export class ChangeTracker {
     });
 
     for (const event of queue) {
-      const { type, uri } = event;
-      const project = this.provider.getProject(uri);
-      if (!project) {
-        logger.warn(`For change event ${type} ${uri.path}, no project found.`);
-        continue;
-      }
-
-      // If this is an included file, we need to force-sync the project's files
-      if (project.dir.join('datafiles').isParentOf(pathy(uri.fsPath))) {
-        try {
-          await project.syncIncludedFiles();
-          stitchEvents.emit('datafiles-changed', project);
-        } catch {}
-        continue;
-      }
-
-      /** The asset this changed file belongs to, if any. */
-      const asset = project.getAsset(pathy(uri.fsPath));
-
-      // Change to the yyp file implies that we have deleted
-      // or added an asset, so we need to respond to that.
-      if (type === 'change' && uri.path.endsWith('.yyp')) {
-        logger.info(`yyp file changed on disk. Reloading!`);
-        await project.reloadYyp();
-        stitchEvents.emit('project-changed', project);
-        continue;
-      }
-
-      // Creation/deletion of GML files must be accompanied
-      // by a change to yy/yyp files, so we can ignore them.
-      // They'll be incidentally handled by handling the yy/yyp changes.
-      if (['create', 'delete'].includes(type) && uri.path.endsWith('.gml')) {
-        continue;
-      }
-      // Changes to existing GML files can be handled immediately.
-      if (type === 'change' && uri.path.endsWith('.gml')) {
-        logger.info(`GML file "${uri.path}" changed on disk. Reloading!`);
-        await this.provider.getGmlFile(uri)?.reload(undefined, {
-          reloadDirty: true,
-        });
-      }
-      // Changes to yy files can be handled immediately.
-      // For now we
-      // only care about objects, since object yy files list
-      // their events.
-      if (type === 'change' && uri.path.endsWith('.yy')) {
-        logger.info(`yy file "${uri.path}" changed on disk. Reloading!`);
-        if (!asset) {
-          logger.warn(`No asset found for yy file "${uri.fsPath}".`);
+      if (this.disposed) return;
+      try {
+        const { type, uri } = event;
+        const project = this.provider.getProject(uri);
+        if (!project) {
+          logger.warn(
+            `For change event ${type} ${uri.path}, no project found.`,
+          );
+          continue;
         }
-        await asset?.reload();
-      }
 
-      // Changes to art assets should be accumulated with timestamps
-      // until the user runs the project. Depending on config settings,
-      // changes to .atlas files should result in an auto-clean, and changes
-      // to .png files should result in a popup detailing all sprites changes.
-      if (type === 'change' && uri.path.endsWith('.atlas')) {
-        const shouldClean =
-          stitchConfig.cleanOnSpineSpriteChange && !this.cache.igorCacheIsClean;
-        logger.info(
-          `atlas file "${uri.path}" changed on disk. `,
-          shouldClean ? 'Cleaning!' : 'Skipping cache-clean.',
-        );
-        if (shouldClean) {
-          void project.run({ clean: true });
-          // Set the cache to clean so that we don't clean again while looping
-          // through the queue.
-          this.cache.igorCacheIsClean = true;
+        // If this is an included file, we need to force-sync the project's files
+        if (project.dir.join('datafiles').isParentOf(pathy(uri.fsPath))) {
+          try {
+            await project.syncIncludedFiles();
+            stitchEvents.emit('datafiles-changed', project);
+          } catch {}
+          continue;
         }
-      }
-      if (asset) {
-        stitchEvents.emit('asset-changed', asset, type, uri);
+
+        /** The asset this changed file belongs to, if any. */
+        const asset = project.getAsset(pathy(uri.fsPath));
+
+        // Change to the yyp file implies that we have deleted
+        // or added an asset, so we need to respond to that.
+        if (type === 'change' && uri.path.endsWith('.yyp')) {
+          logger.info(`yyp file changed on disk. Reloading!`);
+          await project.reloadYyp();
+          stitchEvents.emit('project-changed', project);
+          continue;
+        }
+
+        // Creation/deletion of GML files must be accompanied
+        // by a change to yy/yyp files, so we can ignore them.
+        // They'll be incidentally handled by handling the yy/yyp changes.
+        if (['create', 'delete'].includes(type) && uri.path.endsWith('.gml')) {
+          continue;
+        }
+        // Changes to existing GML files can be handled immediately.
+        if (type === 'change' && uri.path.endsWith('.gml')) {
+          logger.info(`GML file "${uri.path}" changed on disk. Reloading!`);
+          await this.provider.onChangeFile(uri);
+        }
+        // Changes to yy files can be handled immediately.
+        // For now we
+        // only care about objects, since object yy files list
+        // their events.
+        if (type === 'change' && uri.path.endsWith('.yy')) {
+          logger.info(`yy file "${uri.path}" changed on disk. Reloading!`);
+          if (!asset) {
+            logger.warn(`No asset found for yy file "${uri.fsPath}".`);
+          }
+          await asset?.reload();
+        }
+
+        // Changes to art assets should be accumulated with timestamps
+        // until the user runs the project. Depending on config settings,
+        // changes to .atlas files should result in an auto-clean, and changes
+        // to .png files should result in a popup detailing all sprites changes.
+        if (type === 'change' && uri.path.endsWith('.atlas')) {
+          const shouldClean =
+            stitchConfig.cleanOnSpineSpriteChange &&
+            !this.cache.igorCacheIsClean;
+          logger.info(
+            `atlas file "${uri.path}" changed on disk. `,
+            shouldClean ? 'Cleaning!' : 'Skipping cache-clean.',
+          );
+          if (shouldClean) {
+            void project.run({ clean: true });
+            // Set the cache to clean so that we don't clean again while looping
+            // through the queue.
+            this.cache.igorCacheIsClean = true;
+          }
+        }
+        if (asset) {
+          stitchEvents.emit('asset-changed', asset, type, uri);
+        }
+      } catch (error) {
+        logger.error(error);
       }
     }
   }

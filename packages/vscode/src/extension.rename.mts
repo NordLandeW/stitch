@@ -36,22 +36,24 @@ export class StitchRenameProvider implements vscode.RenameProvider {
     return { ref, text, range };
   }
 
-  prepareRename(
+  async prepareRename(
     document: vscode.TextDocument,
     position: vscode.Position,
-  ): vscode.ProviderResult<
-    vscode.Range | { range: vscode.Range; placeholder: string }
-  > {
+    token: vscode.CancellationToken,
+  ): Promise<vscode.Range | undefined> {
+    if (!(await this.workspace.ensureDocumentCurrent(document, token))) return;
     // Find the signifier ref at this position
     const toRename = this.assertRenameableReference(document, position);
     return toRename.range;
   }
 
-  provideRenameEdits(
+  async provideRenameEdits(
     document: vscode.TextDocument,
     position: vscode.Position,
     newName: string,
+    token: vscode.CancellationToken,
   ) {
+    if (!(await this.workspace.ensureProjectCurrent(document, token))) return;
     const toRename = this.assertRenameableReference(document, position);
     const refs = toRename.ref.item.refs;
     const edits = new vscode.WorkspaceEdit();

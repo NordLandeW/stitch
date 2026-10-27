@@ -26,15 +26,11 @@ export class StitchDocumentSymbolProvider
     token: vscode.CancellationToken,
   ): Promise<vscode.DocumentSymbol[]> {
     try {
-      const pendingUpdate = this.workspace.processingFiles.get(
-        document.uri.fsPath,
+      const file = await this.workspace.ensureDocumentCurrent(
+        document,
+        token,
+        false,
       );
-      if (pendingUpdate) {
-        await pendingUpdate;
-      }
-      if (token.isCancellationRequested) return [];
-
-      const file = this.workspace.getGmlFile(document);
       if (!file) return [];
 
       const convert = (

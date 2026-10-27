@@ -6,12 +6,13 @@ import { locationOf, registerCommand } from './lib.mjs';
 export class StitchDefinitionsProvider implements vscode.DefinitionProvider {
   constructor(readonly workspace: StitchWorkspace) {}
 
-  provideDefinition(
+  async provideDefinition(
     document: vscode.TextDocument,
     position: vscode.Position,
-  ): vscode.Definition | undefined {
+    token: vscode.CancellationToken,
+  ): Promise<vscode.Definition | undefined> {
+    const file = await this.workspace.ensureDocumentCurrent(document, token);
     const offset = document.offsetAt(position);
-    const file = this.workspace.getGmlFile(document);
     const ref = file?.getReferenceAt(offset);
     const item = ref?.item;
 

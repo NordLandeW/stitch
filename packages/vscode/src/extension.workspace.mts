@@ -21,6 +21,7 @@ import {
 import { stitchEvents } from './events.mjs';
 import { activateStitchExtension } from './extension.activate.mjs';
 import { completionTriggerCharacters } from './extension.completions.mjs';
+import { DocumentAnalysisQueue } from './extension.analysis.core.mjs';
 import { GameMakerSemanticTokenProvider } from './extension.highlighting.mjs';
 import { GameMakerProject } from './extension.project.mjs';
 import {
@@ -46,8 +47,24 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
 
   projects: GameMakerProject[] = [];
 
-  readonly processingFiles = new Map<string, Promise<any>>();
-  readonly debouncingOnChange = new Map<string, NodeJS.Timeout>();
+  private disposed = false;
+  private readonly diagnosticTimers = new Map<Project, NodeJS.Timeout>();
+  private readonly diskReads = new WeakMap<Code, object>();
+  private readonly analysis = new DocumentAnalysisQueue<Code>({
+    content: (code) => code.content,
+    analyze: async (code, snapshot) => {
+      await code.reload(snapshot.text);
+      if (
+        !this.disposed &&
+        this.projects.some((project) => project === code.project)
+      ) {
+        this.semanticHighlightProvider.refresh();
+        this.scheduleDiagnostics(code.project);
+      }
+    },
+    delay: () => stitchConfig.reprocessOnTypeDelay,
+    onError: (error) => logger.error(error),
+  });
 
   protected constructor(readonly ctx: vscode.ExtensionContext) {
     this.signatureHelpStatus.hide();
@@ -73,6 +90,10 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
   /**
    * Emit a collection of diagnostics for a particular file. */
   emitDiagnostics(payload: DiagnosticsEventPayload) {
+    if (this.disposed) return;
+    const document = this.openDocument(vscode.Uri.file(payload.filePath));
+    if (document && payload.code && document.getText() !== payload.code.content)
+      return;
     const suppresedGroups = stitchConfig.suppressDiagnosticsInGroups;
     for (const group of suppresedGroups) {
       if (payload.code?.asset.isInFolder(group)) {
@@ -87,6 +108,9 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
   }
 
   clearProjects() {
+    this.analysis.clear();
+    for (const timer of this.diagnosticTimers.values()) clearTimeout(timer);
+    this.diagnosticTimers.clear();
     this.projects = [];
     void vscode.commands.executeCommand(
       'setContext',
@@ -140,7 +164,16 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     stitchEvents.emit('asset-deleted', asset);
   }
 
-  provideSignatureHelp(
+  async provideSignatureHelp(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    token?: vscode.CancellationToken,
+  ): Promise<vscode.SignatureHelp | undefined> {
+    if (!(await this.ensureDocumentCurrent(document, token))) return;
+    return this.getSignatureHelp(document, position);
+  }
+
+  getSignatureHelp(
     document: vscode.TextDocument,
     position: vscode.Position,
   ): vscode.SignatureHelp | undefined {
@@ -169,16 +202,126 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     return help;
   }
 
-  /**
-   * Determine the project the file belongs to,
-   * and pass an update request to that project.
-   */
-  async updateFile(document: vscode.TextDocument): Promise<Code | undefined> {
+  /** Obtain current positions and symbols without waiting for unrelated diagnostics. */
+  async ensureDocumentCurrent(
+    document: vscode.TextDocument,
+    token?: vscode.CancellationToken,
+    immediate = true,
+  ): Promise<Code | undefined> {
+    if (
+      this.disposed ||
+      document.isClosed ||
+      token?.isCancellationRequested ||
+      document.languageId !== 'gml' ||
+      document.uri.scheme !== 'file'
+    )
+      return;
     const code = this.getGmlFile(document);
-    await code?.reload(document.getText(), {
-      reloadDirty: true,
-    });
+    if (!code) return;
+    this.diskReads.delete(code);
+    const version = document.version;
+    const snapshot = { version, text: document.getText() };
+    if (immediate) await this.analysis.flush(code, snapshot);
+    else await this.analysis.wait(code, snapshot, token);
+    if (
+      this.disposed ||
+      document.isClosed ||
+      token?.isCancellationRequested ||
+      document.version !== version ||
+      this.getGmlFile(document) !== code
+    )
+      return;
     return code;
+  }
+
+  /** Reference edits need current positions in every open buffer in the project. */
+  async ensureProjectCurrent(
+    document: vscode.TextDocument,
+    token?: vscode.CancellationToken,
+  ) {
+    const version = document.version;
+    const project = this.getProject(document);
+    if (!project) return;
+    const buffers = vscode.workspace.textDocuments.filter(
+      (other) =>
+        other.languageId === 'gml' &&
+        other.uri.scheme === 'file' &&
+        !other.isClosed &&
+        this.getProject(other) === project,
+    );
+    const versions = buffers.map((other) => other.version);
+    for (const other of buffers) {
+      if (!(await this.ensureDocumentCurrent(other, token))) return;
+    }
+    if (
+      buffers.some(
+        (other, index) => other.isClosed || other.version !== versions[index],
+      )
+    )
+      return;
+    if (document.version !== version || token?.isCancellationRequested) return;
+    return this.ensureDocumentCurrent(document, token);
+  }
+
+  private openDocument(uri: vscode.Uri) {
+    return vscode.workspace.textDocuments.find(
+      (document) =>
+        !document.isClosed && document.uri.toString() === uri.toString(),
+    );
+  }
+
+  /** Open buffers are authoritative, including when a watcher races a save or edit. */
+  async onChangeFile(uri: vscode.Uri): Promise<void> {
+    if (this.disposed) return;
+    const open = this.openDocument(uri);
+    if (open) {
+      await this.ensureDocumentCurrent(open);
+      return;
+    }
+    const code = this.getGmlFile(uri);
+    if (!code) return;
+    const read = {};
+    this.diskReads.set(code, read);
+    const text = await code.path.read();
+    if (this.disposed || this.diskReads.get(code) !== read) return;
+    const openedDuringRead = this.openDocument(uri);
+    if (openedDuringRead) {
+      await this.ensureDocumentCurrent(openedDuringRead);
+    } else if (this.getGmlFile(uri) === code) {
+      await this.analysis.flush(code, { text });
+    }
+  }
+
+  async onCloseDoc(document: vscode.TextDocument): Promise<void> {
+    if (document.languageId !== 'gml' || document.uri.scheme !== 'file') return;
+    const code = this.getGmlFile(document);
+    if (code) this.analysis.forget(code);
+    // Closing an unsaved buffer must restore the on-disk model as well.
+    await this.onChangeFile(document.uri);
+  }
+
+  private scheduleDiagnostics(project: Project) {
+    clearTimeout(this.diagnosticTimers.get(project));
+    this.diagnosticTimers.set(
+      project,
+      setTimeout(() => {
+        this.diagnosticTimers.delete(project);
+        if (this.disposed) return;
+        try {
+          project.drainDirtyFileUpdateQueue();
+        } catch (error) {
+          logger.error(error);
+        }
+      }, stitchConfig.reprocessOnTypeDelay),
+    );
+  }
+
+  dispose() {
+    this.disposed = true;
+    this.analysis.dispose();
+    for (const timer of this.diagnosticTimers.values()) clearTimeout(timer);
+    this.diagnosticTimers.clear();
+    this.externalChangeTracker.dispose();
   }
 
   getActiveDocument(): vscode.TextDocument | undefined {
@@ -355,71 +498,39 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     return ref;
   }
 
-  /**
-   * A general function for reprocessing files upon change. Handles
-   * debounding and the like.
-   */
-  async onChangeDoc(
+  /** Record every text change; explicit completion triggers can bypass the delay. */
+  onChangeDoc(
     event: vscode.TextDocumentChangeEvent | vscode.TextDocument | undefined,
-  ) {
-    if (!event) {
-      return;
-    }
-    const doc = 'document' in event ? event.document : event;
-    if (doc.languageId !== 'gml') {
-      return;
-    }
-
-    // While actively typing, we don't want to reprocess on
-    // every keystroke since that'll make things feel sluggish.
-    // So for calls to this function triggered by typing, we
-    // only immediately reprocess if the character is a trigger
-    // character. Otherwise, we debounce.
+  ): void {
+    if (!event || this.disposed) return;
+    const document = 'document' in event ? event.document : event;
     if (
-      'contentChanges' in event &&
-      event.contentChanges.length === 1 &&
-      event.contentChanges[0].text.length
-    ) {
-      const isTriggerCharacter = [
-        ...completionTriggerCharacters,
-        ' ',
-        '\r\n',
-        '\n',
-        ';',
-        ',',
-      ].includes(event.contentChanges[0].text as any);
-      if (!isTriggerCharacter) {
-        // TODO: Debounce this so that we still get reprocessing
-        // while editing, but only when not actively typing.
-        clearTimeout(this.debouncingOnChange.get(doc.uri.fsPath));
-        this.debouncingOnChange.set(
-          doc.uri.fsPath,
-          setTimeout(() => {
-            this.onChangeDoc(doc);
-          }, stitchConfig.reprocessOnTypeDelay),
-        );
-        return;
-      }
-    }
-
-    if (this.processingFiles.has(doc.uri.fsPath)) {
-      logger.info('Already processing file', doc.uri.fsPath);
+      document.languageId !== 'gml' ||
+      document.uri.scheme !== 'file' ||
+      document.isClosed
+    )
       return;
-    }
-
-    this.diagnosticCollection.delete(doc.uri);
-    // Add the processing promise to a map so
-    // that other functionality can wait for it
-    // to complete.
-    const updateWait = StitchWorkspace.provider.updateFile(doc).finally(() => {
-      // Semantic highlighting is normally updated by VSCode
-      // upon change. But since we're delaying processing of the
-      // file, we need to manually trigger a refresh.
-      this.semanticHighlightProvider.refresh();
-    });
-    this.processingFiles.set(doc.uri.fsPath, updateWait);
-    await updateWait;
-    this.processingFiles.delete(doc.uri.fsPath);
+    if ('contentChanges' in event && !event.contentChanges.length) return;
+    const code = this.getGmlFile(document);
+    if (!code) return;
+    this.diskReads.delete(code);
+    const triggers: readonly string[] = [
+      ...completionTriggerCharacters,
+      ' ',
+      '\r\n',
+      '\n',
+      ';',
+      ',',
+    ];
+    const immediate =
+      !('contentChanges' in event) ||
+      (event.contentChanges.length === 1 &&
+        triggers.includes(event.contentChanges[0].text));
+    this.analysis.enqueue(
+      code,
+      { version: document.version, text: document.getText() },
+      immediate,
+    );
   }
 
   async createNewProject() {
