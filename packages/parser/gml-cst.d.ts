@@ -24,6 +24,7 @@ export interface StatementCstNode extends CstNode {
 }
 
 export type StatementCstChildren = {
+  blockStatement?: BlockStatementCstNode[];
   functionStatement?: FunctionStatementCstNode[];
   localVarDeclarationsStatement?: LocalVarDeclarationsStatementCstNode[];
   globalVarDeclarationsStatement?: GlobalVarDeclarationsStatementCstNode[];
@@ -38,6 +39,7 @@ export type StatementCstChildren = {
   breakStatement?: BreakStatementCstNode[];
   continueStatement?: ContinueStatementCstNode[];
   returnStatement?: ReturnStatementCstNode[];
+  throwStatement?: ThrowStatementCstNode[];
   exitStatement?: ExitStatementCstNode[];
   withStatement?: WithStatementCstNode[];
   enumStatement?: EnumStatementCstNode[];
@@ -145,6 +147,17 @@ export type ReturnStatementCstChildren = {
   Semicolon?: IToken[];
 };
 
+export interface ThrowStatementCstNode extends CstNode {
+  name: 'throwStatement';
+  children: ThrowStatementCstChildren;
+}
+
+export type ThrowStatementCstChildren = {
+  Throw: IToken[];
+  assignmentRightHandSide: AssignmentRightHandSideCstNode[];
+  Semicolon?: IToken[];
+};
+
 export interface IfStatementCstNode extends CstNode {
   name: 'ifStatement';
   children: IfStatementCstChildren;
@@ -187,8 +200,7 @@ export interface BlockableStatementCstNode extends CstNode {
 }
 
 export type BlockableStatementCstChildren = {
-  statement?: StatementCstNode[];
-  blockStatement?: BlockStatementCstNode[];
+  statement: StatementCstNode[];
 };
 
 export interface BlockableStatementsCstNode extends CstNode {
@@ -197,8 +209,7 @@ export interface BlockableStatementsCstNode extends CstNode {
 }
 
 export type BlockableStatementsCstChildren = {
-  statements?: StatementsCstNode[];
-  blockStatement?: BlockStatementCstNode[];
+  statements: StatementsCstNode[];
 };
 
 export interface BlockStatementCstNode extends CstNode {
@@ -207,9 +218,9 @@ export interface BlockStatementCstNode extends CstNode {
 }
 
 export type BlockStatementCstChildren = {
-  StartBrace: IToken[];
+  BlockStart: IToken[];
   statement?: StatementCstNode[];
-  EndBrace: IToken[];
+  BlockEnd: IToken[];
 };
 
 export interface ExpressionStatementCstNode extends CstNode {
@@ -274,6 +285,9 @@ export type PrimaryExpressionCstChildren = {
   identifierAccessor?: IdentifierAccessorCstNode[];
   parenthesizedExpression?: ParenthesizedExpressionCstNode[];
   arrayLiteral?: ArrayLiteralCstNode[];
+  structLiteral?: StructLiteralCstNode[];
+  functionExpression?: FunctionExpressionCstNode[];
+  accessorSuffixes?: AccessorSuffixesCstNode[];
   UnarySuffixOperator?: IToken[];
 };
 
@@ -330,6 +344,16 @@ export type AccessorSuffixesCstChildren = {
   functionArguments?: FunctionArgumentsCstNode[];
 };
 
+export interface PropertyNameCstNode extends CstNode {
+  name: 'propertyName';
+  children: PropertyNameCstChildren;
+}
+
+export type PropertyNameCstChildren = {
+  Identifier?: IToken[];
+  Keyword?: IToken[];
+};
+
 export interface DotAccessSuffixCstNode extends CstNode {
   name: 'dotAccessSuffix';
   children: DotAccessSuffixCstChildren;
@@ -337,7 +361,7 @@ export interface DotAccessSuffixCstNode extends CstNode {
 
 export type DotAccessSuffixCstChildren = {
   Dot: IToken[];
-  identifier: IdentifierCstNode[];
+  propertyName: PropertyNameCstNode[];
 };
 
 export interface ArrayAccessSuffixCstNode extends CstNode {
@@ -461,8 +485,7 @@ export interface EnumMemberCstNode extends CstNode {
 export type EnumMemberCstChildren = {
   Identifier: IToken[];
   Assign?: IToken[];
-  Minus?: IToken[];
-  NumericLiteral?: IToken[];
+  expression?: ExpressionCstNode[];
 };
 
 export interface ConstructorSuffixCstNode extends CstNode {
@@ -670,9 +693,7 @@ export interface AssignmentRightHandSideCstNode extends CstNode {
 }
 
 export type AssignmentRightHandSideCstChildren = {
-  expression?: ExpressionCstNode[];
-  structLiteral?: StructLiteralCstNode[];
-  functionExpression?: FunctionExpressionCstNode[];
+  expression: ExpressionCstNode[];
 };
 
 export interface ArrayLiteralCstNode extends CstNode {
@@ -706,7 +727,7 @@ export interface StructLiteralEntryCstNode extends CstNode {
 
 export type StructLiteralEntryCstChildren = {
   jsdoc?: JsdocCstNode[];
-  Identifier?: IToken[];
+  propertyName?: PropertyNameCstNode[];
   stringLiteral?: StringLiteralCstNode[];
   Colon?: IToken[];
   assignmentRightHandSide?: AssignmentRightHandSideCstNode[];
@@ -743,10 +764,10 @@ export interface SwitchStatementCstNode extends CstNode {
 export type SwitchStatementCstChildren = {
   Switch: IToken[];
   expression: ExpressionCstNode[];
-  StartBrace: IToken[];
+  BlockStart: IToken[];
   caseStatement?: CaseStatementCstNode[];
   defaultStatement?: DefaultStatementCstNode[];
-  EndBrace: IToken[];
+  BlockEnd: IToken[];
 };
 
 export interface CaseStatementCstNode extends CstNode {
@@ -857,6 +878,7 @@ export interface GmlVisitor<IN, OUT> extends ICstVisitor<IN, OUT> {
   templateLiteral(children: TemplateLiteralCstChildren, param?: IN): OUT;
   repeatStatement(children: RepeatStatementCstChildren, param?: IN): OUT;
   returnStatement(children: ReturnStatementCstChildren, param?: IN): OUT;
+  throwStatement(children: ThrowStatementCstChildren, param?: IN): OUT;
   ifStatement(children: IfStatementCstChildren, param?: IN): OUT;
   elseIfStatement(children: ElseIfStatementCstChildren, param?: IN): OUT;
   elseStatement(children: ElseStatementCstChildren, param?: IN): OUT;
@@ -881,6 +903,7 @@ export interface GmlVisitor<IN, OUT> extends ICstVisitor<IN, OUT> {
     param?: IN,
   ): OUT;
   accessorSuffixes(children: AccessorSuffixesCstChildren, param?: IN): OUT;
+  propertyName(children: PropertyNameCstChildren, param?: IN): OUT;
   dotAccessSuffix(children: DotAccessSuffixCstChildren, param?: IN): OUT;
   arrayAccessSuffix(children: ArrayAccessSuffixCstChildren, param?: IN): OUT;
   structAccessSuffix(children: StructAccessSuffixCstChildren, param?: IN): OUT;

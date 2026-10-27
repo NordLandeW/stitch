@@ -10,8 +10,9 @@ class LookupCode extends Code {
   copiedReferenceSlots = 0;
 
   constructor() {
-    // Position queries need no project state or filesystem access.
-    super({} as Asset, pathy('lookup.gml'));
+    // Position queries need a document owner, but no initialized semantic inputs
+    // or filesystem access. These tests never start project analysis.
+    super({ project: {} } as Asset, pathy('lookup.gml'));
   }
 
   override get refs() {

@@ -3,6 +3,7 @@ import { logger } from './logger.js';
 import type { Asset } from './project.asset.js';
 import { Project } from './project.js';
 import { Native } from './project.native.js';
+import { planReferenceRename } from './project.location.js';
 import { Signifier } from './signifiers.js';
 import { resetSandbox } from './test.lib.js';
 import { Type, TypeStore } from './types.js';
@@ -10,6 +11,19 @@ import type { PrimitiveName } from './types.primitives.js';
 import { assert, ok } from './util.js';
 
 describe('Project', function () {
+  const listSpecFiles = Native.listSpecFiles;
+  const findHelpLinksFile = Native.findHelpLinksFile;
+  before(function () {
+    // These model regressions use the repository's bundled specification.
+    // Installed runtimes and release-network latency are separate native tests.
+    Native.listSpecFiles = async () => [Native.fallbackGmlSpecPath];
+    Native.findHelpLinksFile = async () => undefined;
+  });
+  after(function () {
+    Native.listSpecFiles = listSpecFiles;
+    Native.findHelpLinksFile = findHelpLinksFile;
+  });
+
   it('can load the GML spec', async function () {
     const spec = await Native.from(undefined, new Type('Struct'), new Map());
     expect(spec).to.exist;
@@ -324,7 +338,13 @@ function BaseSettings() constructor { ${baseDefines ? 'sharedValue' : 'baseValue
     expect(reassignment.item.def?.file).to.equal(complicatedFile);
 
     await complicatedFile.reload('');
-    expect(reassignment.item.def).to.equal(undefined);
+    const promoted = file.getReferenceAt(1, 15)!;
+    expect(promoted.item).to.equal(reassignment.item);
+    expect(promoted.isDef).to.equal(true);
+    expect(promoted.item.def?.file).to.equal(file);
+    expect(promoted.item.def?.file && promoted.item.def.start.offset).to.equal(
+      7,
+    );
     await file.reload('global.outline_late_global = false;');
     expect(file.getReferenceAt(1, 15)!.isDef).to.equal(true);
   });
@@ -924,8 +944,11 @@ function validateWithContexts(project: Project) {
   ok(complicatedScriptFile);
 
   // WITHING INTO A GLOBAL CONSTRUCTED
-  const bschemaGlobalContext = complicatedScriptFile.getReferenceAt(1, 14)!.item
-    .type.type[0];
+  // Storage summaries include the uninitialized globalvar state; the with
+  // receiver is the struct alternative, independent of union array order.
+  const bschemaGlobalContext = complicatedScriptFile
+    .getReferenceAt(1, 14)!
+    .item.getTypeByKind('Struct');
   ok(
     bschemaGlobalContext &&
       bschemaGlobalContext.kind === 'Struct' &&
@@ -949,6 +972,11 @@ function validateWithContexts(project: Project) {
   expect(typeTextRef.text).to.equal('Id.Instance.o_object');
   expect(typeTextRef.isRenameable).to.equal(true);
   expect(typeTextRef.toRenamed('new_name')).to.equal('Id.Instance.new_name');
+  // A qualified type name belongs to the type namespace, even when a value
+  // with the proposed suffix is already local to this document.
+  expect(
+    planReferenceRename([typeTextRef], 'o_instance').map((edit) => edit.text),
+  ).to.deep.equal(['Id.Instance.o_instance']);
 
   // WITHING INTO AN OBJECT INSTANCE
   const instanceVarRef = withingScriptFile.getReferenceAt(11, 11)!;

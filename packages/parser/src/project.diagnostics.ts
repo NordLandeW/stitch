@@ -5,6 +5,7 @@ export type GmlParseError = IRecognitionException & { previousToken?: IToken };
 export type DiagnosticSeverity = 'error' | 'warning' | 'info';
 
 export interface DiagnosticCollections {
+  ANALYSIS: Diagnostic[];
   GLOBAL_SELF: Diagnostic[];
   INVALID_OPERATION: Diagnostic[];
   JSDOC_MISMATCH: Diagnostic[];

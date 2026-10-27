@@ -22,6 +22,11 @@ const signifierFlags = {
 export class Flags {
   protected flags = signifierFlags.ReadWrite;
 
+  /** Copy metadata at an analysis commit without replaying individual setters. */
+  copyFlagsFrom(source: Flags): void {
+    this.flags = source.flags;
+  }
+
   protected setFlag(flag: number, value: boolean) {
     if (value) {
       this.flags |= flag;
@@ -119,6 +124,9 @@ export class Flags {
 
   get readable() {
     return this.getFlag(signifierFlags.Readable);
+  }
+  set readable(readable: boolean) {
+    this.setFlag(signifierFlags.Readable, readable);
   }
 
   get deprecated() {

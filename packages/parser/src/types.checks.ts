@@ -78,7 +78,7 @@ export function getTypes(items: Typeable | undefined): Type[] {
     if (item.$tag === 'Sym') {
       types.push(...item.type.type);
     } else if (item.$tag === 'TypeStore') {
-      return [...item.type];
+      types.push(...item.type);
     } else {
       types.push(item);
     }
@@ -209,14 +209,16 @@ export function normalizeType(
             new Type(defaultItemKind);
           if (itemType.isGeneric) {
             // Then extend the type to allow having a generic without mutating the original
-            type = type.derive().genericize().named(itemType.name);
+            type = type.deriveDetached().genericize().named(itemType.name);
           }
           if (utilityKind === 'StaticType') {
-            // TODO: Create a new type consisting of the type's static members
-            type = Type.Struct;
-            for (const member of itemType.listMembers()) {
-              if (member.static) {
-                type.addMember(member);
+            const statics =
+              itemType.statics ||
+              itemType.signifier?.getTypeByKind('Function')?.statics;
+            type = statics || Type.Struct;
+            if (!statics) {
+              for (const member of itemType.listMembers()) {
+                if (member.static) type.setOwnMember(member);
               }
             }
           }
@@ -290,6 +292,11 @@ export function replaceGenerics(
   generics: Map<string, TypeStore>,
 ): TypeStore {
   const startingTypes = getTypes(startingType);
+  if (!generics.size) {
+    const unchanged = new TypeStore();
+    unchanged.type = startingTypes;
+    return unchanged;
+  }
   // Recurse through the types and, if we find a generic, replace it!
   // The complication is that we don't want to mutate the starting types, we need to replace them (or their containers!) with a new type. The easiest way to do this is to just create new types from the jump.
   const replacedTypes = new TypeStore();
@@ -299,7 +306,7 @@ export function replaceGenerics(
         ? generics.get(startingType.name!)?.type
         : [startingType];
     for (const type of newTypes || []) {
-      const newType = type.derive();
+      const newType = type.deriveDetached();
       if (type.items) {
         newType.items = replaceGenerics(type.items, knownTypes, generics);
       }

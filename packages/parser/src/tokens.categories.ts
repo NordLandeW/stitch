@@ -69,6 +69,8 @@ export const categories = [
     name: 'UnarySuffixOperator',
     pattern: Lexer.NA,
   }),
+  createToken({ name: 'BlockStart', pattern: Lexer.NA }),
+  createToken({ name: 'BlockEnd', pattern: Lexer.NA }),
   // https://docs.oracle.com/javase/specs/jls/se11/html/jls-3.html#jls-3.11
   createToken({
     name: 'Separators',

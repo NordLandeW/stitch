@@ -1,8 +1,14 @@
 import type { CstNodeLocation, IToken } from 'chevrotain';
+import { tokenMatcher } from 'chevrotain';
+import { GmlLexer } from './lexer.js';
+import { c } from './tokens.categories.js';
 import type { Code } from './project.code.js';
 import type { Signifier } from './signifiers.js';
 import { EnumType, FunctionType, StructType, WithableType } from './types.js';
 import { assert } from './util.js';
+import type { ReferenceRole, RenameRecipe } from './analysis/model.js';
+import type { SourceOrigin } from './syntax/source.js';
+import type { Type, TypeStore } from './types.js';
 
 export const firstLineIndex = 1;
 export const firstColumnIndex = 1;
@@ -195,11 +201,23 @@ export const enum ScopeFlag {
   DotAccessor = 1 << 0,
 }
 
+export interface CompletionCandidate {
+  readonly name: string;
+  /** Real storage identities; a shared name does not create a new symbol. */
+  readonly symbols: readonly Signifier[];
+  readonly type: TypeStore;
+  /** Receiver branch coverage, independent of the number of symbol identities. */
+  readonly availability: { readonly present: number; readonly total: number };
+}
+
 export class Scope extends Range {
   override readonly $tag = 'Scope';
   /** The immediately adjacent ScopeRange */
   protected _next: Scope | undefined = undefined;
   public flags = 0;
+  /** Query-only alternatives. An unknown receiver contributes no members. */
+  public dotReceivers: readonly Type[] | undefined;
+  public memberTypes: ReadonlyMap<Signifier, TypeStore> | undefined;
   constructor(
     start: Position,
     public local: StructType,
@@ -252,6 +270,14 @@ export class Reference extends Range {
   /** If this is reference marks the declaration */
   isDef = false;
   protected _itemNamePattern: RegExp | undefined = undefined;
+  /** Semantic contribution owner; physical spelling may belong to another file. */
+  ownerUnitId: string | undefined;
+  /** Current-unit query location for a macro expansion. The edit range stays physical. */
+  queryRange: Range | undefined;
+  origin: SourceOrigin | undefined;
+  evaluatedType: TypeStore | undefined;
+  role: ReferenceRole | undefined;
+  rename: RenameRecipe | undefined;
 
   constructor(
     public item: Signifier,
@@ -263,7 +289,11 @@ export class Reference extends Range {
 
   get itemNamePattern(): RegExp {
     if (!this._itemNamePattern) {
-      this._itemNamePattern = new RegExp(`\\b(?<name>${this.item.name})\\b`);
+      // Qualified annotations refer to their final name, not an equally named
+      // namespace prefix (for example the constructor in Struct.Struct).
+      this._itemNamePattern = new RegExp(
+        `\\b(?<name>${this.item.name})\\b${this.role === 'type' ? '$' : ''}`,
+      );
     }
     return this._itemNamePattern;
   }
@@ -281,7 +311,11 @@ export class Reference extends Range {
 
   get isRenameable(): boolean {
     const text = this.text;
-    return this.item.isRenameable && this.itemNamePattern.test(text);
+    return (
+      this.rename?.kind !== 'none' &&
+      this.item.isRenameable &&
+      (this.rename?.kind === 'string-key' || this.itemNamePattern.test(text))
+    );
   }
 
   /**
@@ -290,11 +324,136 @@ export class Reference extends Range {
    * the identifier!
    */
   toRenamed(newName: string): string {
-    return this.text.replace(this.itemNamePattern, newName);
+    switch (this.rename?.kind) {
+      case 'none':
+        return this.text;
+      case 'shorthand-value':
+        return `${this.rename.property}: ${newName}`;
+      case 'shorthand-property':
+        return `${newName}: ${this.rename.value}`;
+      case 'string-key': {
+        const quote = this.text.startsWith("@'")
+          ? "'"
+          : this.text.startsWith("'")
+            ? "'"
+            : '"';
+        const prefix = this.text.startsWith('@') ? '@' : '';
+        return `${prefix}${quote}${newName.replaceAll('\\', '\\\\').replaceAll(quote, `\\${quote}`)}${quote}`;
+      }
+      default:
+        return this.text.replace(this.itemNamePattern, newName);
+    }
   }
 
   static fromRange(range: Range, item: ReferenceableType) {
     assert(range, 'Cannot create a reference from an undefined range.');
     return new Reference(item, range.start, range.end);
   }
+}
+
+export interface ReferenceRenameEdit {
+  readonly range: Range;
+  readonly text: string;
+}
+
+/** Validate the complete operation before producing any edits. */
+export function planReferenceRename(
+  references: Iterable<Reference>,
+  newName: string,
+  allReferences?: Iterable<Reference>,
+): ReferenceRenameEdit[] {
+  const selected = [...references];
+  const universe = allReferences && [...allReferences];
+  const edits = new Map<string, ReferenceRenameEdit>();
+  const targets = new Set(selected.map((reference) => reference.item));
+  const tokens = GmlLexer.tokenize(newName);
+  const token = tokens.tokens[0];
+  const propertyOnly =
+    selected.length > 0 &&
+    selected.every(
+      (reference) =>
+        reference.rename?.kind === 'string-key' ||
+        reference.rename?.kind === 'shorthand-property' ||
+        (reference.rename?.kind === 'identifier' && reference.rename.property),
+    );
+  if (
+    tokens.errors.length ||
+    tokens.tokens.length !== 1 ||
+    token.image !== newName ||
+    !(
+      token.tokenType.name === 'Identifier' ||
+      (propertyOnly && tokenMatcher(token, c.Keyword))
+    )
+  )
+    throw new Error(
+      'The new name must be a valid GML identifier for every reference.',
+    );
+  for (const target of targets) {
+    const existing = target.parent.getMember(newName);
+    if (existing && existing !== target && !existing.placeholder)
+      throw new Error(
+        `The name ${newName} already exists in this storage scope.`,
+      );
+  }
+  for (const reference of selected) {
+    const recipe = reference.rename;
+    if (
+      reference.role !== 'type' &&
+      (recipe?.kind === 'shorthand-value' ||
+        (recipe?.kind === 'identifier' && !recipe.property) ||
+        !recipe)
+    ) {
+      const query = reference.queryRange || reference;
+      const scope = query.file.getScopeRangeAt?.(query.start.offset);
+      const existing = scope?.local.getMember(newName);
+      if (existing && !targets.has(existing) && !existing.placeholder)
+        throw new Error(
+          `The name ${newName} would be captured by another local symbol.`,
+        );
+    }
+    if (!reference.isRenameable) {
+      if (reference.rename?.kind === 'none')
+        throw new Error(
+          'A reference has no safe source edit; rename would be incomplete.',
+        );
+      continue;
+    }
+    if (reference.origin?.expansion && !universe)
+      throw new Error(
+        'Renaming macro-expanded bindings requires all expansion references.',
+      );
+    const peers = universe || reference.file.refs || [];
+    const conflict = peers.some((other) => {
+      if (
+        other.file !== reference.file ||
+        other.start.offset !== reference.start.offset ||
+        other.end.offset !== reference.end.offset ||
+        targets.has(other.item)
+      )
+        return false;
+      // Expanding an ordinary shorthand explicitly preserves its other role.
+      const shorthandPair =
+        !reference.origin?.expansion &&
+        ((reference.role === 'shorthand-value' &&
+          other.role === 'shorthand-property') ||
+          (reference.role === 'shorthand-property' &&
+            other.role === 'shorthand-value'));
+      return !shorthandPair;
+    });
+    if (conflict)
+      throw new Error(
+        reference.origin?.expansion
+          ? 'The macro spelling denotes different symbols in different expansions.'
+          : 'The source spelling denotes different symbols; rename would be ambiguous.',
+      );
+    const key = `${reference.file.path.absolute}:${reference.start.offset}:${reference.end.offset}`;
+    const text = reference.toRenamed(newName);
+    const prior = edits.get(key);
+    if (prior && prior.text !== text)
+      throw new Error(
+        'Overlapping reference roles require incompatible rename edits.',
+      );
+    if (text !== reference.text) edits.set(key, { range: reference, text });
+  }
+  return [...edits.values()];
 }

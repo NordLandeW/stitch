@@ -5,7 +5,7 @@ import {
   type FeatherTypeUnion,
 } from './jsdoc.feather.js';
 import type { JsdocSummary } from './jsdoc.js';
-import { Type } from './types.js';
+import { Type, TypeStore } from './types.js';
 import { primitiveNames } from './types.primitives.js';
 import { ok } from './util.js';
 
@@ -69,7 +69,7 @@ export function typeFromIdentifier(
   const knownType = findInKnownOrGenerics(identifier, knownTypes)?.[0];
   if (knownType && isObjectType) {
     // Need a derived type to prevent mutation of the parent!
-    return knownType.derive();
+    return knownType.deriveDetached();
   } else if (knownType) {
     return knownType;
   }
@@ -87,7 +87,7 @@ export function typeFromIdentifier(
     const type = typeFromIdentifier(baseType, knownTypes, addMissing, false);
     if (__isRootRequest && type) {
       // Then add to the known types map
-      const derivedTyped = type.derive().named(nameParts.join('.'));
+      const derivedTyped = type.deriveDetached().named(nameParts.join('.'));
       // Types should only be auto-added when loading the native spec
       if (addMissing) {
         const map = arrayWrapped(knownTypes).find(
@@ -141,7 +141,12 @@ export function typeFromParsedJsdocs(
         generic.type?.content || 'Any',
         knownTypes,
         addMissing,
-      );
+      ).map((type) => {
+        const genericType = new Type(type.kind);
+        genericType.setBaseView(type);
+        genericType.items = type.items;
+        return genericType;
+      });
       // Flag them all as generic, named after the generic name
       for (const genericType of generics[generic.name!.content]) {
         genericType.isGeneric = true;
@@ -189,27 +194,23 @@ export function typeFromParsedFeatherString(
 ): Type[] {
   if (node.kind === 'type') {
     const identifier = node.name;
-    let type = typeFromIdentifier(identifier.content, knownTypes, addMissing);
-    if (node.of) {
-      const subtypes = typeFromParsedFeatherString(
-        node.of,
-        knownTypes,
-        addMissing,
-      );
-      // Then we need to create a new type instead of mutating
-      // the one we found.
-      type = type.derive();
-      // While only some types are "containers", we can
-      // go ahead and add any contained types and worry
-      // about the consequences later. That way we don't
-      // need to keep updating this as we add more container
-      // types.
-      for (const subtype of subtypes) {
-        type.addItemType(subtype);
-      }
-      // TODO: Else create a diagnostic?
-    }
-    return [type];
+    const alias = findInKnownOrGenerics(identifier.content, knownTypes);
+    const types =
+      alias && alias.length > 1
+        ? alias
+        : [typeFromIdentifier(identifier.content, knownTypes, addMissing)];
+    if (!node.of) return types;
+    const subtypes = typeFromParsedFeatherString(
+      node.of,
+      knownTypes,
+      addMissing,
+    );
+    return types.map((source) => {
+      const type = source.deriveDetached();
+      type.items = new TypeStore();
+      type.items.type = subtypes;
+      return type;
+    });
   } else if (node.kind === 'union') {
     const unionOf = node.types;
     if (unionOf.length === 1) {

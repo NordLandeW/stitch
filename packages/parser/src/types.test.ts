@@ -5,6 +5,40 @@ import { KnownTypesMap, typeFromFeatherString } from './types.feather.js';
 import { Type, TypeStore } from './types.js';
 
 describe('Types', function () {
+  it('preserves generic alias unions and leaves parameterized inputs unchanged', function () {
+    const alternatives = [
+      new Type('Real').named('T').genericize(),
+      new Type('String').named('T').genericize(),
+    ];
+    const expanded = typeFromFeatherString(
+      'Array<T>|T',
+      [{ T: alternatives }],
+      false,
+    );
+    expect(expanded.map((type) => type.kind)).to.deep.equal([
+      'Array',
+      'Real',
+      'String',
+    ]);
+    expect(expanded[0].items!.type.map((type) => type.kind)).to.deep.equal([
+      'Real',
+      'String',
+    ]);
+    const container = new Type('Struct').named('Container');
+    container.addItemType(new Type('Real'));
+    const parameterized = typeFromFeatherString(
+      'Container<String>',
+      new Map([['Container', container]]),
+      false,
+    )[0];
+    expect(parameterized.items!.type.map((type) => type.kind)).to.deep.equal([
+      'String',
+    ]);
+    expect(container.items!.type.map((type) => type.kind)).to.deep.equal([
+      'Real',
+    ]);
+  });
+
   it('can resursively resolve generic types', function () {
     const genericType = new Type('Any').named('T').genericize();
     const generics = [{ T: [genericType] }];

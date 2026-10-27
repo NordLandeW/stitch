@@ -1,6 +1,10 @@
 import { keysOf } from '@bscotch/utility';
 import type { IToken } from 'chevrotain';
-import { flattenFeatherTypes } from './jsdoc.feather.js';
+import {
+  flattenFeatherTypes,
+  parseFeatherTypeString,
+  type FeatherTypeDiagnostic,
+} from './jsdoc.feather.js';
 import type { IPosition, IRange } from './project.location.js';
 import { assert } from './util.js';
 
@@ -50,8 +54,11 @@ const patterns = {
   template: `@template\\b`,
   unknown: `@\\w+\\b`,
 };
-const typeGroupPattern = `(?<typeGroup>{\\s*(?<typeUnion>[^}]*?)?\\s*})`;
-const linePrefixPattern = `^(\\s*(?<delim>///|\\*)\\s*)?`;
+// Recover a missing closing brace at this line's end, never at a later tag.
+const typeGroupPattern = `(?<typeGroup>{\\s*(?<typeUnion>[^}]*?)?\\s*(?:}|$))`;
+// Block opening delimiters are replaced with spaces to preserve offsets.
+// Those spaces (and ordinary indentation) are valid even without a '*' prefix.
+const linePrefixPattern = `^\\s*(?:(?<delim>///|\\*)\\s*)?`;
 const descriptionPattern = `(?:\\s*-\\s*)?(?<info>.*)`;
 const paramNamePattern = `(?<name>[a-zA-Z_][a-zA-Z_0-9]*)`;
 const paramDefaultPattern = `(?:\\s*=\\s*(?<default>[^\\]]+?)\\s*)`;
@@ -61,9 +68,8 @@ const optionalParamNamePattern = `\\[\\s*(?<optionalName>(?:[a-zA-Z_][a-zA-Z_0-9
 const names = keysOf(patterns);
 for (const tagName of names) {
   // Add the line prefix and a tag capture group
-  patterns[
-    tagName
-  ] = `${linePrefixPattern}(?<tag>(?<${tagName}>${patterns[tagName]}))`;
+  patterns[tagName] =
+    `${linePrefixPattern}(?<tag>(?<${tagName}>${patterns[tagName]}))`;
 }
 
 // Types with required typeGroups
@@ -82,9 +88,8 @@ for (const tagName of [
   'instancevar',
   'template',
 ] as const) {
-  patterns[
-    tagName
-  ] = `${patterns[tagName]}(\\s+${typeGroupPattern})?\\s+${paramNamePattern}`;
+  patterns[tagName] =
+    `${patterns[tagName]}(\\s+${typeGroupPattern})?\\s+${paramNamePattern}`;
 }
 
 // Self (has a type but no group. Make brackets optional to be more forgiving)
@@ -145,16 +150,15 @@ export interface Jsdoc<T extends JsdocKind = JsdocKind> extends IRange {
   self?: JsdocComponent;
 }
 
-export interface JsdocSummary
-  extends Jsdoc<
-    | 'description'
-    | 'function'
-    | 'type'
-    | 'self'
-    | 'globalvar'
-    | 'instancevar'
-    | 'localvar'
-  > {
+export interface JsdocSummary extends Jsdoc<
+  | 'description'
+  | 'function'
+  | 'type'
+  | 'self'
+  | 'globalvar'
+  | 'instancevar'
+  | 'localvar'
+> {
   /**
    * The list of all tags found in this block, and their
    * respective locations, for use e.g. syntax highlighting.
@@ -350,10 +354,90 @@ export function parseJsdoc(
     typeRanges: [],
   };
 
+  const typeGroupComponent = (
+    line: JsdocLine,
+    parts: MatchGroups,
+  ): JsdocComponent | undefined => {
+    if (!parts.typeGroup) return;
+    // Search after the tag, not for the type's text: a type name can also
+    // occur in the tag, parameter name or description.
+    const tagEnd = line.content.indexOf(parts.tag!) + parts.tag!.length;
+    const opening = line.content.indexOf('{', tagEnd);
+    const closing = line.content.indexOf('}', opening + 1);
+    if (closing < 0) {
+      const start = {
+        line: line.start.line,
+        column: line.start.column + opening,
+        offset: line.start.offset + opening,
+      };
+      doc.diagnostics.push({
+        message: "Missing closing brace '}' in JSDoc type",
+        start,
+        end: { ...start },
+      });
+    }
+    const rawType = line.content.slice(
+      opening + 1,
+      closing < 0 ? line.content.length : closing,
+    );
+    const content = rawType.trim();
+    const index = opening + 1 + rawType.length - rawType.trimStart().length;
+    const start = {
+      line: line.start.line,
+      column: line.start.column + index,
+      offset: line.start.offset + index,
+    };
+    if (!content) {
+      // There is no source token to highlight as an inferred Any. Anchor the
+      // diagnostic to the closing brace (or the opening brace if truncated).
+      const anchor = closing < 0 ? opening : closing;
+      const position = {
+        line: line.start.line,
+        column: line.start.column + anchor,
+        offset: line.start.offset + anchor,
+      };
+      doc.diagnostics.push({
+        message: 'Expected a type',
+        start: position,
+        end: { ...position },
+      });
+      return;
+    }
+    return {
+      content,
+      start,
+      end: {
+        line: start.line,
+        column: start.column + content.length - 1,
+        offset: start.offset + content.length - 1,
+      },
+    };
+  };
+
   const addTypeRanges = (component: JsdocComponent | undefined) => {
     if (!component) return;
-    const types = flattenFeatherTypes(component.content);
+    const diagnostics: FeatherTypeDiagnostic[] = [];
+    const parsed = parseFeatherTypeString(component.content, diagnostics);
+    for (const diagnostic of diagnostics) {
+      const start = {
+        line: component.start.line,
+        column: component.start.column + diagnostic.offset,
+        offset: component.start.offset + diagnostic.offset,
+      };
+      const length = Math.max(1, diagnostic.length);
+      doc.diagnostics.push({
+        message: diagnostic.message,
+        start,
+        end: {
+          line: start.line,
+          column: start.column + length - 1,
+          offset: start.offset + length - 1,
+        },
+      });
+    }
+    const types = flattenFeatherTypes(parsed);
     for (const type of types) {
+      if (type.name.inferred) continue;
       // Convert the offset to a range and add it to typeRanges
       const start = {
         line: component.start.line,
@@ -436,6 +520,35 @@ export function parseJsdoc(
       }
       // If it's an unfamiliar tag, just skip it
       else if (parts.unknown) {
+        // A truncated typed parameter/declaration may not have a recoverable
+        // name. Report its unmatched brace locally and still parse later tags.
+        const typedTag =
+          /^@(param(eter)?|arg(ument)?|template|localvar|var|globalvar|instancevar|prop(erty)?)$/;
+        if (typedTag.test(parts.tag!)) {
+          const afterTag = tagIndices[1];
+          const group = line.content.slice(afterTag).match(/^\s*\{/);
+          if (group && !line.content.slice(afterTag).includes('}')) {
+            const opening = afterTag + group[0].length - 1;
+            const start = {
+              line: line.start.line,
+              column: line.start.column + opening,
+              offset: line.start.offset + opening,
+            };
+            doc.diagnostics.push({
+              message: "Missing closing brace '}' in JSDoc type",
+              start,
+              end: { ...start },
+            });
+          }
+        } else if (/^@(type|returns?)$/.test(parts.tag!)) {
+          doc.diagnostics.push({
+            message: 'Expected a JSDoc type enclosed in braces',
+            ...matchIndexToRange(line.start, [
+              tagIndices[0],
+              tagIndices[1] - 1,
+            ]),
+          });
+        }
         // Unset the describe target
         describing = null;
       }
@@ -453,18 +566,14 @@ export function parseJsdoc(
         const kind = parts.param
           ? 'param'
           : parts.template
-          ? 'template'
-          : parts.localvar
-          ? 'localvar'
-          : parts.globalvar
-          ? 'globalvar'
-          : 'instancevar';
+            ? 'template'
+            : parts.localvar
+              ? 'localvar'
+              : parts.globalvar
+                ? 'globalvar'
+                : 'instancevar';
 
-        const typeString = substringRange(
-          line.content,
-          parts.typeUnion,
-          line.start,
-        );
+        const typeString = typeGroupComponent(line, parts);
         addTypeRanges(typeString);
 
         const entity: Jsdoc<typeof kind> = {
@@ -500,11 +609,7 @@ export function parseJsdoc(
           // Then we don't want to overwrite.
           break;
         }
-        const typeString = substringRange(
-          line.content,
-          parts.typeUnion!,
-          line.start,
-        );
+        const typeString = typeGroupComponent(line, parts);
         addTypeRanges(typeString);
 
         const returns: Jsdoc<'returns'> = {
@@ -532,7 +637,7 @@ export function parseJsdoc(
       // Handle Type
       else if (parts.type) {
         doc.kind = 'type';
-        doc.type = substringRange(line.content, parts.typeUnion!, line.start);
+        doc.type = typeGroupComponent(line, parts);
         addTypeRanges(doc.type);
         doc.description = appendDescription(doc.description, parts.info);
       }
