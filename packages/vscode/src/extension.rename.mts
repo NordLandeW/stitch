@@ -16,7 +16,10 @@ export class StitchRenameProvider implements vscode.RenameProvider {
       // Might be that the cursor is *after* the symbol. Try one position prior.
       ref = this.workspace.getReference(document, position.translate(0, -1));
     }
-    assertUserClaim(ref, 'Not a symbol reference');
+    assertUserClaim(
+      ref,
+      'No unique symbol reference; a shared macro spelling may bind to different symbols',
+    );
     const range = rangeFrom(ref);
     const text = document.getText(range);
     assertUserClaim(
@@ -41,7 +44,7 @@ export class StitchRenameProvider implements vscode.RenameProvider {
     position: vscode.Position,
     token: vscode.CancellationToken,
   ): Promise<vscode.Range | undefined> {
-    if (!(await this.workspace.ensureDocumentCurrent(document, token))) return;
+    if (!(await this.workspace.ensureProjectCurrent(document, token))) return;
     // Find the signifier ref at this position
     const toRename = this.assertRenameableReference(document, position);
     return toRename.range;
@@ -55,16 +58,17 @@ export class StitchRenameProvider implements vscode.RenameProvider {
   ) {
     if (!(await this.workspace.ensureProjectCurrent(document, token))) return;
     const toRename = this.assertRenameableReference(document, position);
-    const refs = toRename.ref.item.refs;
+    const plan = toRename.ref.file.project.renameEdits(
+      toRename.ref.item,
+      newName,
+    );
     const edits = new vscode.WorkspaceEdit();
-    for (const ref of refs) {
-      // Get the corresponding URI
-      const uri = vscode.Uri.file(ref.file.path.absolute);
-      const renamed = ref.toRenamed(newName);
-      if (ref.text === renamed) {
-        continue;
-      }
-      edits.replace(uri, rangeFrom(ref), renamed);
+    for (const edit of plan) {
+      edits.replace(
+        vscode.Uri.file(edit.range.file.path.absolute),
+        rangeFrom(edit.range),
+        edit.text,
+      );
     }
     return edits;
   }

@@ -1,5 +1,5 @@
 import type { IRecognitionException, IToken } from 'chevrotain';
-import type { IRange, Range } from './project.location.js';
+import { Range, type IRange } from './project.location.js';
 
 export type GmlParseError = IRecognitionException & { previousToken?: IToken };
 export type DiagnosticSeverity = 'error' | 'warning' | 'info';
@@ -27,7 +27,9 @@ export class Diagnostic {
     readonly location: IRange,
     readonly severity: DiagnosticSeverity = 'warning',
     readonly payload?: any,
-  ) {}
+  ) {
+    this.location = location instanceof Range ? location.invocation : location;
+  }
 
   static warn(message: string, location: Range, payload?: any) {
     return new Diagnostic(message, location, 'warning', payload);

@@ -23,7 +23,11 @@ import {
   ReferenceableType,
   Scope,
   StructNewMemberRange,
+  type SourceMapping,
 } from './project.location.js';
+import { SourceLines } from './syntax/source.js';
+import type { PreprocessedDocument } from './syntax/macros.js';
+import type { RenameEdit } from './project.rename.js';
 import type { Signifier } from './signifiers.js';
 import { getTypeOfKind } from './types.checks.js';
 import { Type, type StructType } from './types.js';
@@ -52,6 +56,12 @@ export class Code {
   protected _rangesAreSorted = false;
   content!: string;
   protected _parsed!: GmlParsed;
+  /** Internal analysis ranges retain this immutable source-projection snapshot. */
+  sourceMapping?: SourceMapping;
+  protected preprocessed!: PreprocessedDocument;
+  protected sourceLines = new SourceLines('');
+  private incomingRefs?: Set<Reference>;
+  private retired = false;
 
   // Metadata
   /** For object events, whether or not `event_inherited` is unambiguously being called */
@@ -118,7 +128,7 @@ export class Code {
 
   /** A zero-length range at the start of the file. */
   get startRange() {
-    return new Range(this.startPosition, this.startPosition);
+    return Range.physical(this.startPosition);
   }
 
   protected isInRange(
@@ -146,109 +156,137 @@ export class Code {
     if (typeof offset === 'number' && typeof column === 'number') {
       offset = { line: offset, column };
     }
-    const refs = this.refs;
-    assert(refs, 'Refs must be an array');
-    for (let i = 0; i < refs.length; i++) {
-      const ref = refs[i];
-      if (this.isInRange(ref, offset)) {
-        return ref;
-      } else if (this.isBeforeRange(ref, offset)) {
-        return undefined;
-      }
+    const refs = this.getReferenceCandidatesAt(offset);
+    return refs.length && refs.every((ref) => ref.item === refs[0].item)
+      ? refs[0]
+      : undefined;
+  }
+
+  getReferenceCandidatesAt(
+    offset: number | LinePosition,
+    column?: number,
+  ): Reference[] {
+    if (typeof offset === 'number' && typeof column === 'number')
+      offset = { line: offset, column };
+    const matches: Reference[] = [];
+    const sharedBindings = !!this.sourceMapping || !!this.incomingRefs?.size;
+    for (const ref of this.sourceRefs) {
+      const source = ref.source;
+      if (this.isInRange(source, offset)) {
+        if (!sharedBindings) return [ref];
+        const first = matches[0]?.source;
+        // Preserve ordinary first-range precedence. Only one physical spelling
+        // can have additional bindings contributed by macro expansion.
+        if (
+          !first ||
+          (source.start.offset === first.start.offset &&
+            source.end.offset === first.end.offset)
+        )
+          matches.push(ref);
+      } else if (this.isBeforeRange(source, offset)) break;
     }
-    return undefined;
+    return matches;
+  }
+
+  private queryContexts(offset: number | LinePosition, column?: number) {
+    if (typeof offset === 'number' && typeof column === 'number')
+      offset = { line: offset, column };
+    return this.project.macros.contextsAt(
+      this,
+      typeof offset === 'number' ? offset : this.sourceLines.offset(offset),
+    );
   }
 
   getJsdocAt(
     offset: number | LinePosition,
     column?: number,
   ): JsdocSummary | undefined {
-    if (typeof offset === 'number' && typeof column === 'number') {
-      offset = { line: offset, column };
-    }
-    assert(this.jsdocs, 'Jsdocs must be an array');
-    for (let i = 0; i < this.jsdocs.length; i++) {
-      const jsdoc = this.jsdocs[i];
-      if (this.isInRange(jsdoc, offset)) {
-        return jsdoc;
-      } else if (this.isBeforeRange(jsdoc, offset)) {
-        return undefined;
+    const matches = new Set<JsdocSummary>();
+    for (const context of this.queryContexts(offset, column)) {
+      for (const jsdoc of context.code.jsdocs) {
+        if (this.isInRange(jsdoc, context.offset)) matches.add(jsdoc);
+        else if (this.isBeforeRange(jsdoc, context.offset)) break;
       }
     }
-    return undefined;
+    return matches.size === 1 ? [...matches][0] : undefined;
   }
 
   getFunctionArgRangeAt(
     offset: number | LinePosition,
     column?: number,
   ): FunctionArgRange | undefined {
-    if (typeof offset === 'number' && typeof column === 'number') {
-      offset = { line: offset, column };
-    }
-    let match: FunctionArgRange | undefined;
-    const ranges = this.functionArgRanges;
-    assert(ranges, 'Function arg ranges must be an array');
-    for (let i = 0; i < ranges.length; i++) {
-      const argRange = ranges[i];
-      if (this.isInRange(argRange, offset)) {
-        // These could be nested, so an outer arg range might contain an inner one.
-        // Since these are sorted by start offset, we can return the *last* one to ensure that we're in the innermost range.
-        match = argRange;
-        continue;
-      } else if (this.isBeforeRange(argRange, offset)) {
-        return match;
+    const matches: FunctionArgRange[] = [];
+    for (const context of this.queryContexts(offset, column)) {
+      let match: FunctionArgRange | undefined;
+      for (const range of context.code.functionArgRanges) {
+        if (this.isInRange(range, context.offset)) match = range;
+        else if (this.isBeforeRange(range, context.offset)) break;
       }
+      if (match) matches.push(match);
     }
-    return match;
+    return matches.length &&
+      matches.every(
+        (match) =>
+          match.type === matches[0].type && match.idx === matches[0].idx,
+      )
+      ? matches[0]
+      : undefined;
   }
 
   getStructNewMemberRangeAt(
     offset: number | LinePosition,
     column?: number,
   ): StructNewMemberRange | undefined {
-    if (typeof offset === 'number' && typeof column === 'number') {
-      offset = { line: offset, column };
-    }
-    const ranges = this.structNewMemberRanges;
-    for (let i = 0; i < ranges.length; i++) {
-      const range = ranges[i];
-      if (this.isInRange(range, offset)) {
-        return range;
-      } else if (this.isBeforeRange(range, offset)) {
-        return undefined;
+    const matches: StructNewMemberRange[] = [];
+    for (const context of this.queryContexts(offset, column)) {
+      for (const range of context.code.structNewMemberRanges) {
+        if (this.isInRange(range, context.offset)) {
+          matches.push(range);
+          break;
+        } else if (this.isBeforeRange(range, context.offset)) break;
       }
     }
-    return undefined;
+    return matches.length &&
+      matches.every((match) => match.type === matches[0].type)
+      ? matches[0]
+      : undefined;
   }
 
   getScopeRangeAt(
     offset: number | LinePosition,
     column?: number,
   ): Scope | undefined {
-    if (typeof offset === 'number' && typeof column === 'number') {
-      offset = { line: offset, column };
-    }
-    for (const scopeRange of this.scopes) {
-      if (this.isInRange(scopeRange, offset)) {
-        return scopeRange;
-      }
-    }
-    // Default to the last scope,
-    // since we can end up with wonkiness with EOF trailing whitespace
-    return this.scopes.at(-1);
+    const scopes = this.queryContexts(offset, column).map((context) =>
+      context.code.getAnalysisScopeAt(context.offset),
+    );
+    return scopes.length && scopes.every((scope) => scope === scopes[0])
+      ? scopes[0]
+      : undefined;
+  }
+
+  /** @internal Scope lookup in analysis coordinates, before source projection. */
+  getAnalysisScopeAt(offset: number): Scope | undefined {
+    return (
+      this.scopes.find((scope) => this.isInRange(scope, offset)) ||
+      this.scopes.at(-1)
+    );
   }
 
   getInScopeSymbolsAt(
     offset: number | LinePosition,
     column?: number,
   ): Signifier[] {
-    if (typeof offset === 'number' && typeof column === 'number') {
-      offset = { line: offset, column };
+    const matches = new Set<Signifier>();
+    for (const context of this.queryContexts(offset, column)) {
+      const scope = context.code.getAnalysisScopeAt(context.offset);
+      if (scope)
+        for (const symbol of context.code.symbolsInScope(scope))
+          matches.add(symbol);
     }
-    const scopeRange = this.getScopeRangeAt(offset);
-    if (!scopeRange) {
-      return [];
-    }
+    return [...matches];
+  }
+
+  private symbolsInScope(scopeRange: Scope): Signifier[] {
     if (scopeRange.isDotAccessor) {
       // Then only return self variables
       // Filter out those that cannot be dot-accessed on global
@@ -267,6 +305,8 @@ export class Code {
     // Add to a flat list, and remove all entries that don't have
     // a definition if they are not native
     const allSignifiers = [
+      // Preprocessor names take precedence over runtime variable lookup.
+      ...this.project.macros.activeSymbols(),
       // Local variables
       ...(scopeRange.local.listMembers() || []),
       // Self variables, if not global
@@ -330,10 +370,54 @@ export class Code {
    * is useful for editors that want to provide a live preview.
    */
   async parse(content?: string) {
+    this.collectText(
+      typeof content === 'string' ? content : await this.path.read(),
+    );
+  }
+
+  private collectText(content: string) {
+    if (this.retired) return;
+    this.content = content;
+    this.sourceLines = new SourceLines(content);
+    this.project.macros.collect(this, content);
+    this.parseCollected();
+  }
+
+  /** @internal Re-expand a collected buffer without reading over an open editor. */
+  parseCollected() {
     this.clearAllDiagnostics();
-    this.content =
-      typeof content === 'string' ? content : await this.path.read();
-    this._parsed = parser.parse(this.content);
+    this.preprocessed = this.project.macros.preprocess(this);
+    this.sourceMapping = this.preprocessed.sourceMap
+      ? this.project.macros.mapping(this.preprocessed.sourceMap)
+      : undefined;
+    this._parsed = parser.parse(
+      this.preprocessed.text,
+      this.preprocessed.lexed,
+    );
+    if (this.preprocessed.sourceMap) {
+      for (const error of this._parsed.lexed.errors) {
+        const origin = this.preprocessed.sourceMap.origin(
+          error.offset,
+          error.offset + error.length - 1,
+        );
+        this.diagnostics.SYNTAX_ERROR.push(
+          Diagnostic.error(
+            error.message,
+            this.project.macros.physicalRange(
+              origin.expansion || origin.spelling,
+            ),
+          ),
+        );
+      }
+    }
+    for (const diagnostic of this.preprocessed.diagnostics) {
+      this.diagnostics.SYNTAX_ERROR.push(
+        Diagnostic.error(
+          diagnostic.message,
+          this.project.macros.physicalRange(diagnostic.span),
+        ),
+      );
+    }
     for (const diagnostic of this._parsed.errors) {
       const fromToken = isNaN(diagnostic.token.startOffset)
         ? diagnostic.previousToken
@@ -354,28 +438,24 @@ export class Code {
     }
   }
 
-  /**
-   * Replace all refs for a signifier with a new name,
-   * followed by fully reprocessing the file.
-   */
+  /** Rename the complete binding, including spellings in other macro files. */
   @sequential
   async renameSignifier(signifier: Signifier, newName: string) {
-    const renameableRefs = this.refs.filter(
-      (ref) => ref.item === signifier && ref.isRenameable,
-    );
-    // Rename using magic-string so we don't have to track changed positions
+    await this.project.renameSignifier(signifier, newName);
+  }
+
+  /** Apply a prevalidated physical plan without changing the live buffer. */
+  renamedContent(edits: readonly RenameEdit[]): string {
     const updated = new MagicString(this.content);
-    for (const ref of renameableRefs) {
+    for (const edit of edits) {
+      if (edit.range.file !== this) continue;
       updated.update(
-        ref.start.offset,
-        ref.end.offset + 1,
-        ref.toRenamed(newName),
+        edit.range.start.offset,
+        edit.range.end.offset + 1,
+        edit.text,
       );
     }
-    // Save to disk and reprocess
-    this.content = updated.toString();
-    await this.path.write(this.content);
-    await this.reload(this.content);
+    return updated.toString();
   }
 
   clearDiagnosticCollection(collection: DiagnosticCollectionName) {
@@ -404,6 +484,18 @@ export class Code {
 
   addRef(ref: Reference) {
     this._refs.push(ref);
+    this._rangesAreSorted = false;
+    const source = ref.source.file;
+    if (source !== this) (source.incomingRefs ||= new Set()).add(ref);
+  }
+
+  /** References spelled here, including bindings produced by other callers. */
+  get sourceRefs(): Reference[] {
+    if (!this.sourceMapping && !this.incomingRefs?.size) return this.refs;
+    return [
+      ...this._refs.filter((ref) => ref.source.file === this),
+      ...(this.incomingRefs || []),
+    ].sort((a, b) => a.source.start.offset - b.source.start.offset);
   }
 
   addStructNewMemberRange(range: StructNewMemberRange) {
@@ -447,6 +539,10 @@ export class Code {
 
   protected reset() {
     this.initializeScopeRanges();
+    for (const ref of this._refs) {
+      const source = ref.source.file;
+      if (source !== this) source.incomingRefs?.delete(ref);
+    }
     // Remove each reference in *this file* from its symbol. If that was the only reference to its signifier, and it was a defining reference, also remove the signifier
     const cleared = new Set<ReferenceableType>();
     for (const ref of this._refs) {
@@ -470,7 +566,11 @@ export class Code {
         }
       }
       // Remove orphaned declarations and unresolved names left behind while editing.
-      if (!signifier.refs.size && (isDefinedInThisFile || !signifier.def)) {
+      if (
+        !signifier.refs.size &&
+        (isDefinedInThisFile || !signifier.def) &&
+        signifier.parent.getMember(signifier.name, true) === signifier
+      ) {
         signifier.parent.removeMember(signifier.name);
       }
       cleared.add(signifier);
@@ -511,8 +611,8 @@ export class Code {
     this.asset.gmlFiles.delete(this.path.absolute.toLocaleLowerCase());
     // remove file
     await this.path.delete();
-    // reset to clear refs and diagnostics
-    this.reset();
+    this.retire();
+    this.project.macros.flush();
   }
 
   /**
@@ -520,10 +620,10 @@ export class Code {
    * provide new content to use instead of reading from disk.
    */
   async reload(content?: string, options?: { reloadDirty?: boolean }) {
-    await this.parse(content);
-    this.updateGlobals();
-    this.updateAllSymbols();
-    this.updateDiagnostics();
+    const next = typeof content === 'string' ? content : await this.path.read();
+    if (this.retired) return;
+    this.collectText(next);
+    this.project.macros.flush();
     // Re-run diagnostics on everything that ended up dirty due to the changes
     if (options?.reloadDirty) {
       this.project.drainDirtyFileUpdateQueue();
@@ -613,7 +713,14 @@ export class Code {
     this.diagnostics.UNDECLARED_VARIABLE_REFERENCE = [];
     const undeclaredSymbols = new Set<Signifier>();
     outer: for (const ref of this._refs) {
-      if (ref.item.def || ref.item.native || undeclaredSymbols.has(ref.item)) {
+      // Macro families also contain inactive declarations and template refs;
+      // unresolved runtime uses have separate, non-macro references.
+      if (
+        ref.item.macro ||
+        ref.item.def ||
+        ref.item.native ||
+        undeclaredSymbols.has(ref.item)
+      ) {
         continue;
       }
       // Handle global prefixes setting
@@ -696,7 +803,17 @@ export class Code {
 
   updateGlobals() {
     this.reset();
+    this.project.macros.registerSymbols(this, this.preprocessed);
     return registerGlobals(this);
+  }
+
+  /** Retire semantic contributions without changing any project files. */
+  retire() {
+    if (this.retired) return;
+    this.retired = true;
+    this.reset();
+    this.project.macros.forget(this);
+    this.project.emitDiagnostics(this, []);
   }
 
   updateAllSymbols() {

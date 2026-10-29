@@ -152,14 +152,7 @@ export async function activateStitchExtension(
       void showErrorMessage('No project found to run!');
       return;
     }
-    let lastConfig: any = ctx.workspaceState.get('lastRunConfig');
-    const isValidConfig =
-      typeof lastConfig === 'object' &&
-      'compiler' in lastConfig &&
-      'config' in lastConfig;
-    if (!isValidConfig) {
-      lastConfig = undefined;
-    }
+    const lastConfig = workspace.savedRunOptions(project);
     try {
       if (debug) {
         await startGameMakerDebugging(project, lastConfig?.config);
@@ -181,6 +174,14 @@ export async function activateStitchExtension(
     //   const code = provider.getGmlFile(editor.document);
     // }),
     workspace,
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!event.affectsConfiguration('stitch.run.defaultConfig')) return;
+      try {
+        workspace.refreshAnalysisConfigurations();
+      } catch (error) {
+        void showErrorMessage(error as Error);
+      }
+    }),
     vscode.workspace.onDidChangeTextDocument((event) =>
       workspace.onChangeDoc(event),
     ),
@@ -319,10 +320,11 @@ export async function activateStitchExtension(
         });
         if (!chosenCompiler) return;
 
-        ctx.workspaceState.update('lastRunConfig', {
+        await ctx.workspaceState.update('lastRunConfig', {
           compiler: chosenCompiler as any,
           config: chosenConfig,
         });
+        workspace.refreshAnalysisConfigurations();
 
         const when = await vscode.window.showQuickPick(
           [

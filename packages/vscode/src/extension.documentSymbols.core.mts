@@ -93,15 +93,16 @@ function belongsToAnonymousStruct(
 
 function symbolRange(item: Signifier): Range | undefined {
   if (!item.def?.file) return;
-  const declaration = item.declaration;
+  const definition = item.def.source;
+  const declaration = item.declaration?.source;
   if (
-    declaration?.file === item.def.file &&
-    declaration.start.offset <= item.def.start.offset &&
-    declaration.end.offset >= item.def.end.offset
+    declaration?.file === definition.file &&
+    declaration.start.offset <= definition.start.offset &&
+    declaration.end.offset >= definition.end.offset
   ) {
     return declaration;
   }
-  return new Range(item.def.start, item.def.end);
+  return definition;
 }
 
 function contains(parent: Range, child: Range) {
@@ -117,12 +118,16 @@ function contains(parent: Range, child: Range) {
  * into their lexical hierarchy.
  */
 export function collectGmlDocumentSymbols(file: Code): GmlDocumentSymbol[] {
+  const macros = file.project.macros.declarationsIn(file);
+  const macroItems = new Set(macros.map((declaration) => declaration.item));
   const items = new Set<Signifier>();
-  for (const reference of file.refs) {
+  for (const reference of file.sourceRefs) {
     if (
       reference.isDef &&
       !reference.item.parameter &&
-      reference.item.def?.file === file
+      !macroItems.has(reference.item) &&
+      reference.item.def?.file &&
+      reference.item.def.source.file === file
     ) {
       items.add(reference.item);
     }
@@ -146,7 +151,7 @@ export function collectGmlDocumentSymbols(file: Code): GmlDocumentSymbol[] {
         !isExcludedLocal(item) && !belongsToAnonymousStruct(item, structOwners),
     )
     .map((item): GmlDocumentSymbol | undefined => {
-      const selectionRange = item.def?.file ? item.def : undefined;
+      const selectionRange = item.def?.file ? item.def.source : undefined;
       const range = symbolRange(item);
       if (!selectionRange || !range || !item.name) return;
       return {
@@ -160,6 +165,15 @@ export function collectGmlDocumentSymbols(file: Code): GmlDocumentSymbol[] {
       };
     })
     .filter((symbol): symbol is GmlDocumentSymbol => !!symbol)
+    .concat(
+      macros.map((declaration) => ({
+        ...declaration,
+        name: declaration.item.name!,
+        detail: declaration.configuration || '',
+        kind: 'constant' as const,
+        children: [],
+      })),
+    )
     .sort(
       (a, b) =>
         a.range.start.offset - b.range.start.offset ||

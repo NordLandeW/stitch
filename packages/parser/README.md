@@ -64,6 +64,26 @@ const project = await Project.initialize('path/to/your/project.yyp');
 await project.reload();
 ```
 
+### Macro analysis and source positions
+
+Project loading collects GML macros across scripts and object events before interpreting their uses. Select the configuration explicitly when needed:
+
+```ts
+const project = await Project.initialize('path/to/your/project.yyp', {
+  configuration: 'Debug', // Must exist in this project's configuration tree.
+});
+project.setAnalysisConfiguration('Release'); // Refreshes affected code synchronously.
+console.log(project.analysisConfiguration);
+```
+
+When omitted, selection follows the build default: the first child configuration, or the root when there are no children. Macro definitions inherit along the selected configuration's ancestor chain; the nearest override wins. `Code.reload()`, `Asset.reload()` and `Project.reloadYyp()` refresh affected macro users after text or resource changes. External resource retirement removes its analysis without deleting its files.
+
+`Code.content` and public cursor queries use the original UTF-16 source text. Analysis ranges can refer to expanded text; use `Range.source` for author-written spelling and `Range.invocation` for the calling macro's diagnostic anchor. `Code.getReferenceCandidatesAt()` returns every binding at a shared physical spelling. `getReferenceAt()` returns a reference only when those candidates identify one symbol.
+
+`Project.renameEdits()` validates a complete physical edit plan before any write. `Project.renameSignifier()` applies that plan across affected files; `Code.renameSignifier()` uses the same project-wide operation, since a local binding can be spelled in another file's macro body. Ambiguous shared bindings, name capture, non-editable spellings and overlapping edits are rejected. An inactive macro with ordinary code uses must be activated through configuration selection before it can be renamed safely. Filesystem writes are not atomic across files: failed writes are reported after all started writes settle and successful writes have been reanalyzed. Keep source control backups for filesystem operations.
+
+See [macro-aware editing](../vscode/README.md#macro-aware-editing) for replacement syntax, editor behavior and analysis limits.
+
 ### View/Manage Project metadata
 
 ```ts

@@ -33,6 +33,8 @@ import { Asset, isAssetOfKind } from './project.asset.js';
 import { Code } from './project.code.js';
 import { Diagnostic } from './project.diagnostics.js';
 import { Native } from './project.native.js';
+import { ProjectMacros } from './project.macros.js';
+import { createRenameEdits, type RenameEdit } from './project.rename.js';
 import { fshDefault, vshDefault } from './shaderDefaults.js';
 import { Signifier } from './signifiers.js';
 import { StructType, Type } from './types.js';
@@ -62,6 +64,8 @@ export interface DiagnosticsEventPayload {
 export type OnDiagnostics = (diagnostics: DiagnosticsEventPayload) => void;
 
 export interface ProjectOptions {
+  /** Active GameMaker configuration; omitted uses the build's first-child/default selection. */
+  configuration?: string;
   /**
    * Register a callback to run when diagnostics are emitted.
    * If not provided, a callback can be registered after
@@ -98,6 +102,32 @@ export class Project {
   config!: StitchConfig;
 
   readonly assets = new Map<AssetName, Asset>();
+  readonly macros = new ProjectMacros(this);
+  private readonly sourceUpdates = new Set<Promise<unknown>>();
+
+  /** Keep editor queries outside async resource reads and physical rename writes. */
+  async withSourceUpdate<T>(operation: () => Promise<T>): Promise<T> {
+    const update = Promise.resolve().then(operation);
+    this.sourceUpdates.add(update);
+    try {
+      return await update;
+    } finally {
+      this.sourceUpdates.delete(update);
+    }
+  }
+
+  async whenSourcesCurrent(): Promise<void> {
+    while (this.sourceUpdates.size) await Promise.all([...this.sourceUpdates]);
+  }
+
+  get analysisConfiguration(): string {
+    return this.macros.configuration;
+  }
+
+  setAnalysisConfiguration(configuration?: string) {
+    this.macros.configure(configuration);
+    this.macros.flush();
+  }
   /**
    * Store the "native" functions, constants, and enums on
    * a per-project basis, but separately from the project-specific
@@ -258,6 +288,10 @@ export class Project {
    */
   @sequential
   async removeAssetByName(name: string | undefined) {
+    return this.withSourceUpdate(() => this.removeAssetFiles(name));
+  }
+
+  private async removeAssetFiles(name: string | undefined) {
     if (!name) return;
     name = name.toLocaleLowerCase();
     const asset = this.assets.get(name);
@@ -427,10 +461,16 @@ export class Project {
    */
   @sequential
   async renameAsset(from: string, to: string) {
+    return this.withSourceUpdate(() => this.renameAssetFiles(from, to));
+  }
+
+  private async renameAssetFiles(from: string, to: string) {
     const asset = this.getAssetByName(from, { assertExists: true });
     assertIsValidIdentifier(to);
     const toAsset = this.getAssetByName(to);
     assert(!toAsset, `Cannot rename. An asset named "${to}" already exists`);
+    // Reject capture or ambiguous macro spellings before changing resource files.
+    this.renameEdits(asset.signifier, to);
 
     // Create a new asset with the new name, copying over the old asset's files and updating them as needed
     const newAssetDir = asset.dir.up().join(to);
@@ -522,7 +562,9 @@ export class Project {
     await this.initiallyParseAssetCode([newAsset]);
 
     // Update the code from all refs to have the new name
-    await this.renameSignifier(asset.signifier, to);
+    await this.applyRenameEdits(
+      createRenameEdits(asset.signifier, to, newAsset.signifier),
+    );
 
     if (isAssetOfKind(newAsset, 'objects')) {
       // Update immediate children to have the new asset as the parent
@@ -537,16 +579,44 @@ export class Project {
     }
   }
 
+  renameEdits(signifier: Signifier, newName: string) {
+    return createRenameEdits(signifier, newName);
+  }
+
   async renameSignifier(signifier: Signifier, newName: string) {
-    assertIsValidIdentifier(newName);
-    // Rename the signifier
-    const files = new Set<Code>();
-    signifier.refs.forEach((ref) => files.add(ref.start.file));
-    const waits: Promise<any>[] = [];
-    for (const file of files) {
-      waits.push(file.renameSignifier(signifier, newName));
+    await this.applyRenameEdits(this.renameEdits(signifier, newName));
+  }
+
+  private async applyRenameEdits(edits: readonly RenameEdit[]) {
+    const grouped = new Map<Code, RenameEdit[]>();
+    for (const edit of edits) {
+      let fileEdits = grouped.get(edit.range.file);
+      if (!fileEdits) grouped.set(edit.range.file, (fileEdits = []));
+      fileEdits.push(edit);
     }
-    await Promise.all(waits);
+    const updates = [...grouped].map(
+      ([code, fileEdits]) => [code, code.renamedContent(fileEdits)] as const,
+    );
+    await this.withSourceUpdate(async () => {
+      // A failed write must not release the gate while a sibling still writes.
+      // Successful files still need publication; filesystem writes are not atomic
+      // across files, and their actual outcome must remain visible after failure.
+      const results = await Promise.allSettled(
+        updates.map(([code, text]) => code.path.write(text)),
+      );
+      const errors: unknown[] = [];
+      for (const [index, result] of results.entries()) {
+        if (result.status === 'rejected') errors.push(result.reason);
+        else await updates[index][0].parse(updates[index][1]);
+      }
+      this.macros.flush();
+      if (errors.length === 1) throw errors[0];
+      if (errors.length)
+        throw new AggregateError(
+          errors,
+          'Some renamed source files could not be written',
+        );
+    });
   }
 
   @sequential
@@ -1281,23 +1351,27 @@ export class Project {
    * Call to reload the project's yyp file (e.g. because it has changed
    * on disk) and add/remove any resources.
    */
-  async reloadYyp() {
-    // Update the YYP and identify new/deleted assets
-    // const oldYyp = this.yyp;
+  reloadYyp() {
+    return this.withSourceUpdate(() => this.reloadProjectSources());
+  }
+
+  private async reloadProjectSources() {
     assert(this.yypPath, 'Cannot reload YYP without a path');
     this.yyp = await Yy.read(this.yypPath.absolute, 'project');
-
-    // // NOTE: This is disabled because it's doesn't behave well
-    // // Remove old assets
-    // const assetIds = new Map(
-    //   this.yyp.resources.map((r) => [r.id.path, r.id]),
-    // );
-    // const removedAssets = oldYyp.resources.filter(
-    //   (r) => !assetIds.has(r.id.path),
-    // );
-    // for (const removedAsset of removedAssets) {
-    //   await this.removeAssetByName(removedAsset.id.name);
-    // }
+    const active = new Map(
+      this.yyp.resources.map((resource) => [
+        resource.id.name.toLocaleLowerCase(),
+        this.dir.join(resource.id.path).absolute.toLocaleLowerCase(),
+      ]),
+    );
+    for (const [name, asset] of this.assets) {
+      // Compare the loaded path, not resource metadata that a caller may have edited.
+      if (active.get(name) === asset.yyPath.absolute.toLocaleLowerCase())
+        continue;
+      asset.retire();
+      this.assets.delete(name);
+    }
+    this.macros.configurationTreeChanged();
 
     // Add new assets
     const newAssets = await this.loadAssets();
@@ -1311,6 +1385,8 @@ export class Project {
    * @internal
    * Initialize a collection of new assets by parsing their GML */
   initiallyParseAssetCode(assets: Asset[]) {
+    const codes = assets.flatMap((asset) => asset.gmlFilesArray);
+    this.macros.preparePending();
     // Do scripts before objects
     assets = [...assets.values()].sort((a, b) => {
       if (a.assetKind === b.assetKind) {
@@ -1360,6 +1436,8 @@ export class Project {
     for (const asset of assets) {
       asset.updateDiagnostics();
     }
+    this.macros.complete(codes);
+    this.macros.flush();
   }
 
   protected async initialize(options?: ProjectOptions): Promise<void> {
@@ -1386,6 +1464,7 @@ export class Project {
       this.yypWaiter,
       this.loadHelpLinks(),
     ]);
+    this.macros.configure(options?.configuration);
 
     const assets = await this.loadAssets(options);
     log.log(

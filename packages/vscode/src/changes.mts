@@ -151,7 +151,7 @@ export class ChangeTracker {
           if (!asset) {
             logger.warn(`No asset found for yy file "${uri.fsPath}".`);
           }
-          await asset?.reload();
+          if (asset) await this.provider.reloadAsset(asset);
         }
 
         // Changes to art assets should be accumulated with timestamps

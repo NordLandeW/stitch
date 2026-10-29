@@ -1,5 +1,16 @@
 # Stitch Changelog
 
+## Unreleased
+
+### Features
+
+- Add project-wide macro analysis with configuration overrides, nested replacements, continuations, and caller-context binding.
+- Map macro-aware navigation, references, rename, completion, signatures, and semantic highlighting to the original source.
+
+### Fixes
+
+- Refresh unchanged macro users after configuration, open-buffer, and resource changes, and reject ambiguous shared-body renames.
+
 ## 1.81.0 (2026-01-11)
 
 ### Features

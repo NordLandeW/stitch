@@ -134,7 +134,10 @@ export class StitchWorkspaceSymbolProvider
     symbols: SymbolResults,
     isMatch: SearchMatcher,
   ): SymbolResults {
-    for (const item of project.self.listMembers()) {
+    for (const item of [
+      ...project.macros.activeSymbols(),
+      ...project.self.listMembers(),
+    ]) {
       // Assets are already handled by the resource cache.
       if (!symbols.has(item)) {
         const symbol = this.signifierToSymbol(item, isMatch);

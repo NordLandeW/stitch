@@ -23,8 +23,12 @@ type TestSignifier = Signifier & {
 };
 
 function createFixture() {
-  const file = { refs: [] } as unknown as Code;
-  const refs = file.refs as any[];
+  const refs: any[] = [];
+  const file = {
+    refs,
+    sourceRefs: refs,
+    project: { macros: { declarationsIn: () => [] } },
+  } as unknown as Code;
   const rootContainer = {
     kind: 'Struct',
     signifier: { asset: true },

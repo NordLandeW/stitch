@@ -69,12 +69,27 @@ export class GameMakerSemanticTokenProvider
         ReferenceableType,
         { type: SemanticTokenType; mods: Set<SemanticTokenModifier> }
       >();
-      for (const ref of file.refs) {
+      const spellings = new Map<
+        string,
+        { ref: Reference; ambiguous: boolean }
+      >();
+      for (const ref of file.sourceRefs) {
+        const source = ref.source;
+        const key = `${source.start.offset}:${source.end.offset}`;
+        const previous = spellings.get(key);
+        if (!previous) spellings.set(key, { ref, ambiguous: false });
+        else if (inferSemanticToken(previous.ref) !== inferSemanticToken(ref))
+          previous.ambiguous = true;
+      }
+      let previousEnd = -1;
+      for (const { ref, ambiguous } of spellings.values()) {
+        const source = ref.source;
         if (
-          !ref.start ||
-          isNaN(ref.start.line) ||
-          !ref.end ||
-          isNaN(ref.end.line)
+          source.file !== file ||
+          !Number.isFinite(source.start.line) ||
+          !Number.isFinite(source.end.line) ||
+          source.start.line !== source.end.line ||
+          source.start.offset <= previousEnd
         ) {
           continue;
         }
@@ -89,6 +104,11 @@ export class GameMakerSemanticTokenProvider
           continue;
         }
         const range = locationOf(ref)!.range;
+        previousEnd = source.end.offset;
+        if (ambiguous) {
+          tokensBuilder.push(range, 'variable', []);
+          continue;
+        }
         // If we've already seen this symbol, use the cached semantic details
         if (cache.has(signifier)) {
           const { type, mods } = cache.get(signifier)!;

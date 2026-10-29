@@ -74,10 +74,10 @@ export function locationOf(thing: Range | string): vscode.Location | undefined {
       new vscode.Position(0, 0),
     );
   }
-  // Get a vscode.Range from the thing
+  const source = thing.source;
   return new vscode.Location(
-    vscode.Uri.file(thing.file.path.absolute),
-    rangeFrom(thing),
+    vscode.Uri.file(source.file.path.absolute),
+    rangeFrom(source),
   );
 }
 
@@ -85,9 +85,10 @@ export function rangeFrom(
   location: DiagnosticsEventPayload['diagnostics'][number]['location'],
 ) {
   return logThrown(() => {
+    const source = 'source' in location ? (location as Range).source : location;
     return new vscode.Range(
-      new vscode.Position(location.start.line - 1, location.start.column - 1),
-      new vscode.Position(location.end.line - 1, location.end.column),
+      new vscode.Position(source.start.line - 1, source.start.column - 1),
+      new vscode.Position(source.end.line - 1, source.end.column),
     );
   });
 }

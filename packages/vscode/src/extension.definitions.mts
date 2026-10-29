@@ -1,4 +1,4 @@
-import { isAssetOfKind } from '@bscotch/gml-parser';
+import { isAssetOfKind, type Reference } from '@bscotch/gml-parser';
 import vscode from 'vscode';
 import type { StitchWorkspace } from './extension.workspace.mjs';
 import { locationOf, registerCommand } from './lib.mjs';
@@ -13,10 +13,26 @@ export class StitchDefinitionsProvider implements vscode.DefinitionProvider {
   ): Promise<vscode.Definition | undefined> {
     const file = await this.workspace.ensureDocumentCurrent(document, token);
     const offset = document.offsetAt(position);
-    const ref = file?.getReferenceAt(offset);
-    const item = ref?.item;
+    const locations = new Map<string, vscode.Location>();
+    for (const ref of file?.getReferenceCandidatesAt(offset) || []) {
+      const location = this.definitionOf(ref);
+      if (!location) continue;
+      const range = location.range;
+      locations.set(
+        `${location.uri}:${range.start.line}:${range.start.character}:${range.end.line}:${range.end.character}`,
+        location,
+      );
+    }
+    const results = [...locations.values()];
+    return results.length === 1
+      ? results[0]
+      : results.length
+        ? results
+        : undefined;
+  }
 
-    if (!item) return;
+  private definitionOf(ref: Reference): vscode.Location | undefined {
+    const item = ref.item;
 
     const assetName = item?.asset
       ? item.name

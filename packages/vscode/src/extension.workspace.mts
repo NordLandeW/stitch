@@ -31,7 +31,7 @@ import {
   pathyFromUri,
   showProgress,
 } from './lib.mjs';
-import { info, logger, warn } from './log.mjs';
+import { info, logger, warn, showErrorMessage } from './log.mjs';
 
 export class StitchWorkspace implements vscode.SignatureHelpProvider {
   readonly semanticHighlightProvider = new GameMakerSemanticTokenProvider(this);
@@ -142,6 +142,16 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
           },
         );
         try {
+          this.selectAnalysisConfiguration(
+            project,
+            this.configuredRunConfiguration(project),
+          );
+        } catch (error) {
+          void showErrorMessage(
+            `${String(error)}. Analysis remains on ${project.analysisConfiguration}.`,
+          );
+        }
+        try {
           await project.syncIncludedFiles();
         } catch {}
         progress.report({
@@ -157,6 +167,63 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
       this.projects.length,
     );
     return project;
+  }
+
+  savedRunOptions(
+    project: Project,
+  ): { config: string; compiler?: 'vm' | 'yyc' } | undefined {
+    const saved = this.ctx.workspaceState.get<{
+      config?: unknown;
+      compiler?: unknown;
+    }>('lastRunConfig');
+    if (!saved || typeof saved.config !== 'string' || !('compiler' in saved))
+      return;
+    // The last target belongs to the workspace; another project may not define it.
+    if (saved.config && !project.configs.includes(saved.config)) return;
+    return {
+      config: saved.config,
+      compiler:
+        saved.compiler === 'vm' || saved.compiler === 'yyc'
+          ? saved.compiler
+          : undefined,
+    };
+  }
+
+  private configuredRunConfiguration(project: Project): string | undefined {
+    return (
+      (this.savedRunOptions(project)?.config ??
+        stitchConfig.runConfigDefault) ||
+      undefined
+    );
+  }
+
+  selectAnalysisConfiguration(project: Project, configuration?: string) {
+    project.setAnalysisConfiguration(configuration);
+    this.semanticHighlightProvider.refresh();
+    this.scheduleDiagnostics(project);
+  }
+
+  refreshAnalysisConfigurations() {
+    for (const project of this.projects) {
+      try {
+        this.selectAnalysisConfiguration(
+          project,
+          this.configuredRunConfiguration(project),
+        );
+      } catch (error) {
+        void showErrorMessage(
+          `${String(error)}. Analysis remains on ${project.analysisConfiguration}.`,
+        );
+      }
+    }
+  }
+
+  async reloadAsset(asset: Asset) {
+    await asset.reload((code) =>
+      this.openDocument(vscode.Uri.file(code.path.absolute))?.getText(),
+    );
+    this.semanticHighlightProvider.refresh();
+    this.scheduleDiagnostics(asset.project);
   }
 
   async deleteAsset(asset: Asset) {
@@ -208,6 +275,15 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     token?: vscode.CancellationToken,
     immediate = true,
   ): Promise<Code | undefined> {
+    return this.ensureBufferCurrent(document, token, immediate, true);
+  }
+
+  private async ensureBufferCurrent(
+    document: vscode.TextDocument,
+    token: vscode.CancellationToken | undefined,
+    immediate: boolean,
+    scanMacroBuffers: boolean,
+  ): Promise<Code | undefined> {
     if (
       this.disposed ||
       document.isClosed ||
@@ -215,6 +291,37 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
       document.languageId !== 'gml' ||
       document.uri.scheme !== 'file'
     )
+      return;
+    const project = this.getProject(document);
+    if (!project) return;
+    await project.whenSourcesCurrent();
+    // A changed macro buffer invalidates other unchanged documents before their
+    // own text-only queue can legitimately take its fast path.
+    if (scanMacroBuffers) {
+      for (const other of vscode.workspace.textDocuments) {
+        if (
+          other === document ||
+          other.isClosed ||
+          other.languageId !== 'gml' ||
+          other.uri.scheme !== 'file' ||
+          this.getProject(other) !== project
+        )
+          continue;
+        const otherCode = this.getGmlFile(other);
+        if (!otherCode) continue;
+        const text = other.getText();
+        if (
+          text !== otherCode.content &&
+          (text.includes('#macro') || otherCode.content.includes('#macro'))
+        ) {
+          await this.analysis.flush(otherCode, {
+            version: other.version,
+            text,
+          });
+        }
+      }
+    }
+    if (this.disposed || document.isClosed || token?.isCancellationRequested)
       return;
     const code = this.getGmlFile(document);
     if (!code) return;
@@ -251,7 +358,9 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     );
     const versions = buffers.map((other) => other.version);
     for (const other of buffers) {
-      if (!(await this.ensureDocumentCurrent(other, token))) return;
+      // Every buffer is flushed once; macro updates refresh their users. The
+      // final document query scans foreign macros once instead of once per buffer.
+      if (!(await this.ensureBufferCurrent(other, token, true, false))) return;
     }
     if (
       buffers.some(

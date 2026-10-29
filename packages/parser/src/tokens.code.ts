@@ -5,15 +5,10 @@ import { identifier, numericLiterals } from './tokens.shared.js';
 export const codeTokens = [
   //#region Whitespace and comments
 
-  // Lines can end with a "\" character, which is required
-  // by GML in multi-line macros but not needed anywhere else.
-  // Outside of that, "\" is only used in strings as an escape character.
-  // Stitch doesn't allow macros to be invalid standalone code anyway,
-  // so if we just treat "\" characters (outside of strings) as whitespace
-  // and ignore them we can treat macros like variables.
+  // Preserve backslashes as Escape tokens for macro logical-line collection.
   createToken({
     name: 'WhiteSpace',
-    pattern: /[ \t\n\r\\]+/,
+    pattern: /[ \t\n\r]+/,
     line_breaks: true,
     group: Lexer.SKIPPED,
   }),
@@ -36,14 +31,14 @@ export const codeTokens = [
   createToken({
     name: 'SingleLineComment',
     pattern: /\/\/[^\r\n]*/,
-    group: Lexer.SKIPPED,
+    group: 'comments',
     start_chars_hint: ['/'],
     categories: [c.Comment],
   }),
   createToken({
     name: 'MultiLineComment',
     pattern: /(?<!\\)\/\*([\r\n]|.)*?(?<!\\)\*\//,
-    group: Lexer.SKIPPED,
+    group: 'comments',
     line_breaks: true,
     start_chars_hint: ['/'],
     categories: [c.Comment],
@@ -52,7 +47,7 @@ export const codeTokens = [
   createToken({
     name: 'MultiLineCommentNotTerminated',
     pattern: /(?<!\\)\/\*([\r\n]|.)*/,
-    group: Lexer.SKIPPED,
+    group: 'comments',
     line_breaks: true,
     start_chars_hint: ['/'],
     categories: [c.Comment],

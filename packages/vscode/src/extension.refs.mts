@@ -11,18 +11,25 @@ export class StitchReferenceProvider implements vscode.ReferenceProvider {
     _context: vscode.ReferenceContext,
     token: vscode.CancellationToken,
   ): Promise<vscode.Location[] | undefined> {
-    if (!(await this.workspace.ensureProjectCurrent(document, token))) return;
-    const symbol = this.workspace.getSignifier(document, position);
-    if (!symbol) {
-      return;
-    }
-    return [...symbol.refs.values()]
-      .map((ref) => {
-        const range = locationOf(ref);
-        if (!range) return;
-        return range;
-      })
-      .filter((loc) => !!loc) as vscode.Location[];
+    const file = await this.workspace.ensureProjectCurrent(document, token);
+    if (!file) return;
+    const symbols = new Set(
+      file
+        .getReferenceCandidatesAt(document.offsetAt(position))
+        .map((ref) => ref.item),
+    );
+    const locations = new Map<string, vscode.Location>();
+    for (const symbol of symbols)
+      for (const reference of symbol.refs) {
+        const location = locationOf(reference);
+        if (!location) continue;
+        const range = location.range;
+        locations.set(
+          `${location.uri}:${range.start.line}:${range.start.character}:${range.end.line}:${range.end.character}`,
+          location,
+        );
+      }
+    return [...locations.values()];
   }
 
   static register(workspace: StitchWorkspace) {

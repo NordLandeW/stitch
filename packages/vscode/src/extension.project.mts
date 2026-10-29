@@ -149,6 +149,8 @@ export class GameMakerProject extends Project {
     debug?: boolean;
     debuggerPort?: number;
   }): Promise<boolean> {
+    const config = options?.config ?? stitchConfig.runConfigDefault;
+    this.setAnalysisConfiguration(config || undefined);
     if (stitchConfig.killOthersOnRun && !options?.clean) {
       await this.kill();
     }
@@ -157,7 +159,6 @@ export class GameMakerProject extends Project {
       options?.clean ? 'clean-project-start' : 'run-project-start',
       this,
     );
-    const config = options?.config ?? stitchConfig.runConfigDefault;
     let compiler = options?.compiler ?? stitchConfig.runCompilerDefault;
     if (['yyc', 'vm'].indexOf(compiler) === -1) {
       compiler = stitchConfig.runCompilerDefault;
@@ -264,8 +265,10 @@ export class GameMakerProject extends Project {
     yypPath: vscode.Uri,
     onDiagnostics: OnDiagnostics,
     onProgress: (increment: number, message?: string) => void,
+    configuration?: string,
   ) {
     const options: ProjectOptions = {
+      configuration,
       onDiagnostics,
       onLoadProgress: onProgress,
       settings: {

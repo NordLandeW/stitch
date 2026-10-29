@@ -16,8 +16,7 @@ export interface GmlParsed {
 
 export class GmlParser extends CstParser {
   /** Parse GML Code, e.g. from a file. */
-  parse(code: string): GmlParsed {
-    const lexed = this.lexer.tokenize(code);
+  parse(code: string, lexed = this.lexer.tokenize(code)): GmlParsed {
     this.input = lexed.tokens;
     const cst = this.file();
     return {

@@ -19,6 +19,12 @@ export interface IRange {
   end: IPosition;
 }
 
+/** Snapshot of the expansion that produced an analysis range. */
+export interface SourceMapping {
+  project(range: Range, invocation: boolean): Range;
+  editable(range: Range): boolean;
+}
+
 /**
  * Single-character tokens do not have correct end
  * location information. This function checks the `image`
@@ -118,7 +124,18 @@ export class Range implements IRange {
   public start: Position;
   public end: Position;
 
-  constructor(start: Position, end?: Position) {
+  private projected?: {
+    start: number;
+    end: number;
+    source: Range;
+    invocation: Range;
+  };
+
+  constructor(
+    start: Position,
+    end?: Position,
+    readonly mapping: SourceMapping | null = start.file.sourceMapping || null,
+  ) {
     // We can get into some weird cases when recovering
     // from parse errors, so do some checks with graceful
     // recovery.
@@ -131,6 +148,41 @@ export class Range implements IRange {
 
   get file(): Code {
     return this.start.file;
+  }
+
+  /** Physical author-written spelling; analysis coordinates stay on this Range. */
+  get source(): Range {
+    return this.projectedRanges().source;
+  }
+
+  /** Physical invocation anchor for diagnostics spanning expanded text. */
+  get invocation(): Range {
+    return this.projectedRanges().invocation;
+  }
+
+  get sourceEditable(): boolean {
+    return this.mapping?.editable(this) ?? true;
+  }
+
+  private projectedRanges() {
+    if (!this.mapping) return { source: this, invocation: this };
+    if (
+      !this.projected ||
+      this.projected.start !== this.start.offset ||
+      this.projected.end !== this.end.offset
+    ) {
+      this.projected = {
+        start: this.start.offset,
+        end: this.end.offset,
+        source: this.mapping.project(this, false),
+        invocation: this.mapping.project(this, true),
+      };
+    }
+    return this.projected;
+  }
+
+  static physical(start: Position, end: Position = start): Range {
+    return new Range(start, end, null);
   }
 
   static from(file: Code, location: IRange | CstNodeLocation): Range {
@@ -257,8 +309,9 @@ export class Reference extends Range {
     public item: Signifier,
     start: Position,
     end: Position,
+    mapping?: SourceMapping | null,
   ) {
-    super(start, end);
+    super(start, end, mapping);
   }
 
   get itemNamePattern(): RegExp {
@@ -273,15 +326,20 @@ export class Reference extends Range {
    * the text of the item it refers to (e.g. it could be `self` or similar)
    */
   get text(): string {
-    return this.start.file.content.slice(
-      this.start.offset,
-      this.end.offset + 1,
+    const source = this.source;
+    return source.file.content.slice(
+      source.start.offset,
+      source.end.offset + 1,
     );
   }
 
   get isRenameable(): boolean {
     const text = this.text;
-    return this.item.isRenameable && this.itemNamePattern.test(text);
+    return (
+      this.sourceEditable &&
+      this.item.isRenameable &&
+      this.itemNamePattern.test(text)
+    );
   }
 
   /**
@@ -295,6 +353,6 @@ export class Reference extends Range {
 
   static fromRange(range: Range, item: ReferenceableType) {
     assert(range, 'Cannot create a reference from an undefined range.');
-    return new Reference(item, range.start, range.end);
+    return new Reference(item, range.start, range.end, range.mapping);
   }
 }

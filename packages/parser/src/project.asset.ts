@@ -715,7 +715,15 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     return gml;
   }
 
-  async reload() {
+  reload(buffer?: (code: Code) => string | undefined) {
+    return this.project.withSourceUpdate(() => this.reloadSources(buffer));
+  }
+
+  private async reloadSources(buffer?: (code: Code) => string | undefined) {
+    const wasInitialized =
+      this.initalized.globals ||
+      this.initalized.locals ||
+      this.project.getAssetByName(this.name) === this;
     // Find all immediate children, which might include legacy GML files
 
     const [, children] = await Promise.all([
@@ -725,7 +733,6 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     if (this.assetKind === 'scripts') {
       this.addScriptFile(children as Pathy<string>[]);
     } else if (this.assetKind === 'objects') {
-      this.gmlFiles.clear();
       this.addObjectFile(children as Pathy<string>[]);
     } else if (this.assetKind === 'extensions') {
       const diagnostics: Diagnostic[] = [];
@@ -818,7 +825,27 @@ export class Asset<T extends YyResourceType = YyResourceType> {
 
       this.project.emitDiagnostics(this.yyPath.absolute, diagnostics);
     }
-    await this.initiallyReadAndParseGml();
+    await this.initiallyReadAndParseGml(buffer);
+    if (wasInitialized) {
+      this.initalized.globals = false;
+      this.initalized.locals = false;
+      this.project.initiallyParseAssetCode([this]);
+    }
+  }
+
+  /** External resource retirement must not delete author-owned files. */
+  retire() {
+    for (const code of this.gmlFiles.values()) code.retire();
+    this.gmlFiles.clear();
+    if (
+      this.project.self.getMember(this.signifier.name, true) === this.signifier
+    ) {
+      this.project.self.removeMember(this.signifier.name);
+    }
+    for (const name of [this.typeName, this.instanceTypeName]) {
+      if (this.project.types.get(name)?.signifier === this.signifier)
+        this.project.types.delete(name);
+    }
   }
 
   async onRemove() {
@@ -840,13 +867,49 @@ export class Asset<T extends YyResourceType = YyResourceType> {
   }
 
   protected addObjectFile(children: Pathy<string>[]) {
-    // Objects have one file per event, named after the event.
-    // The YY file includes the list of events, but references them by
-    // numeric identifiers instead of their name. For now we'll just
-    // assume that the GML files are correct.
-    children
-      .filter((p) => p.hasExtension('gml'))
-      .forEach((p) => this.addGmlFile(p));
+    // YY identifies every subtype; the sidebar's event labels cover only a subset.
+    const prefixes: Record<number, string> = {
+      0: 'Create',
+      1: 'Destroy',
+      2: 'Alarm',
+      3: 'Step',
+      4: 'Collision',
+      5: 'Keyboard',
+      6: 'Mouse',
+      7: 'Other',
+      8: 'Draw',
+      9: 'KeyPress',
+      10: 'KeyRelease',
+      12: 'CleanUp',
+      13: 'Gesture',
+    };
+    const active = new Set(
+      (this.yy as YyObject).eventList.flatMap((event) => {
+        const prefix = prefixes[event.eventType];
+        const suffix =
+          event.eventType === 4
+            ? event.collisionObjectId?.name
+            : event.eventNum;
+        return prefix && suffix !== undefined
+          ? [`${prefix}_${suffix}.gml`.toLocaleLowerCase()]
+          : [];
+      }),
+    );
+    this.reconcileGmlFiles(
+      children.filter((path) => active.has(path.basename.toLocaleLowerCase())),
+    );
+  }
+
+  private reconcileGmlFiles(paths: Pathy<string>[]) {
+    const active = new Set(
+      paths.map((path) => path.absolute.toLocaleLowerCase()),
+    );
+    for (const [key, code] of this.gmlFiles) {
+      if (active.has(key)) continue;
+      code.retire();
+      this.gmlFiles.delete(key);
+    }
+    for (const path of paths) this.addGmlFile(path);
   }
 
   protected addScriptFile(children: Pathy<string>[]) {
@@ -861,17 +924,26 @@ export class Asset<T extends YyResourceType = YyResourceType> {
       logger.error(
         `Script ${this.name} has ${matches.length} GML files. Expected 1.`,
       );
-    } else {
-      this.addGmlFile(matches[0]);
     }
+    this.reconcileGmlFiles(matches.length === 1 ? matches : []);
   }
 
-  protected async initiallyReadAndParseGml() {
-    const parseWaits: Promise<any>[] = [];
-    for (const file of this.gmlFilesArray) {
-      parseWaits.push(file.parse());
-    }
-    return await Promise.all(parseWaits);
+  protected async initiallyReadAndParseGml(
+    buffer?: (code: Code) => string | undefined,
+  ) {
+    const contents = await Promise.all(
+      this.gmlFilesArray.map(async (code) => {
+        const previous = code.content;
+        return { code, previous, text: await code.path.read() };
+      }),
+    );
+    await Promise.all(
+      contents.map(({ code, previous, text }) =>
+        code.parse(
+          buffer?.(code) ?? (code.content !== previous ? code.content : text),
+        ),
+      ),
+    );
   }
 
   get assetTypeKind() {

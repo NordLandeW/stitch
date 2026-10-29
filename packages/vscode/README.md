@@ -29,6 +29,26 @@ There are a lot of ways you can support this project:
 
 Stitch provides Intellisense (auto-complete, hovertext, function signature helpers, go-to-definition, find-references, etc) for all built-in and user-defined symbols.
 
+#### Macro-aware editing
+
+Stitch expands project-wide GML `#macro` definitions before parsing their uses. Definitions can appear later in the same file or in another script or object event. Nested macros, backslash continuations, multiline verbatim strings and replacement fragments are interpreted in the calling code's context. Semicolons remain part of the replacement text.
+
+```gml
+#macro VALUE local_value
+#macro DEBUG_VALUE VALUE
+
+function example() {
+    var local_value = 7;
+    return DEBUG_VALUE;
+}
+```
+
+Here `DEBUG_VALUE` navigates to its macro declaration, while `local_value` in the replacement refers to the calling function's local variable. If a shared macro body binds to different variables at different uses, Go to Definition and Find References retain those targets. Rename rejects that ambiguous shared spelling rather than changing unrelated variables. Renaming a macro updates its declarations across configurations and its discoverable uses. If a macro is inactive in the selected configuration and has ordinary code uses, select a configuration that activates it before renaming; this keeps those uses separate from same-named runtime symbols.
+
+Analysis follows the [selected run configuration](#-running-your-project), including inherited `#macro Configuration:NAME` overrides. Changing the selection, editing an open macro buffer or adding/removing a project resource refreshes unchanged users. Diagnostics point to physical source positions, and semantic highlighting marks macro names separately from the variables in their replacements.
+
+Recursive expansions and incomplete definitions produce diagnostics. Expansion has a bounded analysis budget: an over-budget invocation remains available for navigation, and later ordinary statements are still analyzed. Empty replacement bodies are treated as incomplete for analysis; compiler-specific empty-body behavior is not inferred. Expanded code retains the parser's existing GML syntax and type-inference limitations.
+
 ### 📛 Renaming
 
 Since Stitch knows about all of your project's symbols, it can also rename them for you! Use the hotkey (`F2` by default) or the right-click context menu to "Rename" a symbol. You can also rename assets via the tree view (while maintaining parent/child relationships). Stitch will auto-rename all references to the symbol, including in JSDoc comments.
@@ -261,7 +281,7 @@ You can choose whether to run via VM or YYC, and which config to use.
 
 Check out Stitch settings to configure how your project is run. In particular:
 
-- `stitch.run.defaultConfig`: Choose a run configuration to use as the default (defaults to "Default"). This will remain the default until you update your Target.
+- `stitch.run.defaultConfig`: Choose the GameMaker configuration used for running and macro analysis. The default is `null`, which selects the project's first child configuration, or its root configuration when it has no children. A target previously saved by the run picker takes precedence over this setting; choosing **Run Later** also saves the target and refreshes analysis. A saved target absent from the current project is ignored. Invalid explicit selections are reported, with analysis retaining its last valid configuration.
 - `stitch.run.defaultCompiler`: Choose whether to use the VM or YYC compiler (defaults to "VM"). This will remain the default until you update your Target.
 - `stitch.run.inTerminal`: By default Stitch opens a terminal in VSCode and runs your project there, using your default terminal settings. Set this to `false` to use the Stitch Runner Panel instead.
 
@@ -370,7 +390,6 @@ The nice thing about being in the VSCode ecosystem is that there are TONS of oth
 To see the current list of known issues and feature requests, check out the [issues page](https://github.com/bscotch/stitch/issues?q=is%3Aopen+is%3Aissue+label%3A%22%3Akeyboard%3A+vscode%22).
 
 - 😕 **Code only**. Stitch leverages VSCode's power for editing _code_, and makes no attempt to provide visual editors for any type of GameMaker asset.
-- 😕 **Macro limitations**. The Stitch parser can only handle macros that are set to simple and complete expressions. There are no plans to extend the parser to support more complex macro usage.
 - 😕 **Variable Definitions** via the UI are not supported. Since instance variables can be defined in code (via Creation events) we don't also support defining them via the "Variable Definitions" feature of Objects. If for some reason you need that feature, please provide context on the [associated issue](https://github.com/bscotch/stitch/issues/205)!
 - 😕 **Extraneous Curlies**. To avoid some parser complexity, the Stitch parser does not support extraneous curly braces (`{}`). For example, if a random section of code (not following a `for`, `if`, etc) is wrapped in curlies, the parser will emit errors.
 - 😕 **IIFFEs**. Stitch does not support IIFEs (immediately-invoked function expressions), e.g. `(function(){})()`. This is due to parser complexity, but pull requests addressing this are welcome!
