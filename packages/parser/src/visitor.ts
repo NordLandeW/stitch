@@ -642,8 +642,8 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     for (const entry of children.structLiteralEntry || []) {
       const parts = entry.children;
       // Visit the JSDocs, if there are any
-      if (parts.jsdoc) {
-        this.visit(parts.jsdoc, ctx);
+      for (const doc of parts.jsdoc || []) {
+        this.visit(doc, ctx);
       }
       const docs = this.PROCESSOR.consumeJsdoc();
       // The name is either a direct variable name or a string literal.

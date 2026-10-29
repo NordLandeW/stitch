@@ -11,6 +11,7 @@ import { GmlLexer } from './lexer.js';
 import type { GmlParseError } from './project.diagnostics.js';
 import type { Reference, ReferenceableType } from './project.location.js';
 import type { Signifier } from './signifiers.js';
+import { attachJsdoc, separateJsdoc } from './syntax/trivia.js';
 import { c, categories, t, tokens } from './tokens.js';
 import type { Type, TypeStore } from './types.js';
 
@@ -34,9 +35,12 @@ export class GmlParser extends CstParser {
 
   /** Parse GML Code, e.g. from a file. */
   parse(code: string, lexed = this.lexer.tokenize(code)): GmlParsed {
-    this.input = lexed.tokens;
+    const trivia = separateJsdoc(lexed.tokens);
+    const input = trivia?.tokens || lexed.tokens;
+    this.input = input;
     let cst = this.file();
     const errors: GmlParseError[] = [];
+    const rootRecovery: IToken[] | undefined = trivia ? [] : undefined;
     let chunk = cst;
     let searchFrom = 0;
     for (;;) {
@@ -64,15 +68,17 @@ export class GmlParser extends CstParser {
       if (!remaining) break;
       // indexOf resumes at the last boundary: all searches together visit at
       // most the token vector once. LA presents the suffix without copying it.
-      const index = lexed.tokens.indexOf(remaining.token, searchFrom);
+      const index = input.indexOf(remaining.token, searchFrom);
       if (index < searchFrom) break;
+      rootRecovery?.push(remaining.token);
       searchFrom = index + 1;
-      if (searchFrom >= lexed.tokens.length) break;
-      this.input = lexed.tokens;
+      if (searchFrom >= input.length) break;
+      this.input = input;
       this.rootOffset = searchFrom;
       chunk = this.file();
     }
     this.errors = errors;
+    if (trivia) attachJsdoc(cst, trivia, rootRecovery);
     return { lexed, cst, errors };
   }
 

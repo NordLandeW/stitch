@@ -65,6 +65,8 @@ Since Stitch knows about all of your project's symbols, it can also rename them 
 
 GameMaker includes a type system called "Feather", which Stitch builds upon. Stitch does take a different overall approach and provides some extensions to the Feather type system and additional features that are not currently available in GameMaker.
 
+JSDoc-shaped comments can appear within expressions without splitting the code or changing argument positions. Leading declaration, call-argument and struct-member annotations continue to supply types and documentation. Comments in the middle of an expression or a formal parameter list are ordinary trivia; document function parameters with `@param` above the function. Region titles may contain punctuation and other comment text. Use LF or CRLF line endings for region directives.
+
 - **Go to Type Definition:** Stitch implements the "Go To Type Definition" command, letting you quickly get from a variable to e.g. the constructor for its type.
 - **Declarations FTW:** Unlike Feather, Stitch only infers types at the time an identifier is _declared_. When a variable is declared without assignment, Stitch will infer its type using the first assignment it sees, but that might result in surprises! For best results, use the `@type` JSDoc tag to specify the type of a variable when it is declared if there is any ambiguity. (Typescript and JavaScript+JSDoc programmers will be familiar with this approach.)
 - **Union Type Support:** Feather technically supports "union" types (e.g. `String|Number`), but with limitations. Stitch tries to provide more robust support for union types, though this is a work in progress.

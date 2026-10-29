@@ -322,8 +322,8 @@ function processFunctionArguments(
       if (expectedType) {
         functionCtx.type = expectedType.type;
       }
-      if (token.children.jsdoc) {
-        visitor.jsdoc(token.children.jsdoc[0].children, functionCtx);
+      for (const doc of token.children.jsdoc || []) {
+        visitor.jsdoc(doc.children, functionCtx);
       }
       const rhs = token.children.assignmentRightHandSide?.[0];
       if (!rhs) {

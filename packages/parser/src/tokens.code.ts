@@ -23,7 +23,7 @@ export const codeTokens = [
   }),
   createToken({
     name: 'JsdocJs',
-    pattern: /\/\*\*([\r\n]|.)*?\*\//,
+    pattern: /\/\*\*(?!\/)([\r\n]|.)*?\*\//,
     start_chars_hint: ['/'],
     line_breaks: true,
     categories: [c.Jsdoc],
@@ -37,7 +37,7 @@ export const codeTokens = [
   }),
   createToken({
     name: 'MultiLineComment',
-    pattern: /(?<!\\)\/\*([\r\n]|.)*?(?<!\\)\*\//,
+    pattern: /(?<!\\)\/\*([\r\n]|.)*?\*\//,
     group: 'comments',
     line_breaks: true,
     start_chars_hint: ['/'],
@@ -280,7 +280,7 @@ export const codeTokens = [
   }),
   createToken({
     name: 'EndRegion',
-    pattern: /#endregion[^\n]*\b/,
+    pattern: /#endregion[^\n]*/,
     group: Lexer.SKIPPED,
     categories: [c.Keyword, c.Comment],
   }),

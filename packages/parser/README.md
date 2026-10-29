@@ -70,6 +70,12 @@ await project.reload();
 
 File-level recovery advances through unexpected tokens without changing their absolute source coordinates or the grammar's nested recovery rules. Empty buffers, partial calls and recovered declarations have finite ranges; cursor-like scope and argument ranges can end at EOF. Editor adapters should validate their end-exclusive projections against the target document. A missing block boundary can leave the intended scope ambiguous, and an unexpected internal-analysis failure is reported as a diagnostic rather than silently presenting complete results.
 
+### Comments and annotations
+
+GML comments are transparent to expression parsing, including `///` and `/** ... */` forms. Annotation consumers retain leading statement, call-argument and struct-member documentation. Comments inside expressions or formal parameter lists remain trivia; use `@param` above a function to document its parameters. Adjacent line-style annotations retain their original grouping and UTF-16 source positions. The returned lexer token vector still contains JSDoc tokens even though the parser excludes them from its grammar input.
+
+A backslash in block-comment text does not escape `*/`. An unfinished block comment extends to EOF during editing. Region directives consume their entire LF-terminated line, including trailing punctuation; use LF or CRLF line endings for regions.
+
 ### Macro analysis and source positions
 
 Project loading collects GML macros across scripts and object events before interpreting their uses. Select the configuration explicitly when needed:
