@@ -2,6 +2,14 @@ import { createToken, Lexer, tokenListToObject } from './tokens.lib.js';
 
 export const categories = [
   createToken({
+    name: 'BlockStart',
+    pattern: Lexer.NA,
+  }),
+  createToken({
+    name: 'BlockEnd',
+    pattern: Lexer.NA,
+  }),
+  createToken({
     name: 'Keyword',
     pattern: Lexer.NA,
   }),

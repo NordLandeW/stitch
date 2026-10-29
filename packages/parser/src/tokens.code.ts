@@ -142,13 +142,13 @@ export const codeTokens = [
   createToken({
     name: 'Begin',
     pattern: /\bbegin\b/,
-    categories: [c.Keyword, c.Separators],
+    categories: [c.Keyword, c.Separators, c.BlockStart],
     push_mode: 'code',
   }),
   createToken({
     name: 'End',
     pattern: /\bend\b/,
-    categories: [c.Keyword, c.Separators],
+    categories: [c.Keyword, c.Separators, c.BlockEnd],
     pop_mode: true,
   }),
   createToken({ name: 'If', pattern: /\bif\b/, categories: [c.Keyword] }),
@@ -504,13 +504,13 @@ export const codeTokens = [
   createToken({
     name: 'StartBrace',
     pattern: /\{/,
-    categories: [c.Separators],
+    categories: [c.Separators, c.BlockStart],
     push_mode: 'code',
   }),
   createToken({
     name: 'EndBrace',
     pattern: /\}/,
-    categories: [c.Separators],
+    categories: [c.Separators, c.BlockEnd],
     pop_mode: true,
   }),
   createToken({ name: 'Escape', pattern: /\\/, categories: [c.Separators] }),

@@ -122,6 +122,7 @@ export class GmlParser extends CstParser {
 
   readonly statement = this.RULE('statement', () => {
     this.OR([
+      { ALT: () => this.SUBRULE(this.blockStatement) },
       { ALT: () => this.SUBRULE(this.functionStatement) },
       { ALT: () => this.SUBRULE(this.localVarDeclarationsStatement) },
       { ALT: () => this.SUBRULE(this.globalVarDeclarationsStatement) },
@@ -238,6 +239,7 @@ export class GmlParser extends CstParser {
     this.CONSUME(t.Else);
     this.CONSUME(t.If);
     this.SUBRULE(this.expression);
+    this.OPTION(() => this.CONSUME(t.Then));
     this.SUBRULE(this.blockableStatement);
   });
 
@@ -248,23 +250,39 @@ export class GmlParser extends CstParser {
 
   readonly blockableStatement = this.RULE('blockableStatement', () => {
     this.OR([
-      { ALT: () => this.SUBRULE(this.statement) },
+      {
+        GATE: () =>
+          this.LA(1).tokenType !== t.StartBrace &&
+          this.LA(1).tokenType !== t.Begin,
+        ALT: () => this.SUBRULE(this.statement),
+      },
       { ALT: () => this.SUBRULE(this.blockStatement) },
     ]);
   });
 
   readonly blockableStatements = this.RULE('blockableStatements', () => {
-    this.OR([
-      { ALT: () => this.SUBRULE(this.statements) },
-      { ALT: () => this.SUBRULE(this.blockStatement) },
-    ]);
+    this.SUBRULE(this.statements);
   });
 
-  readonly blockStatement = this.RULE('blockStatement', () => {
-    this.CONSUME(t.StartBrace);
-    this.MANY(() => this.SUBRULE(this.statement));
-    this.CONSUME(t.EndBrace);
-  });
+  readonly blockStatement = this.RULE(
+    'blockStatement',
+    (requireBrace = false) => {
+      // Function bodies require a literal opening brace. Keep the existing CST
+      // keys and actual delimiter tokens for scopes, source ranges and trivia.
+      this.OR([
+        {
+          GATE: () => requireBrace,
+          ALT: () => this.CONSUME(t.StartBrace),
+        },
+        {
+          GATE: () => !requireBrace,
+          ALT: () => this.CONSUME(c.BlockStart, { LABEL: 'StartBrace' }),
+        },
+      ]);
+      this.MANY(() => this.SUBRULE(this.statement));
+      this.CONSUME(c.BlockEnd, { LABEL: 'EndBrace' });
+    },
+  );
 
   readonly expressionStatement = this.RULE('expressionStatement', () => {
     this.SUBRULE(this.expression);
@@ -439,14 +457,14 @@ export class GmlParser extends CstParser {
   readonly enumStatement = this.RULE('enumStatement', () => {
     this.CONSUME(t.Enum);
     this.CONSUME1(t.Identifier);
-    this.CONSUME(t.StartBrace);
+    this.CONSUME(c.BlockStart, { LABEL: 'StartBrace' });
     this.SUBRULE(this.enumMember);
     this.MANY(() => {
       this.CONSUME2(t.Comma);
       this.SUBRULE2(this.enumMember);
     });
     this.OPTION(() => this.CONSUME3(t.Comma));
-    this.CONSUME(t.EndBrace);
+    this.CONSUME(c.BlockEnd, { LABEL: 'EndBrace' });
   });
 
   readonly enumMember = this.RULE('enumMember', () => {
@@ -474,7 +492,7 @@ export class GmlParser extends CstParser {
     this.OPTION2(() => {
       this.SUBRULE2(this.constructorSuffix);
     });
-    this.SUBRULE(this.blockStatement);
+    this.SUBRULE(this.blockStatement, { ARGS: [true] });
   });
 
   readonly functionStatement = this.RULE('functionStatement', () => {
@@ -517,7 +535,10 @@ export class GmlParser extends CstParser {
     this.CONSUME2(t.Semicolon);
     this.OPTION2(() => this.SUBRULE2(this.expression));
     this.CONSUME3(t.Semicolon);
-    this.OPTION3(() => this.SUBRULE3(this.expression));
+    this.OPTION3(() => {
+      this.SUBRULE3(this.expression);
+      this.MANY(() => this.CONSUME4(t.Semicolon));
+    });
     this.CONSUME(t.EndParen);
     this.SUBRULE(this.blockableStatement);
   });
@@ -630,7 +651,7 @@ export class GmlParser extends CstParser {
   });
 
   readonly structLiteral = this.RULE('structLiteral', () => {
-    this.CONSUME(t.StartBrace);
+    this.CONSUME(c.BlockStart, { LABEL: 'StartBrace' });
     this.OPTION1(() => {
       this.SUBRULE1(this.structLiteralEntry);
       this.MANY(() => {
@@ -639,7 +660,7 @@ export class GmlParser extends CstParser {
       });
       this.OPTION2(() => this.CONSUME2(t.Comma));
     });
-    this.CONSUME(t.EndBrace);
+    this.CONSUME(c.BlockEnd, { LABEL: 'EndBrace' });
   });
 
   readonly structLiteralEntry = this.RULE('structLiteralEntry', () => {
@@ -676,14 +697,14 @@ export class GmlParser extends CstParser {
   readonly switchStatement = this.RULE('switchStatement', () => {
     this.CONSUME(t.Switch);
     this.SUBRULE(this.expression);
-    this.CONSUME(t.StartBrace);
+    this.CONSUME(c.BlockStart, { LABEL: 'StartBrace' });
     this.MANY(() =>
       this.OR([
         { ALT: () => this.SUBRULE(this.caseStatement) },
         { ALT: () => this.SUBRULE(this.defaultStatement) },
       ]),
     );
-    this.CONSUME(t.EndBrace);
+    this.CONSUME(c.BlockEnd, { LABEL: 'EndBrace' });
   });
 
   readonly caseStatement = this.RULE('caseStatement', () => {

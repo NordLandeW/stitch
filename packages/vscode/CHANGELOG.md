@@ -10,6 +10,7 @@
 ### Fixes
 
 - Refresh unchanged macro users after configuration, open-buffer, and resource changes, and reject ambiguous shared-body renames.
+- Parse standalone and nested blocks, supported `begin`/`end` delimiters, `else if ... then`, and trailing semicolons after a `for` loop's third operation while preserving symbol scopes and source ranges.
 
 ## 1.81.0 (2026-01-11)
 

@@ -64,6 +64,12 @@ const project = await Project.initialize('path/to/your/project.yyp');
 await project.reload();
 ```
 
+### Blocks and control statements
+
+Standalone and nested blocks retain GML's function-local variable scope. Code blocks, switch containers, struct literals and enum bodies accept `{` or `begin` as their opening delimiter and `}` or `end` as their closing delimiter, including mixed pairs. Function and constructor bodies require an opening `{` and accept either closing delimiter. Template interpolation uses its own `{...}` delimiters.
+
+Both `if` and `else if` accept optional `then`. A `for` header accepts trailing semicolons after a nonempty third operation, such as `for (var i = 0; i < 3; i++;)`. An empty third operation uses the normal two separators: `for (;;)`. Enum initializer expressions retain their existing syntax restrictions.
+
 ### Diagnostics and recovery
 
 `Code.getDiagnostics()` exposes lexical and parser errors in `SYNTAX_ERROR` and annotation errors in `JSDOC`. `Code.reload()` updates these collections together with the recovered symbol model. Malformed annotation components are diagnosed locally while recognizable types and subsequent annotations remain available.

@@ -620,7 +620,9 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     let nextRange: StructNewMemberRange | undefined;
     for (let i = 0; i < sortedParts.length; i++) {
       const part = sortedParts[i];
-      const isStart = 'image' in part && [',', '{'].includes(part.image);
+      const isStart =
+        part === children.StartBrace[0] ||
+        ('image' in part && part.tokenType === t.Comma);
       if (isStart) {
         // Then we're starting a range!
         const startPosition = Position.fromCstEnd(this.PROCESSOR.file, part);

@@ -35,6 +35,12 @@ Lexical errors, syntax errors and malformed JSDoc type annotations appear at the
 
 JSDoc recovery retains recognizable types around a local error and preserves later annotations. Repairing the source refreshes symbols and withdraws the corresponding diagnostics. Recovery follows the existing grammar; a missing block boundary can leave its intended scope ambiguous. An internal-analysis failure diagnostic indicates that some symbol results are unavailable.
 
+#### Blocks and control statements
+
+Intellisense supports standalone and nested GML blocks, including blocks inside switch cases. Code blocks, switch containers, struct literals and enum bodies accept braces or `begin`/`end`, including mixed delimiter pairs. Function and constructor bodies start with `{` and can close with either `}` or `end`. Variables declared inside a block retain GML's function-local scope.
+
+`else if` accepts optional `then`, just like `if`. A `for` header may have trailing semicolons after its third operation, for example `for (var i = 0; i < 3; i++;)`. With no third operation, use the normal form `for (;;)`. Enum initializer syntax and other expression forms retain their existing limitations.
+
 #### Macro-aware editing
 
 Stitch expands project-wide GML `#macro` definitions before parsing their uses. Definitions can appear later in the same file or in another script or object event. Nested macros, backslash continuations, multiline verbatim strings and replacement fragments are interpreted in the calling code's context. Semicolons remain part of the replacement text.
@@ -399,7 +405,6 @@ To see the current list of known issues and feature requests, check out the [iss
 
 - 😕 **Code only**. Stitch leverages VSCode's power for editing _code_, and makes no attempt to provide visual editors for any type of GameMaker asset.
 - 😕 **Variable Definitions** via the UI are not supported. Since instance variables can be defined in code (via Creation events) we don't also support defining them via the "Variable Definitions" feature of Objects. If for some reason you need that feature, please provide context on the [associated issue](https://github.com/bscotch/stitch/issues/205)!
-- 😕 **Extraneous Curlies**. To avoid some parser complexity, the Stitch parser does not support extraneous curly braces (`{}`). For example, if a random section of code (not following a `for`, `if`, etc) is wrapped in curlies, the parser will emit errors.
 - 😕 **IIFFEs**. Stitch does not support IIFEs (immediately-invoked function expressions), e.g. `(function(){})()`. This is due to parser complexity, but pull requests addressing this are welcome!
 - 📝 **Stitch settings**. Stitch provides a number of settings that you can use to customize your experience. You can find them by opening the command palette and searching for "Preferences: Open Settings".
 - 🪵 **How to view logs**. If you run into trouble, you can view the extension's logs by opening the Output panel and selecting "Stitch" from the dropdown menu. These are particularly helpful for providing context when leaving bug reports!

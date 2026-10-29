@@ -24,6 +24,7 @@ export interface StatementCstNode extends CstNode {
 }
 
 export type StatementCstChildren = {
+  blockStatement?: BlockStatementCstNode[];
   functionStatement?: FunctionStatementCstNode[];
   localVarDeclarationsStatement?: LocalVarDeclarationsStatementCstNode[];
   globalVarDeclarationsStatement?: GlobalVarDeclarationsStatementCstNode[];
@@ -168,6 +169,7 @@ export type ElseIfStatementCstChildren = {
   Else: IToken[];
   If: IToken[];
   expression: ExpressionCstNode[];
+  Then?: IToken[];
   blockableStatement: BlockableStatementCstNode[];
 };
 
@@ -197,8 +199,7 @@ export interface BlockableStatementsCstNode extends CstNode {
 }
 
 export type BlockableStatementsCstChildren = {
-  statements?: StatementsCstNode[];
-  blockStatement?: BlockStatementCstNode[];
+  statements: StatementsCstNode[];
 };
 
 export interface BlockStatementCstNode extends CstNode {
@@ -207,7 +208,7 @@ export interface BlockStatementCstNode extends CstNode {
 }
 
 export type BlockStatementCstChildren = {
-  StartBrace: IToken[];
+  StartBrace?: IToken[];
   statement?: StatementCstNode[];
   EndBrace: IToken[];
 };
