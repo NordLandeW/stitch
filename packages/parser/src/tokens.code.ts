@@ -1,6 +1,38 @@
+import { tokenMatcher, type IToken } from 'chevrotain';
 import { c } from './tokens.categories.js';
 import { createToken, Lexer } from './tokens.lib.js';
 import { identifier, numericLiterals } from './tokens.shared.js';
+
+const blockPropertyPattern = /(?:begin|end)\b/y;
+
+function followedByMemberColon(
+  text: string,
+  offset: number,
+  previous: IToken | undefined,
+): boolean {
+  if (
+    !previous ||
+    (previous.image !== ',' && !tokenMatcher(previous, c.BlockStart))
+  )
+    return false;
+  while (offset < text.length) {
+    while (offset < text.length && /[ \t\r\n]/.test(text[offset])) offset++;
+    if (text.startsWith('//', offset)) {
+      offset += 2;
+      while (
+        offset < text.length &&
+        text[offset] !== '\r' &&
+        text[offset] !== '\n'
+      )
+        offset++;
+    } else if (text.startsWith('/*', offset)) {
+      const end = text.indexOf('*/', offset + 2);
+      if (end < 0) return false;
+      offset = end + 2;
+    } else return text[offset] === ':';
+  }
+  return false;
+}
 
 export const codeTokens = [
   //#region Whitespace and comments
@@ -137,6 +169,33 @@ export const codeTokens = [
     categories: [c.Keyword, c.BooleanLiteral],
   }),
   //#endregion
+
+  // Dot properties and bare begin keys do not change lexer modes.
+  createToken({
+    name: 'BlockProperty',
+    pattern: {
+      exec(text: string, offset: number, matched: IToken[]) {
+        let previous = matched.length - 1;
+        while (previous >= 0 && tokenMatcher(matched[previous], c.Jsdoc))
+          previous--;
+        blockPropertyPattern.lastIndex = offset;
+        const match = blockPropertyPattern.exec(text);
+        if (!match) return null;
+        if (matched[previous]?.image === '.') return match;
+        return match[0] === 'begin' &&
+          followedByMemberColon(
+            text,
+            offset + match[0].length,
+            matched[previous],
+          )
+          ? match
+          : null;
+      },
+    },
+    start_chars_hint: ['b', 'e'],
+    line_breaks: false,
+    categories: [identifier],
+  }),
 
   //#region Keywords
   createToken({

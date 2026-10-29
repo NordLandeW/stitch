@@ -15,6 +15,9 @@ import type {
   AssignmentCstNode,
   AssignmentRightHandSideCstChildren,
   AssignmentRightHandSideCstNode,
+  ExpressionCstChildren,
+  PrimaryExpressionCstChildren,
+  PropertyNameCstNode,
   FunctionArgumentCstNode,
   FunctionArgumentsCstNode,
   IdentifierCstChildren,
@@ -60,25 +63,57 @@ export function rhsFrom(
   return item as AssignmentRightHandSideCstChildren;
 }
 
+/** A whole value, allowing transparent parentheses but no operation on it. */
+export function unwrappedPrimary(
+  expression: ExpressionCstChildren | undefined,
+): PrimaryExpressionCstChildren | undefined {
+  while (expression) {
+    if (
+      expression.assignment ||
+      expression.binaryExpression ||
+      expression.ternaryExpression
+    )
+      return;
+    const primary = expression.primaryExpression?.[0]?.children;
+    if (
+      !primary ||
+      primary.New ||
+      primary.UnaryPrefixOperator ||
+      primary.UnarySuffixOperator ||
+      primary.assignment ||
+      primary.accessorSuffixes
+    )
+      return;
+    if (!primary.parenthesizedExpression) return primary;
+    expression =
+      primary.parenthesizedExpression[0].children.expression?.[0]?.children;
+  }
+  return;
+}
+
+function literalFromRhs(rhs: Rhs) {
+  return unwrappedPrimary(rhsFrom(rhs)?.expression?.[0]?.children);
+}
+
 export function functionFromRhs(rhs: Rhs) {
-  return rhsFrom(rhs)?.functionExpression?.[0].children;
+  return literalFromRhs(rhs)?.functionExpression?.[0].children;
 }
 
 export function structLiteralFromRhs(rhs: Rhs) {
-  return rhsFrom(rhs)?.structLiteral?.[0].children;
+  return literalFromRhs(rhs)?.structLiteral?.[0].children;
 }
 
 export function arrayLiteralFromRhs(rhs: Rhs) {
-  return rhsFrom(rhs)?.expression?.[0].children.primaryExpression?.[0].children
-    .arrayLiteral?.[0]?.children;
+  return literalFromRhs(rhs)?.arrayLiteral?.[0]?.children;
 }
 
+type NamedTokenNode = IdentifierCstNode | PropertyNameCstNode;
 export type IdentifierSource =
   | IdentifierCstChildren
-  | IdentifierCstNode
-  | IdentifierCstNode[]
-  | { identifier: IdentifierCstNode[] }
-  | { children: { identifier: IdentifierCstNode[] } };
+  | NamedTokenNode
+  | NamedTokenNode[]
+  | { identifier: NamedTokenNode[] }
+  | { children: { identifier: NamedTokenNode[] } };
 
 type AccessorSuffixName = keyof AccessorSuffixesCstChildren;
 export type SortedAccessorSuffix<
@@ -243,7 +278,7 @@ export function identifierFrom(nodes: IdentifierSource | undefined):
     }
   | undefined {
   if (!nodes) return;
-  let node: IdentifierCstNode;
+  let node: NamedTokenNode;
   if (Array.isArray(nodes)) {
     node = nodes[0];
   } else if ('children' in nodes && 'identifier' in nodes.children) {
@@ -254,7 +289,8 @@ export function identifierFrom(nodes: IdentifierSource | undefined):
     node = nodes as IdentifierCstNode;
   }
   if (!node) return;
-  const children = 'children' in node ? node.children : node;
+  const children: IdentifierCstChildren =
+    'children' in node ? node.children : node;
 
   const type = identifierCstNames.find((name) => children[name]);
   if (!type) {

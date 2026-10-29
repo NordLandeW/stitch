@@ -241,7 +241,9 @@ describe('diagnostic and recovery safety', function () {
     '} else }',
     'var broken=;',
     'var broken=true? :2;',
-    'var broken={ default:1 };',
+    'var broken={ and:1 };',
+    'begin member:1 end;',
+    '{member:1}.member=2;',
     'enum BrokenEnum{A=1<<2}',
   ]) {
     it(`preserves the independent root tail after ${JSON.stringify(bad)}`, async () => {

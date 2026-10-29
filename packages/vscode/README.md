@@ -39,7 +39,15 @@ JSDoc recovery retains recognizable types around a local error and preserves lat
 
 Intellisense supports standalone and nested GML blocks, including blocks inside switch cases. Code blocks, switch containers, struct literals and enum bodies accept braces or `begin`/`end`, including mixed delimiter pairs. Function and constructor bodies start with `{` and can close with either `}` or `end`. Variables declared inside a block retain GML's function-local scope.
 
-`else if` accepts optional `then`, just like `if`. A `for` header may have trailing semicolons after its third operation, for example `for (var i = 0; i < 3; i++;)`. With no third operation, use the normal form `for (;;)`. Enum initializer syntax and other expression forms retain their existing limitations.
+`else if` accepts optional `then`, just like `if`. A `for` header may have trailing semicolons after its third operation, for example `for (var i = 0; i < 3; i++;)`. With no third operation, use the normal form `for (;;)`. Enum initializer syntax retains its existing limitations.
+
+#### Expression roots and member access
+
+Completion, navigation, rename, hover and signatures follow the result of parenthesized and literal expressions. Supported forms include `(record).member`, `[10, 20][index]`, `({member: 1}).member`, `(compute)(value)`, immediate function calls and `new (Constructor)(value)`. Assignment through a grouped receiver, such as `(record).member = value`, retains the original member identity and the surrounding scope for `value`. At the start of a statement, `{` or `begin` opens a block; use parentheses for a struct receiver, for example `({member: 1}).member = 2;`.
+
+Keywords can name dot properties, including `record.if` and `record.end`. Bare struct keys support word keywords except `end`, `and`, `or`, `xor`, `not`, `mod`, `div`, `enum` and `function`.
+
+These expression forms follow the verified GameMaker 2026 Windows VM boundaries: array reads like `(values)[index]` and dot-based writes like `(record).values[index] = value` are supported. Direct indexed writes through a parenthesized root and direct data-structure access such as `(map)[? key]` are diagnosed, as are new parenthesized or literal constructor values without a following argument list. Other assignment-target and statement checks keep their existing limits.
 
 #### Macro-aware editing
 

@@ -1,6 +1,7 @@
 import {
   CstParser,
   NotAllInputParsedException,
+  tokenMatcher,
   type CstNode,
   type ILexingResult,
   type IToken,
@@ -121,31 +122,42 @@ export class GmlParser extends CstParser {
   });
 
   readonly statement = this.RULE('statement', () => {
-    this.OR([
-      { ALT: () => this.SUBRULE(this.blockStatement) },
-      { ALT: () => this.SUBRULE(this.functionStatement) },
-      { ALT: () => this.SUBRULE(this.localVarDeclarationsStatement) },
-      { ALT: () => this.SUBRULE(this.globalVarDeclarationsStatement) },
-      { ALT: () => this.SUBRULE(this.staticVarDeclarationStatement) },
-      { ALT: () => this.SUBRULE(this.variableAssignmentStatement) },
-      { ALT: () => this.SUBRULE(this.ifStatement) },
-      { ALT: () => this.SUBRULE(this.tryStatement) },
-      { ALT: () => this.SUBRULE(this.whileStatement) },
-      { ALT: () => this.SUBRULE(this.forStatement) },
-      { ALT: () => this.SUBRULE(this.doUntilStatement) },
-      { ALT: () => this.SUBRULE(this.switchStatement) },
-      { ALT: () => this.SUBRULE(this.breakStatement) },
-      { ALT: () => this.SUBRULE(this.continueStatement) },
-      { ALT: () => this.SUBRULE(this.returnStatement) },
-      { ALT: () => this.SUBRULE(this.exitStatement) },
-      { ALT: () => this.SUBRULE(this.withStatement) },
-      { ALT: () => this.SUBRULE(this.enumStatement) },
-      { ALT: () => this.SUBRULE(this.macroStatement) },
-      { ALT: () => this.SUBRULE(this.emptyStatement) },
-      { ALT: () => this.SUBRULE(this.repeatStatement) },
-      { ALT: () => this.SUBRULE(this.expressionStatement) },
-      { ALT: () => this.SUBRULE(this.jsdoc) },
-    ]);
+    this.OR({
+      // Bare block openers select a block, not a struct-valued expression.
+      // Keep the common dispatch token-only; function/assignment/expression
+      // ambiguity needs deeper lookahead only within their shared alternative.
+      MAX_LOOKAHEAD: 1,
+      DEF: [
+        { ALT: () => this.SUBRULE(this.blockStatement) },
+        { ALT: () => this.SUBRULE(this.localVarDeclarationsStatement) },
+        { ALT: () => this.SUBRULE(this.globalVarDeclarationsStatement) },
+        { ALT: () => this.SUBRULE(this.staticVarDeclarationStatement) },
+        { ALT: () => this.SUBRULE(this.ifStatement) },
+        { ALT: () => this.SUBRULE(this.tryStatement) },
+        { ALT: () => this.SUBRULE(this.whileStatement) },
+        { ALT: () => this.SUBRULE(this.forStatement) },
+        { ALT: () => this.SUBRULE(this.doUntilStatement) },
+        { ALT: () => this.SUBRULE(this.switchStatement) },
+        { ALT: () => this.SUBRULE(this.breakStatement) },
+        { ALT: () => this.SUBRULE(this.continueStatement) },
+        { ALT: () => this.SUBRULE(this.returnStatement) },
+        { ALT: () => this.SUBRULE(this.exitStatement) },
+        { ALT: () => this.SUBRULE(this.withStatement) },
+        { ALT: () => this.SUBRULE(this.enumStatement) },
+        { ALT: () => this.SUBRULE(this.macroStatement) },
+        { ALT: () => this.SUBRULE(this.emptyStatement) },
+        { ALT: () => this.SUBRULE(this.repeatStatement) },
+        {
+          ALT: () =>
+            this.OR2([
+              { ALT: () => this.SUBRULE(this.functionStatement) },
+              { ALT: () => this.SUBRULE(this.variableAssignmentStatement) },
+              { ALT: () => this.SUBRULE(this.expressionStatement) },
+            ]),
+        },
+        { ALT: () => this.SUBRULE(this.jsdoc) },
+      ],
+    });
   });
 
   readonly jsdoc = this.RULE('jsdoc', () => {
@@ -316,7 +328,10 @@ export class GmlParser extends CstParser {
   });
 
   readonly primaryExpression = this.RULE('primaryExpression', () => {
+    let namedRoot = false;
+    let hasSuffix = false;
     this.OPTION1(() => this.CONSUME(c.UnaryPrefixOperator));
+    this.OPTION3(() => this.CONSUME(t.New));
     this.OR1([
       { ALT: () => this.CONSUME(c.BooleanLiteral) },
       { ALT: () => this.CONSUME(c.NumericLiteral) },
@@ -327,10 +342,26 @@ export class GmlParser extends CstParser {
       { ALT: () => this.SUBRULE(this.multilineDoubleStringLiteral) },
       { ALT: () => this.SUBRULE(this.multilineSingleStringLiteral) },
       { ALT: () => this.SUBRULE(this.templateLiteral) },
-      { ALT: () => this.SUBRULE(this.identifierAccessor) },
+      {
+        ALT: () => {
+          this.SUBRULE(this.identifierAccessor);
+          namedRoot = true;
+        },
+      },
       { ALT: () => this.SUBRULE(this.parenthesizedExpression) },
       { ALT: () => this.SUBRULE(this.arrayLiteral) },
+      { ALT: () => this.SUBRULE(this.structLiteral) },
+      { ALT: () => this.SUBRULE(this.functionExpression) },
     ]);
+    this.MANY(() => {
+      this.SUBRULE(this.accessorSuffixes);
+      hasSuffix = true;
+    });
+    // Keep naked non-accessor assignments/comparisons owned by expression.
+    this.OPTION4({
+      GATE: () => namedRoot || hasSuffix,
+      DEF: () => this.SUBRULE(this.assignment),
+    });
     this.OPTION2(() => this.CONSUME(c.UnarySuffixOperator));
   });
 
@@ -345,17 +376,23 @@ export class GmlParser extends CstParser {
     ]);
   });
 
+  readonly propertyName = this.RULE('propertyName', (structKey = false) => {
+    this.OR([
+      { ALT: () => this.CONSUME(t.Identifier) },
+      {
+        GATE: () =>
+          /^[a-zA-Z_]\w*$/.test(this.LA(1).image) &&
+          (!structKey ||
+            !/^(?:end|and|or|xor|not|mod|div|enum|function)$/.test(
+              this.LA(1).image,
+            )),
+        ALT: () => this.CONSUME(c.Keyword, { LABEL: 'Identifier' }),
+      },
+    ]);
+  });
+
   readonly identifierAccessor = this.RULE('identifierAccessor', () => {
-    this.OPTION(() => {
-      this.CONSUME(t.New);
-    });
     this.SUBRULE(this.identifier);
-    this.MANY(() => {
-      this.SUBRULE(this.accessorSuffixes);
-    });
-    this.OPTION2(() => {
-      this.SUBRULE(this.assignment);
-    });
   });
 
   readonly parenthesizedExpression = this.RULE(
@@ -382,7 +419,7 @@ export class GmlParser extends CstParser {
 
   readonly dotAccessSuffix = this.RULE('dotAccessSuffix', () => {
     this.CONSUME(t.Dot);
-    this.SUBRULE(this.identifier);
+    this.SUBRULE(this.propertyName, { LABEL: 'identifier' });
   });
 
   readonly arrayAccessSuffix = this.RULE('arrayAccessSuffix', () => {
@@ -629,11 +666,7 @@ export class GmlParser extends CstParser {
   readonly assignmentRightHandSide = this.RULE(
     'assignmentRightHandSide',
     () => {
-      this.OR([
-        { ALT: () => this.SUBRULE(this.expression) },
-        { ALT: () => this.SUBRULE(this.structLiteral) },
-        { ALT: () => this.SUBRULE(this.functionExpression) },
-      ]);
+      this.SUBRULE(this.expression);
     },
   );
 
@@ -652,13 +685,19 @@ export class GmlParser extends CstParser {
 
   readonly structLiteral = this.RULE('structLiteral', () => {
     this.CONSUME(c.BlockStart, { LABEL: 'StartBrace' });
-    this.OPTION1(() => {
-      this.SUBRULE1(this.structLiteralEntry);
-      this.MANY(() => {
-        this.CONSUME1(t.Comma);
-        this.SUBRULE2(this.structLiteralEntry);
-      });
-      this.OPTION2(() => this.CONSUME2(t.Comma));
+    this.OPTION1({
+      GATE: () => !tokenMatcher(this.LA(1), c.BlockEnd),
+      DEF: () => {
+        this.SUBRULE1(this.structLiteralEntry);
+        this.MANY({
+          GATE: () => !tokenMatcher(this.LA(2), c.BlockEnd),
+          DEF: () => {
+            this.CONSUME1(t.Comma);
+            this.SUBRULE2(this.structLiteralEntry);
+          },
+        });
+        this.OPTION2(() => this.CONSUME2(t.Comma));
+      },
     });
     this.CONSUME(c.BlockEnd, { LABEL: 'EndBrace' });
   });
@@ -670,7 +709,10 @@ export class GmlParser extends CstParser {
           this.OPTION(() => {
             this.SUBRULE(this.jsdoc);
           });
-          this.CONSUME(t.Identifier);
+          this.SUBRULE(this.propertyName, {
+            LABEL: 'identifier',
+            ARGS: [true],
+          });
         },
       },
       { ALT: () => this.SUBRULE(this.stringLiteral) },

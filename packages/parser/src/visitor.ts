@@ -60,7 +60,10 @@ import { withableTypes } from './types.primitives.js';
 import { StitchParserError, assert } from './util.js';
 import { assignVariable, ensureDefinitive } from './visitor.assign.js';
 import { visitFunctionExpression } from './visitor.functionExpression.js';
-import { visitIdentifierAccessor } from './visitor.identifierAccessor.js';
+import {
+  visitAccessors,
+  visitIdentifierAccessor,
+} from './visitor.identifierAccessor.js';
 import {
   SignifierProcessor,
   diagnosticCollections,
@@ -68,6 +71,7 @@ import {
 
 export function registerSignifiers(file: Code) {
   try {
+    file.scopeKeywordOffsets.clear();
     // Clear diagnostics managed by the processor
     for (const group of diagnosticCollections) {
       file.clearDiagnosticCollection(group);
@@ -187,6 +191,13 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     const scope = this.PROCESSOR.fullScope;
     let item: Signifier | WithableType | EnumType | undefined;
     const range = this.PROCESSOR.range(identifier.token);
+    if (
+      identifier.type === 'Self' ||
+      identifier.type === 'Other' ||
+      identifier.type === 'Global'
+    ) {
+      this.FILE.scopeKeywordOffsets.add(identifier.token.startOffset);
+    }
     switch (identifier.type) {
       case 'Global':
         // Global is a special case, it's a keyword and also
@@ -454,8 +465,9 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
   override identifierAccessor(
     children: IdentifierAccessorCstChildren,
     context: VisitorContext,
+    postfix?: PrimaryExpressionCstChildren,
   ): (Type | TypeStore)[] {
-    return arrayWrapped(visitIdentifierAccessor.call(this, children, context));
+    return visitIdentifierAccessor.call(this, children, context, postfix);
   }
 
   override macroStatement(
@@ -620,6 +632,9 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     let nextRange: StructNewMemberRange | undefined;
     for (let i = 0; i < sortedParts.length; i++) {
       const part = sortedParts[i];
+      const location = 'image' in part ? part : part.location;
+      // A recovered empty entry has no authored boundary to close this range.
+      if (!location || !Number.isFinite(location.startOffset)) continue;
       const isStart =
         part === children.StartBrace[0] ||
         ('image' in part && part.tokenType === t.Comma);
@@ -631,7 +646,7 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
       } else if (nextRange) {
         const endPosition = Position.fromCstStart(
           this.PROCESSOR.file,
-          'image' in part ? part : part.location!,
+          location,
         );
         nextRange.end = endPosition;
         this.PROCESSOR.file.addStructNewMemberRange(nextRange);
@@ -651,9 +666,10 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
       // The name is either a direct variable name or a string literal.
       let name: string;
       let range: Range;
-      if (parts.Identifier?.[0] && !parts.Identifier[0].isInsertedInRecovery) {
-        name = parts.Identifier[0].image;
-        range = this.PROCESSOR.range(parts.Identifier[0]);
+      const property = identifierFrom(parts.identifier);
+      if (property) {
+        name = property.name;
+        range = this.PROCESSOR.range(property.token);
       } else if (
         parts.stringLiteral?.[0]?.children.StringStart?.[0] &&
         parts.stringLiteral[0].children.StringEnd?.[0]
@@ -690,7 +706,7 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
           // Add an error message
           this.PROCESSOR.addDiagnostic(
             'INVALID_OPERATION',
-            parts.Identifier![0],
+            range,
             `Struct literal shorthand requires an existing variable named "${name}"`,
           );
         } else {
@@ -727,15 +743,6 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
   ): (Type | TypeStore)[] {
     if (children.expression) {
       return this.expression(children.expression[0].children, context);
-    } else if (children.structLiteral) {
-      return [this.structLiteral(children.structLiteral[0].children, context)];
-    } else if (children.functionExpression) {
-      return [
-        this.functionExpression(
-          children.functionExpression[0].children,
-          context,
-        ) || this.ANY,
-      ];
     }
     return [this.ANY];
   }
@@ -787,6 +794,52 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     children: PrimaryExpressionCstChildren,
     context: VisitorContext,
   ): (Type | TypeStore)[] {
+    if (children.parenthesizedExpression) {
+      const first = children.accessorSuffixes?.[0]?.children;
+      const dataAccessor =
+        first?.structAccessSuffix?.[0] ||
+        first?.listAccessSuffix?.[0] ||
+        first?.mapAccessSuffix?.[0] ||
+        first?.gridAccessSuffix?.[0];
+      if (dataAccessor) {
+        this.PROCESSOR.addDiagnostic(
+          'INVALID_OPERATION',
+          dataAccessor.location!,
+          'A parenthesized receiver cannot be followed directly by a data-structure accessor.',
+          'error',
+        );
+      } else if (
+        children.assignment &&
+        (first?.arrayAccessSuffix || first?.arrayMutationAccessorSuffix)
+      ) {
+        this.PROCESSOR.addDiagnostic(
+          'INVALID_OPERATION',
+          children.accessorSuffixes![0].location!,
+          'A parenthesized receiver cannot start an indexed assignment. Use an identifier-rooted array assignment.',
+          'error',
+        );
+      }
+    }
+    if (
+      children.New &&
+      (children.parenthesizedExpression || children.functionExpression) &&
+      !children.accessorSuffixes?.some(
+        (suffix) => suffix.children.functionArguments,
+      )
+    ) {
+      this.PROCESSOR.addDiagnostic(
+        'INVALID_OPERATION',
+        children.New[0],
+        'A constructor expression requires an argument list after its constructor value.',
+        'error',
+      );
+    }
+    // Expected value bindings must not become the self/type of a temporary root.
+    const rootContext =
+      !children.identifierAccessor &&
+      (children.accessorSuffixes?.length || children.New)
+        ? { ctxKindStack: context.ctxKindStack, returns: context.returns }
+        : context;
     let type!: Type | (Type | TypeStore)[];
     if (children.BooleanLiteral) {
       type = new Type('Bool');
@@ -799,11 +852,23 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     } else if (children.Undefined) {
       type = new Type('Undefined');
     } else if (children.arrayLiteral) {
-      type = this.arrayLiteral(children.arrayLiteral[0].children, context);
+      type = this.arrayLiteral(children.arrayLiteral[0].children, rootContext);
+    } else if (children.structLiteral) {
+      type = this.structLiteral(
+        children.structLiteral[0].children,
+        rootContext,
+      );
+    } else if (children.functionExpression) {
+      type =
+        this.functionExpression(
+          children.functionExpression[0].children,
+          rootContext,
+        ) || this.ANY;
     } else if (children.identifierAccessor) {
       type = this.identifierAccessor(
         children.identifierAccessor[0].children,
         context,
+        children,
       );
     } else if (children.stringLiteral) {
       type = this.stringLiteral(children.stringLiteral[0].children, context);
@@ -825,13 +890,37 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     } else if (children.parenthesizedExpression) {
       type = this.parenthesizedExpression(
         children.parenthesizedExpression[0].children,
-        context,
+        rootContext,
       );
     }
     if (!type) {
       logger.warn('No type found for primary expression');
     }
     type ||= this.ANY;
+    if (!children.identifierAccessor && children.accessorSuffixes?.length) {
+      const root =
+        children.parenthesizedExpression?.[0] ||
+        children.arrayLiteral?.[0] ||
+        children.structLiteral?.[0] ||
+        children.functionExpression?.[0] ||
+        children.stringLiteral?.[0] ||
+        children.multilineDoubleStringLiteral?.[0] ||
+        children.multilineSingleStringLiteral?.[0] ||
+        children.templateLiteral?.[0] ||
+        children.BooleanLiteral?.[0] ||
+        children.NumericLiteral?.[0] ||
+        children.PointerLiteral?.[0] ||
+        children.Undefined?.[0] ||
+        children.NaN?.[0];
+      const range = root
+        ? this.PROCESSOR.range('children' in root ? root.location! : root)
+        : new Range(this.PROCESSOR.file.startPosition);
+      type = visitAccessors(
+        this,
+        { types: arrayWrapped(type), range, ctx: context },
+        children,
+      );
+    }
     // Override the type if we have a unary operator
 
     const prefixOperator = children.UnaryPrefixOperator?.[0].image;

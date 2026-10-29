@@ -299,6 +299,12 @@ export function replaceGenerics(
         ? generics.get(startingType.name!)?.type
         : [startingType];
     for (const type of newTypes || []) {
+      // A returned callable carries its parameter, return and self bindings.
+      // Its function metadata is not inherited by Type.derive().
+      if (type.kind === 'Function') {
+        replacedTypes.addType(type);
+        continue;
+      }
       const newType = type.derive();
       if (type.items) {
         newType.items = replaceGenerics(type.items, knownTypes, generics);

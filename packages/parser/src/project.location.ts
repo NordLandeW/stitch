@@ -327,6 +327,22 @@ export class Reference extends Range {
   override readonly $tag = 'Ref';
   /** If this is reference marks the declaration */
   isDef = false;
+  /** The fixed keyword role is independent of the symbol it resolves to. */
+  get isScopeKeyword(): boolean {
+    return (
+      !this.item.macro && this.file.scopeKeywordOffsets.has(this.start.offset)
+    );
+  }
+
+  /** A physical macro spelling may also be used as an unbound scope keyword. */
+  get hasScopeKeywordUse(): boolean {
+    if (this.item.macro || !/^(?:self|other|global)$/.test(this.text))
+      return false;
+    const source = this.source;
+    return this.file.project.macros
+      .contextsAt(source.file, source.start.offset)
+      .some((context) => context.code.scopeKeywordOffsets.has(context.offset));
+  }
   protected _itemNamePattern: RegExp | undefined = undefined;
 
   constructor(
@@ -360,6 +376,7 @@ export class Reference extends Range {
   get isRenameable(): boolean {
     const text = this.text;
     return (
+      !this.hasScopeKeywordUse &&
       this.sourceEditable &&
       this.item.isRenameable &&
       this.itemNamePattern.test(text)

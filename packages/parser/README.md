@@ -70,6 +70,14 @@ Standalone and nested blocks retain GML's function-local variable scope. Code bl
 
 Both `if` and `else if` accept optional `then`. A `for` header accepts trailing semicolons after a nonempty third operation, such as `for (var i = 0; i < 3; i++;)`. An empty third operation uses the normal two separators: `for (;;)`. Enum initializer expressions retain their existing syntax restrictions.
 
+### Expression roots and postfix access
+
+Calls, member access and array indexing apply to complete expression values: `(record).member`, `[10, 20][index]`, `({member: 1}).member`, `(compute)(value)` and `(function(value) { return value * 2; })(2)`. Constructor values support `new (Constructor)(value)` and `new (select_constructor())(value)`. Literal assignment bindings are retained only when the complete right-hand side is that literal; immediate calls and indexing expose their result type instead. Both slots of legacy two-dimensional array and grid access contribute references. At the start of a statement, `{` or `begin` opens a block; parenthesize a struct receiver there, for example `({member: 1}).member = 2;`.
+
+Word-shaped keywords can be dot properties, such as `record.if` or `record.end`. Bare struct keys accept the supported word keywords except `end`, `and`, `or`, `xor`, `not`, `mod`, `div`, `enum` and `function`. A bare `begin` key requires its member colon and does not open a block.
+
+The analysis follows the verified GameMaker 2026 Windows VM boundaries for these new forms. Parenthesized receivers allow array reads and dot-based writes, including `(record).values[0] = value`; direct indexed writes such as `(values)[0] = value` and direct data-structure access such as `(map)[? key]` produce error-severity `INVALID_OPERATION` diagnostics. New parenthesized or literal constructor values require their own following argument list. Broader statement and assignment-target checking retains its existing limits.
+
 ### Diagnostics and recovery
 
 `Code.getDiagnostics()` exposes lexical and parser errors in `SYNTAX_ERROR` and annotation errors in `JSDOC`. `Code.reload()` updates these collections together with the recovered symbol model. Malformed annotation components are diagnosed locally while recognizable types and subsequent annotations remain available.

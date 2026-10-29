@@ -6,6 +6,7 @@ import type {
   DotAccessSuffixCstNode,
   FunctionArgumentsCstNode,
   IdentifierAccessorCstChildren,
+  PrimaryExpressionCstChildren,
 } from '../gml-cst.js';
 import { Docs, withCtxKind, type VisitorContext } from './parser.js';
 import {
@@ -46,7 +47,7 @@ interface LastAccessed {
   /** The range of the name last accessed */
   range: Range;
   /** The types from the thing we accessed */
-  types?: Type[] | TypeStore[];
+  types?: (Type | TypeStore)[];
   /** If this is an assignment, what we're assigning to */
   rhs?: AssignmentRightHandSideCstChildren;
   /** If the `new` keyword prefixed the accessor */
@@ -63,14 +64,11 @@ export function visitIdentifierAccessor(
   this: GmlSignifierVisitor,
   children: IdentifierAccessorCstChildren,
   ctx: VisitorContext,
-): Type[] | TypeStore[] {
+  postfix?: PrimaryExpressionCstChildren,
+): (Type | TypeStore)[] {
   const docs = this.PROCESSOR.consumeJsdoc();
-  const suffixes = sortedAccessorSuffixes(children.accessorSuffixes);
-  // Compute useful metadata
-  /** If true, then the `new` keyword prefixes this. */
-  const usesNew = !!children.New?.length;
-  /** If not `undefined`, this is the assignment node */
-  const rhs = rhsFrom(children.assignment);
+  const usesNew = !!postfix?.New?.length;
+  const rhs = rhsFrom(postfix?.assignment);
   const scope = this.PROCESSOR.fullScope;
 
   // Use the starting identifier to construct the initial `lastAccessed` object
@@ -134,24 +132,36 @@ export function visitIdentifierAccessor(
     lastAccessed.types = [item];
   }
 
-  // Now that we have the initial "lastAccessed" content,
-  // we can iterate over the accessors.
+  return visitAccessors(this, lastAccessed, postfix, docs);
+}
+
+/** Share suffix evaluation between named and value roots. */
+export function visitAccessors(
+  visitor: GmlSignifierVisitor,
+  lastAccessed: LastAccessed,
+  children: PrimaryExpressionCstChildren | undefined,
+  docs?: Docs,
+): (Type | TypeStore)[] {
+  const suffixes = sortedAccessorSuffixes(children?.accessorSuffixes);
+  const rhs = rhsFrom(children?.assignment);
+  lastAccessed.usesNew = !!children?.New;
   for (let i = 0; i < suffixes.length; i++) {
-    // If this is the final suffix, we need to pass additional
-    // info that is applicable to it.
     if (i === suffixes.length - 1) {
       lastAccessed.rhs = rhs;
       lastAccessed.docs = docs;
     }
+    const usesNew: boolean | undefined = lastAccessed.usesNew;
     lastAccessed = processNextAccessor(
-      this,
+      visitor,
       lastAccessed,
       suffixes[i],
       suffixes[i + 1],
     );
+    // A constructor applies to the first call, not to a returned callable.
+    if (suffixes[i].name !== 'functionArguments')
+      lastAccessed.usesNew = usesNew;
   }
-
-  return lastAccessed.types || [this.ANY];
+  return lastAccessed.types || [visitor.ANY];
 }
 
 /**
@@ -164,7 +174,8 @@ function processNextAccessor(
 ): LastAccessed {
   // For example, `hello[expression]`
   if ('expression' in accessor.children) {
-    visitor.visit(accessor.children.expression, lastAccessed.ctx);
+    for (const expression of accessor.children.expression || [])
+      visitor.visit(expression, lastAccessed.ctx);
   }
   let nextAccessed: LastAccessed; // Many suffix cases include an expression we need to evaluate.
 
@@ -200,6 +211,14 @@ function processNextAccessor(
       nextAccessed.types = allowedTypes
         .map((t) => t.items)
         .filter((t) => !!t) as TypeStore[];
+      if (
+        accessor.name === 'arrayAccessSuffix' &&
+        accessor.children.expression?.length === 2
+      ) {
+        nextAccessed.types = getTypesOfKind(nextAccessed.types, 'Array')
+          .map((type) => type.items)
+          .filter((type) => !!type) as TypeStore[];
+      }
       // If there is a RHS, we can't create a variable from it but
       // do need to process it!
       if (lastAccessed.rhs) {

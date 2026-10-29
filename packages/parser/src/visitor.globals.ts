@@ -4,7 +4,7 @@ import {
   EnumStatementCstChildren,
   FunctionExpressionCstChildren,
   GlobalVarDeclarationCstChildren,
-  IdentifierAccessorCstChildren,
+  PrimaryExpressionCstChildren,
   JsdocGmlCstChildren,
   JsdocJsCstChildren,
   MacroStatementCstChildren,
@@ -12,7 +12,11 @@ import {
 import { JsdocSummary, parseJsdoc } from './jsdoc.js';
 import { logger } from './logger.js';
 import { GmlVisitorBase } from './parser.js';
-import { identifierFrom, recoveredDelimiter } from './parser.utility.js';
+import {
+  identifierFrom,
+  recoveredDelimiter,
+  unwrappedPrimary,
+} from './parser.utility.js';
 import { t } from './tokens.js';
 import type { Code } from './project.code.js';
 import { Diagnostic } from './project.diagnostics.js';
@@ -332,34 +336,30 @@ export class GmlGlobalDeclarationsVisitor extends GmlVisitorBase {
     symbol.macro = true;
   }
 
-  override identifierAccessor(children: IdentifierAccessorCstChildren) {
-    // Discover global.whatever symbols without treating ordinary access as a
-    // declaration. The signifier visitor will mark an actual assignment as
-    // the definition.
-    const identifier = identifierFrom(children);
+  override primaryExpression(children: PrimaryExpressionCstChildren) {
+    const first = children.accessorSuffixes?.[0]?.children;
+    const root =
+      first?.dotAccessSuffix || first?.functionArguments
+        ? children.identifierAccessor?.[0] ||
+          unwrappedPrimary(
+            children.parenthesizedExpression?.[0].children.expression?.[0]
+              ?.children,
+          )?.identifierAccessor?.[0]
+        : undefined;
+    const identifier = identifierFrom(root?.children);
     if (identifier?.type === 'Global') {
-      const globalIdentifier =
-        children.accessorSuffixes?.[0].children.dotAccessSuffix?.[0].children
-          .identifier[0].children;
-      if (globalIdentifier?.Identifier) {
-        // The symbol pass records the reference with its assignment status.
-        // An earlier non-defining reference here would shadow that result.
-        this.DISCOVER_GLOBAL(globalIdentifier.Identifier[0].image);
-      }
+      // Discover without turning a read into the defining occurrence.
+      const member = identifierFrom(first?.dotAccessSuffix?.[0]?.children);
+      if (member) this.DISCOVER_GLOBAL(member.name);
     } else if (
-      identifier?.type === 'Identifier' &&
-      children.accessorSuffixes?.[0].children.functionArguments
+      identifier?.name === 'event_inherited' &&
+      first?.functionArguments
     ) {
-      // See if this is a function call for `event_inherited()`
-      if (identifier.name === 'event_inherited') {
-        this.PROCESSOR.file.callsSuper = true;
-      }
+      this.PROCESSOR.file.callsSuper = true;
     }
-
-    // Still visit the rest
-    if (children.accessorSuffixes) {
-      this.visit(children.accessorSuffixes);
-    }
+    // Each suffix/argument may itself contain global access or a function.
+    for (const nodes of Object.values(children))
+      for (const node of nodes) if ('children' in node) this.visit(node);
   }
 
   constructor(readonly PROCESSOR: GlobalDeclarationsProcessor) {

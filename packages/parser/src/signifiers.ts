@@ -49,11 +49,7 @@ export class Signifier extends Flags {
   }
 
   get isRenameable(): boolean {
-    return (
-      !!this.name &&
-      !this.native &&
-      !['other', 'self', 'global'].includes(this.name)
-    );
+    return !!this.name && !this.native;
   }
 
   /**

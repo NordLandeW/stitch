@@ -71,6 +71,11 @@ export function createRenameEdits(
         'Cannot safely rename a symbol with a non-editable source spelling',
       );
     }
+    if (!reference.isScopeKeyword && reference.hasScopeKeywordUse) {
+      throw new Error(
+        'Cannot rename a shared spelling used as a fixed scope keyword',
+      );
+    }
     if (!reference.isRenameable) continue;
     const source = reference.source;
     const project = reference.file.project;

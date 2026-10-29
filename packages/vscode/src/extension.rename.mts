@@ -22,10 +22,6 @@ export class StitchRenameProvider implements vscode.RenameProvider {
     );
     const range = rangeFrom(ref);
     const text = document.getText(range);
-    assertUserClaim(
-      !['other', 'self', 'global'].includes(text),
-      'Cannot rename special variables',
-    );
     const signifier = ref.item;
     assertUserClaim(signifier, 'No signifier found for reference');
     assertUserClaim(signifier.name, 'No name found for signifier');
