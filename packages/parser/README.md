@@ -64,6 +64,12 @@ const project = await Project.initialize('path/to/your/project.yyp');
 await project.reload();
 ```
 
+### Diagnostics and recovery
+
+`Code.getDiagnostics()` exposes lexical and parser errors in `SYNTAX_ERROR` and annotation errors in `JSDOC`. `Code.reload()` updates these collections together with the recovered symbol model. Malformed annotation components are diagnosed locally while recognizable types and subsequent annotations remain available.
+
+File-level recovery advances through unexpected tokens without changing their absolute source coordinates or the grammar's nested recovery rules. Empty buffers, partial calls and recovered declarations have finite ranges; cursor-like scope and argument ranges can end at EOF. Editor adapters should validate their end-exclusive projections against the target document. A missing block boundary can leave the intended scope ambiguous, and an unexpected internal-analysis failure is reported as a diagnostic rather than silently presenting complete results.
+
 ### Macro analysis and source positions
 
 Project loading collects GML macros across scripts and object events before interpreting their uses. Select the configuration explicitly when needed:

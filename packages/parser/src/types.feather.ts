@@ -58,7 +58,7 @@ export function typeFromIdentifier(
   __isRootRequest = true,
 ): Type {
   ok(
-    identifier.match(/^[A-Z][A-Z0-9._]*$/i),
+    identifier.match(/^[A-Z_][A-Z0-9._]*$/i),
     `Invalid type name ${identifier}`,
   );
   const normalizedName = identifier?.toLocaleLowerCase?.();
@@ -187,44 +187,34 @@ export function typeFromParsedFeatherString(
   knownTypes: KnownTypesMap | KnownOrGenerics[],
   addMissing: boolean,
 ): Type[] {
-  if (node.kind === 'type') {
-    const identifier = node.name;
-    let type = typeFromIdentifier(identifier.content, knownTypes, addMissing);
-    if (node.of) {
-      const subtypes = typeFromParsedFeatherString(
-        node.of,
+  type Work =
+    | { node: FeatherTypeUnion | FeatherType; output: Type[] }
+    | { type: Type; items: Type[]; output: Type[] };
+  const result: Type[] = [];
+  const pending: Work[] = [{ node, output: result }];
+  while (pending.length) {
+    const work = pending.pop()!;
+    if ('type' in work) {
+      // Derive only after the contents, preserving the original lookup order
+      // and keeping shared known types unchanged.
+      const derived = work.type.derive();
+      for (const item of work.items) derived.addItemType(item);
+      work.output.push(derived);
+    } else if (work.node.kind === 'union') {
+      for (let index = work.node.types.length - 1; index >= 0; index--)
+        pending.push({ node: work.node.types[index], output: work.output });
+    } else {
+      const type = typeFromIdentifier(
+        work.node.name.content,
         knownTypes,
         addMissing,
       );
-      // Then we need to create a new type instead of mutating
-      // the one we found.
-      type = type.derive();
-      // While only some types are "containers", we can
-      // go ahead and add any contained types and worry
-      // about the consequences later. That way we don't
-      // need to keep updating this as we add more container
-      // types.
-      for (const subtype of subtypes) {
-        type.addItemType(subtype);
-      }
-      // TODO: Else create a diagnostic?
+      if (work.node.of) {
+        const items: Type[] = [];
+        pending.push({ type, items, output: work.output });
+        pending.push({ node: work.node.of, output: items });
+      } else work.output.push(type);
     }
-    return [type];
-  } else if (node.kind === 'union') {
-    const unionOf = node.types;
-    if (unionOf.length === 1) {
-      return typeFromParsedFeatherString(unionOf[0], knownTypes, addMissing);
-    }
-    const types: Type[] = [];
-    for (const child of unionOf) {
-      const subtype = typeFromParsedFeatherString(
-        child,
-        knownTypes,
-        addMissing,
-      );
-      types.push(...subtype);
-    }
-    return types;
   }
-  throw new Error(`Unknown node type ${node['name']}`);
+  return result;
 }

@@ -1,5 +1,13 @@
 import { keysOf } from '@bscotch/utility';
-import type { CstNode, CstNodeLocation, IToken } from 'chevrotain';
+import {
+  createTokenInstance,
+  type CstNode,
+  type CstNodeLocation,
+  type IToken,
+  type TokenType,
+} from 'chevrotain';
+import type { Code } from './project.code.js';
+import { t } from './tokens.js';
 import type {
   AccessorSuffixesCstChildren,
   AccessorSuffixesCstNode,
@@ -84,14 +92,75 @@ export function isEmpty(obj: unknown) {
   return Object.keys(obj).length === 0;
 }
 
+/** Cursor-only delimiter for a partial CST; never an authored reference. */
+export function recoveredDelimiter(
+  file: Code,
+  token: IToken | undefined,
+  children: Record<string, (IToken | CstNode)[] | undefined>,
+  tokenType: TokenType,
+  image: string,
+  edge: 'start' | 'end' = 'end',
+): IToken {
+  if (token && Number.isFinite(token.startOffset)) return token;
+  const pending = Object.values(children).flatMap((parts) => parts || []);
+  let offset: number | undefined;
+  while (pending.length) {
+    const part = pending.pop()!;
+    let at: number | undefined;
+    if ('children' in part) {
+      // Full CST locations already bound real descendants and ignore inserted
+      // NaN tokens. Reuse them instead of rescanning each nested partial tree.
+      at =
+        edge === 'end' ? part.location?.endOffset : part.location?.startOffset;
+      if (!Number.isFinite(at)) {
+        for (const nodes of Object.values(part.children))
+          for (const node of nodes) pending.push(node);
+      }
+    } else if (!part.isInsertedInRecovery) {
+      at = edge === 'end' ? part.endOffset : part.startOffset;
+    }
+    if (Number.isFinite(at))
+      offset =
+        offset === undefined
+          ? at!
+          : edge === 'end'
+            ? Math.max(offset, at!)
+            : Math.min(offset, at!);
+  }
+  const point = file.analysisPositionAt(
+    offset === undefined
+      ? file.analysisLength
+      : offset + (edge === 'end' ? 1 : 0),
+  );
+  const result = createTokenInstance(
+    tokenType,
+    image,
+    point.offset,
+    point.offset,
+    point.line,
+    point.line,
+    point.column,
+    point.column,
+  );
+  result.isInsertedInRecovery = true;
+  return result;
+}
+
 export function sortedFunctionCallParts(
   node: FunctionArgumentsCstNode,
+  file: Code,
 ): (IToken | FunctionArgumentCstNode)[] {
   return [
-    node.children.StartParen[0],
+    ...(node.children.StartParen || []),
     ...(node.children.functionArgument || []),
     ...(node.children.Comma || []),
-    node.children.EndParen[0],
+    recoveredDelimiter(
+      file,
+      node.children.EndParen?.[0],
+      node.children,
+      t.EndParen,
+      ')',
+    ),
   ].sort((a, b) => {
     const aLocation = ('location' in a ? a.location! : a) as CstNodeLocation;
     const bLocation = ('location' in b ? b.location! : b) as CstNodeLocation;
@@ -166,13 +235,14 @@ const identifierCstNames = [
   'Self',
 ] as const satisfies readonly (keyof IdentifierCstChildren)[];
 
-export function identifierFrom(nodes: IdentifierSource):
+export function identifierFrom(nodes: IdentifierSource | undefined):
   | {
       token: IToken;
       type: keyof IdentifierCstChildren;
       name: string;
     }
   | undefined {
+  if (!nodes) return;
   let node: IdentifierCstNode;
   if (Array.isArray(nodes)) {
     node = nodes[0];
@@ -183,6 +253,7 @@ export function identifierFrom(nodes: IdentifierSource):
   } else {
     node = nodes as IdentifierCstNode;
   }
+  if (!node) return;
   const children = 'children' in node ? node.children : node;
 
   const type = identifierCstNames.find((name) => children[name]);
@@ -190,5 +261,6 @@ export function identifierFrom(nodes: IdentifierSource):
     return;
   }
   const token = children[type]![0];
+  if (!token || token.isInsertedInRecovery || !token.image) return;
   return { token, type, name: token.image };
 }

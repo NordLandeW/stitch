@@ -32,6 +32,7 @@ export interface SourceMapping {
  */
 export function fixITokenLocation(token: IToken) {
   assert(typeof token.image === 'string', 'Token must have an image');
+  if (token.isInsertedInRecovery) return token;
   const length = token.image.length;
   if (token.endOffset === token.startOffset) {
     token.endOffset += length;
@@ -77,11 +78,14 @@ export class Position implements IPosition {
     loc: CstNodeLocation | Position | IPosition,
     fromTokenEnd = false,
   ): Position {
-    if (loc instanceof Position) {
-      return loc;
-    }
     if ('offset' in loc) {
-      return new Position(file, loc.offset, loc.line, loc.column);
+      if (![loc.offset, loc.line, loc.column].every(Number.isFinite))
+        return file.analysisPositionAt(
+          Number.isFinite(loc.offset) ? loc.offset : 0,
+        );
+      return loc instanceof Position
+        ? loc
+        : new Position(file, loc.offset, loc.line, loc.column);
     }
     return fromTokenEnd
       ? Position.fromCstEnd(file, loc)
@@ -93,20 +97,40 @@ export class Position implements IPosition {
   }
 
   static fromCstStart(fileName: Code, location: CstNodeLocation) {
+    if (
+      ![location.startOffset, location.startLine, location.startColumn].every(
+        Number.isFinite,
+      )
+    )
+      return fileName.analysisPositionAt(
+        Number.isFinite(location.startOffset) ? location.startOffset : 0,
+      );
     return new Position(
       fileName,
-      location.startOffset ?? 0,
-      location.startLine ?? firstLineIndex,
-      location.startColumn ?? firstColumnIndex,
+      location.startOffset,
+      location.startLine!,
+      location.startColumn!,
     );
   }
 
   static fromCstEnd(fileName: Code, location: CstNodeLocation) {
+    if (
+      ![location.endOffset, location.endLine, location.endColumn].every(
+        Number.isFinite,
+      )
+    )
+      return fileName.analysisPositionAt(
+        Number.isFinite(location.endOffset)
+          ? location.endOffset!
+          : Number.isFinite(location.startOffset)
+            ? location.startOffset
+            : 0,
+      );
     return new Position(
       fileName,
-      location.endOffset ?? 0,
-      location.endLine ?? firstLineIndex,
-      location.endColumn ?? firstColumnIndex,
+      location.endOffset!,
+      location.endLine!,
+      location.endColumn!,
     );
   }
 
@@ -139,8 +163,8 @@ export class Range implements IRange {
     // We can get into some weird cases when recovering
     // from parse errors, so do some checks with graceful
     // recovery.
-    this.start = start;
-    this.end = end ?? start;
+    this.start = Position.from(start.file, start);
+    this.end = end ? Position.from(end.file, end) : this.start;
     if (this.end.offset < this.start.offset) {
       this.end = this.start;
     }

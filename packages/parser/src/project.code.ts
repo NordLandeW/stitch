@@ -60,6 +60,7 @@ export class Code {
   sourceMapping?: SourceMapping;
   protected preprocessed!: PreprocessedDocument;
   protected sourceLines = new SourceLines('');
+  private analysisLines?: SourceLines;
   private incomingRefs?: Set<Reference>;
   private retired = false;
 
@@ -115,6 +116,19 @@ export class Code {
 
   get startPosition() {
     return Position.fromFileStart(this);
+  }
+
+  /** UTF-16 cursor boundary in the current analysis text, including EOF. */
+  get analysisLength() {
+    return this.preprocessed?.text.length ?? this.content?.length ?? 0;
+  }
+
+  analysisPositionAt(offset: number): Position {
+    const lines = this.preprocessed?.sourceMap
+      ? (this.analysisLines ||= new SourceLines(this.preprocessed.text))
+      : this.sourceLines;
+    const point = lines.position(offset);
+    return new Position(this, point.offset, point.line, point.column);
   }
 
   /**
@@ -387,6 +401,7 @@ export class Code {
   parseCollected() {
     this.clearAllDiagnostics();
     this.preprocessed = this.project.macros.preprocess(this);
+    this.analysisLines = undefined;
     this.sourceMapping = this.preprocessed.sourceMap
       ? this.project.macros.mapping(this.preprocessed.sourceMap)
       : undefined;
@@ -394,21 +409,19 @@ export class Code {
       this.preprocessed.text,
       this.preprocessed.lexed,
     );
-    if (this.preprocessed.sourceMap) {
-      for (const error of this._parsed.lexed.errors) {
-        const origin = this.preprocessed.sourceMap.origin(
-          error.offset,
-          error.offset + error.length - 1,
-        );
-        this.diagnostics.SYNTAX_ERROR.push(
-          Diagnostic.error(
-            error.message,
-            this.project.macros.physicalRange(
-              origin.expansion || origin.spelling,
-            ),
-          ),
-        );
-      }
+    for (const error of this._parsed.lexed.errors) {
+      const start = error.offset;
+      const end = start + Math.max(1, error.length) - 1;
+      const origin = this.preprocessed.sourceMap?.origin(start, end);
+      const span = origin
+        ? origin.expansion || origin.spelling
+        : { uri: this.path.absolute, start, end };
+      this.diagnostics.SYNTAX_ERROR.push(
+        Diagnostic.error(
+          error.message,
+          this.project.macros.physicalRange(span),
+        ),
+      );
     }
     for (const diagnostic of this.preprocessed.diagnostics) {
       this.diagnostics.SYNTAX_ERROR.push(

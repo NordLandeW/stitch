@@ -1,4 +1,10 @@
-import { CstParser, type CstNode, type ILexingResult } from 'chevrotain';
+import {
+  CstParser,
+  NotAllInputParsedException,
+  type CstNode,
+  type ILexingResult,
+  type IToken,
+} from 'chevrotain';
 import type { GmlVisitor } from '../gml-cst.js';
 import type { JsdocSummary } from './jsdoc.js';
 import { GmlLexer } from './lexer.js';
@@ -15,14 +21,82 @@ export interface GmlParsed {
 }
 
 export class GmlParser extends CstParser {
+  private rootOffset = 0;
+
+  override reset() {
+    super.reset();
+    this.rootOffset = 0;
+  }
+
+  protected override LA(howMuch: number): IToken {
+    return super.LA(howMuch + this.rootOffset);
+  }
+
   /** Parse GML Code, e.g. from a file. */
   parse(code: string, lexed = this.lexer.tokenize(code)): GmlParsed {
     this.input = lexed.tokens;
-    const cst = this.file();
+    let cst = this.file();
+    const errors: GmlParseError[] = [];
+    let chunk = cst;
+    let searchFrom = 0;
+    for (;;) {
+      const chunkErrors = this.errors;
+      const remaining = chunkErrors.find(
+        (error) => error instanceof NotAllInputParsedException,
+      );
+      if (remaining)
+        remaining.message = `Unexpected token '${remaining.token.image}' between statements`;
+      for (const error of chunkErrors) errors.push(error);
+      if (chunk !== cst) {
+        const target = cst.children.statements?.[0] as CstNode | undefined;
+        const extra = chunk.children.statements?.[0] as CstNode | undefined;
+        if (extra) {
+          if (!target) cst.children.statements = [extra];
+          else {
+            const statements = (target.children.statement ||= []);
+            for (const statement of extra.children.statement || [])
+              statements.push(statement);
+            cst.children.statements[0] = this.extendRootLocation(target, extra);
+          }
+        }
+        cst = this.extendRootLocation(cst, chunk);
+      }
+      if (!remaining) break;
+      // indexOf resumes at the last boundary: all searches together visit at
+      // most the token vector once. LA presents the suffix without copying it.
+      const index = lexed.tokens.indexOf(remaining.token, searchFrom);
+      if (index < searchFrom) break;
+      searchFrom = index + 1;
+      if (searchFrom >= lexed.tokens.length) break;
+      this.input = lexed.tokens;
+      this.rootOffset = searchFrom;
+      chunk = this.file();
+    }
+    this.errors = errors;
+    return { lexed, cst, errors };
+  }
+
+  private extendRootLocation(target: CstNode, source: CstNode): CstNode {
+    const from = source.location;
+    const to = { ...(target.location || { startOffset: NaN, endOffset: NaN }) };
+    if (
+      from &&
+      Number.isFinite(from.startOffset) &&
+      !Number.isFinite(to.startOffset)
+    ) {
+      to.startOffset = from.startOffset;
+      to.startLine = from.startLine;
+      to.startColumn = from.startColumn;
+    }
+    if (from && Number.isFinite(from.endOffset)) {
+      to.endOffset = from.endOffset;
+      to.endLine = from.endLine;
+      to.endColumn = from.endColumn;
+    }
     return {
-      lexed,
-      cst,
-      errors: this.errors,
+      ...target,
+      location: to,
+      recoveredNode: target.recoveredNode || source.recoveredNode,
     };
   }
 

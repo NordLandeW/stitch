@@ -40,8 +40,8 @@ export class StitchDocumentSymbolProvider
           symbol.name,
           symbol.detail,
           symbolKinds[symbol.kind],
-          rangeFrom(symbol.range),
-          rangeFrom(symbol.selectionRange),
+          document.validateRange(rangeFrom(symbol.range)),
+          document.validateRange(rangeFrom(symbol.selectionRange)),
         );
         result.children = symbol.children.map(convert);
         if (symbol.item.deprecated) {

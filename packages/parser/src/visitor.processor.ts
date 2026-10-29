@@ -128,9 +128,9 @@ export class SignifierProcessor {
    * After parsing the entire file, the last scope might not
    * have an appropriate end position. Set it here!
    */
-  setLastScopeEnd(rootNode: CstNodeLocation) {
+  setLastScopeEnd() {
     const lastScope = this.file.scopes.at(-1)!;
-    lastScope.end = this.scope.end.atEnd(rootNode);
+    lastScope.end = this.file.analysisPositionAt(this.file.analysisLength);
     if (lastScope.end.offset < lastScope.start.offset) {
       lastScope.end = lastScope.start;
     }

@@ -29,6 +29,12 @@ There are a lot of ways you can support this project:
 
 Stitch provides Intellisense (auto-complete, hovertext, function signature helpers, go-to-definition, find-references, etc) for all built-in and user-defined symbols.
 
+#### Diagnostics and incomplete edits
+
+Lexical errors, syntax errors and malformed JSDoc type annotations appear at their original source positions. After an unexpected file-level token, analysis resumes at the next token so later declarations remain available. Incomplete calls and recovered declarations retain usable cursor ranges, including at the end of an empty or unfinished buffer.
+
+JSDoc recovery retains recognizable types around a local error and preserves later annotations. Repairing the source refreshes symbols and withdraws the corresponding diagnostics. Recovery follows the existing grammar; a missing block boundary can leave its intended scope ambiguous. An internal-analysis failure diagnostic indicates that some symbol results are unavailable.
+
 #### Macro-aware editing
 
 Stitch expands project-wide GML `#macro` definitions before parsing their uses. Definitions can appear later in the same file or in another script or object event. Nested macros, backslash continuations, multiline verbatim strings and replacement fragments are interpreted in the calling code's context. Semicolons remain part of the replacement text.

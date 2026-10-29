@@ -103,7 +103,7 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     }
     this.diagnosticCollection.set(
       vscode.Uri.file(payload.filePath),
-      normalizeDiagnosticsEvents(payload),
+      normalizeDiagnosticsEvents(payload, document),
     );
   }
 

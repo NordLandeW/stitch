@@ -1,5 +1,7 @@
 import type { FunctionExpressionCstChildren } from '../gml-cst.js';
 import { VisitorContext, withCtxKind } from './parser.js';
+import { recoveredDelimiter } from './parser.utility.js';
+import { t } from './tokens.js';
 import { Range, fixITokenLocation } from './project.location.js';
 import { Signifier } from './signifiers.js';
 import { getTypeOfKind } from './types.checks.js';
@@ -143,8 +145,16 @@ export function visitFunctionExpression(
 
   // Functions have their own localscope as well as their self scope,
   // so we need to push both.
+  const parameters = children.functionParameters?.[0]?.children;
   const startParen = fixITokenLocation(
-    children.functionParameters[0].children.StartParen[0],
+    recoveredDelimiter(
+      this.FILE,
+      parameters?.StartParen?.[0],
+      parameters || children,
+      t.StartParen,
+      '(',
+      'start',
+    ),
   );
   this.PROCESSOR.scope.setEnd(startParen);
   this.PROCESSOR.pushScope(
@@ -167,7 +177,9 @@ export function visitFunctionExpression(
   let totalParams = 0;
   for (let i = 0; i < cstParams.length; i++) {
     const paramCtx = withCtxKind(ctx, 'functionParam');
-    const paramToken = cstParams[i].children.Identifier[0];
+    const paramToken = cstParams[i].children.Identifier?.[0];
+    if (!paramToken || paramToken.isInsertedInRecovery || !paramToken.image)
+      continue;
     const name = paramToken.image;
     const range = this.PROCESSOR.range(paramToken);
 
@@ -263,7 +275,14 @@ export function visitFunctionExpression(
   }
 
   // End the scope
-  const endBraceToken = children.blockStatement[0].children.EndBrace[0];
+  const body = children.blockStatement[0].children;
+  const endBraceToken = recoveredDelimiter(
+    this.FILE,
+    body.EndBrace?.[0],
+    body,
+    t.EndBrace,
+    '}',
+  );
   const declarationEnd = this.PROCESSOR.range(endBraceToken).end;
   const endBrace = fixITokenLocation(endBraceToken);
   if (signifier?.def?.file && (!assignedTo || assignedToIsDefinition)) {

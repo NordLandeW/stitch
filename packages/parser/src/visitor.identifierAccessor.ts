@@ -266,7 +266,7 @@ function processFunctionArguments(
   let methodReturns: Type | undefined;
 
   // Create the argumentRanges between the parens and each comma
-  const argsAndSeps = sortedFunctionCallParts(suffix);
+  const argsAndSeps = sortedFunctionCallParts(suffix, visitor.PROCESSOR.file);
   let argIdx = 0;
   let lastDelimiter: IToken;
   let lastTokenWasDelimiter = true;
@@ -288,7 +288,7 @@ function processFunctionArguments(
       // as the start position for the commas and parens
       // Start on the RIGHT side of the first delimiter
 
-      if (functionType) {
+      if (functionType && lastDelimiter!) {
         const start = Position.fromCstEnd(
           visitor.PROCESSOR.file,
           lastDelimiter!,
@@ -325,11 +325,13 @@ function processFunctionArguments(
       if (token.children.jsdoc) {
         visitor.jsdoc(token.children.jsdoc[0].children, functionCtx);
       }
+      const rhs = token.children.assignmentRightHandSide?.[0];
+      if (!rhs) {
+        lastTokenWasDelimiter = true;
+        continue;
+      }
       const inferredType = normalizeType(
-        visitor.assignmentRightHandSide(
-          token.children.assignmentRightHandSide[0].children,
-          functionCtx,
-        ),
+        visitor.assignmentRightHandSide(rhs.children, functionCtx),
         visitor.PROCESSOR.project.types,
       );
       if (isMethodCall && argIdx === 1) {

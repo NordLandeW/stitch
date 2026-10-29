@@ -843,6 +843,12 @@ export async function createHost() {
           Math.min(offset, bounds[line].end) - bounds[line].start,
         );
       },
+      validateRange(range: Range) {
+        return new Range(
+          document.positionAt(document.offsetAt(range.start)),
+          document.positionAt(document.offsetAt(range.end)),
+        );
+      },
       setText(value: string) {
         text = value;
         document.version++;

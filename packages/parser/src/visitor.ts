@@ -33,10 +33,13 @@ import { GmlVisitorBase, VisitorContext, withCtxKind } from './parser.js';
 import {
   functionFromRhs,
   identifierFrom,
+  recoveredDelimiter,
   sortChildren,
   stringLiteralAsString,
 } from './parser.utility.js';
 import type { Code } from './project.code.js';
+import { Diagnostic } from './project.diagnostics.js';
+import { t } from './tokens.js';
 import {
   Position,
   Range,
@@ -78,6 +81,14 @@ export function registerSignifiers(file: Code) {
     );
     err.cause = parseErr;
     logger.error(err);
+    file.addDiagnostic(
+      'SYNTAX_ERROR',
+      Diagnostic.error(
+        'Internal symbol analysis failed; some results are unavailable.',
+        Range.physical(file.startPosition),
+        err,
+      ),
+    );
   }
 }
 
@@ -104,7 +115,7 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
   /** Entrypoint */
   UPDATE_SIGNIFIERS(input: CstNode) {
     this.visit(input, { ctxKindStack: [] });
-    this.PROCESSOR.setLastScopeEnd(input.location!);
+    this.PROCESSOR.setLastScopeEnd();
     return this.PROCESSOR;
   }
 
@@ -336,15 +347,19 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     children: WithStatementCstChildren,
     context: VisitorContext,
   ) {
-    const blockLocation = children.blockableStatement[0].location!;
+    const blockLocation = children.blockableStatement?.[0]?.location;
     // With statements change the self scope to
     // whatever their expression evaluates to.
     // Evaluate the expression and try to use its type as the self scope
     const docs = this.PROCESSOR.consumeJsdoc();
-    const contextExpression = this.expression(
-      children.expression[0].children,
-      withCtxKind(context, 'withCondition'),
-    );
+    const expression = children.expression?.[0];
+    const contextExpression = expression
+      ? this.expression(
+          expression.children,
+          withCtxKind(context, 'withCondition'),
+        )
+      : this.ANY;
+    if (!blockLocation) return;
     const contextFromDocs =
       docs?.jsdoc.kind === 'self' ? docs.type[0] : undefined;
 
@@ -353,7 +368,8 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
       getTypeOfKind(contextExpression, withableTypes) ||
       this.PROCESSOR.createStruct(blockLocation);
 
-    this.PROCESSOR.scope.setEnd(children.expression[0].location!, true);
+    if (expression?.location)
+      this.PROCESSOR.scope.setEnd(expression.location, true);
     this.PROCESSOR.pushSelfScope(blockLocation, self, false);
 
     this.visit(children.blockableStatement, withCtxKind(context, 'withBody'));
@@ -392,7 +408,15 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     }
     this.visit(children.blockStatement, ctx);
 
-    this.PROCESSOR.popLocalScope(children.blockStatement[0].location!, true);
+    const block = children.blockStatement?.[0];
+    const closing = recoveredDelimiter(
+      this.FILE,
+      block?.children.EndBrace?.[0],
+      block?.children || children,
+      t.EndBrace,
+      '}',
+    );
+    this.PROCESSOR.popLocalScope(closing, true);
   }
 
   override functionStatement(
@@ -551,6 +575,13 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     ctx: VisitorContext,
   ): Type<'Struct'> {
     const signifier = ctx.signifier;
+    const closing = recoveredDelimiter(
+      this.FILE,
+      children.EndBrace?.[0],
+      children,
+      t.EndBrace,
+      '}',
+    );
     // We may already have a struct type attached to a signfier,
     // which should be updated instead of replaced.
     const structFromDocs =
@@ -560,7 +591,7 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     const struct =
       ctx.signifier?.getTypeByKind('Struct') ||
       structFromDocs ||
-      this.PROCESSOR.createStruct(children.StartBrace[0], children.EndBrace[0]);
+      this.PROCESSOR.createStruct(children.StartBrace[0], closing);
     signifier?.setType(struct);
     if (signifier?.def?.file && ctx.signifierIsDefinition) {
       const literalStart = this.PROCESSOR.range(children.StartBrace[0]).start;
@@ -569,10 +600,7 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
           ? signifier.def.start
           : literalStart;
       signifier.declaredAt(
-        new Range(
-          declarationStart,
-          this.PROCESSOR.range(children.EndBrace[0]).end,
-        ),
+        new Range(declarationStart, this.PROCESSOR.range(closing).end),
       );
     }
     ctx.signifier = undefined;
@@ -588,7 +616,7 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     // }
 
     // Create the newMember ranges, to help with autocompletes
-    const sortedParts = sortChildren(children);
+    const sortedParts = sortChildren({ ...children, EndBrace: [closing] });
     let nextRange: StructNewMemberRange | undefined;
     for (let i = 0; i < sortedParts.length; i++) {
       const part = sortedParts[i];
@@ -621,15 +649,25 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
       // The name is either a direct variable name or a string literal.
       let name: string;
       let range: Range;
-      if (parts.Identifier) {
+      if (parts.Identifier?.[0] && !parts.Identifier[0].isInsertedInRecovery) {
         name = parts.Identifier[0].image;
         range = this.PROCESSOR.range(parts.Identifier[0]);
-      } else {
-        name = stringLiteralAsString(parts.stringLiteral![0].children);
+      } else if (
+        parts.stringLiteral?.[0]?.children.StringStart?.[0] &&
+        parts.stringLiteral[0].children.StringEnd?.[0]
+      ) {
+        name = stringLiteralAsString(parts.stringLiteral[0].children);
         range = this.PROCESSOR.range(
           parts.stringLiteral![0].children.StringStart[0],
           parts.stringLiteral![0].children.StringEnd[0],
         );
+      } else {
+        if (parts.assignmentRightHandSide?.[0])
+          this.assignmentRightHandSide(
+            parts.assignmentRightHandSide[0].children,
+            ctx,
+          );
+        continue;
       }
       if (parts.assignmentRightHandSide) {
         assignVariable(
@@ -729,17 +767,12 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
       }
     } else if (children.ternaryExpression) {
       // Get the types of the two expression and create a union
-      const ternary =
-        children.ternaryExpression[0].children.assignmentRightHandSide;
-      const leftType = this.assignmentRightHandSide(
-        ternary[0].children,
-        context,
+      const arms =
+        children.ternaryExpression[0].children.assignmentRightHandSide || [];
+      const types = arms.flatMap((arm) =>
+        arrayWrapped(this.assignmentRightHandSide(arm.children, context)),
       );
-      const rightType = this.assignmentRightHandSide(
-        ternary[1].children,
-        context,
-      );
-      return [...arrayWrapped(leftType), ...arrayWrapped(rightType)];
+      return arms.length < 2 ? [...types, this.ANY] : types;
     } else if (children.assignment) {
       // We shouldn't really end up here since well-formed code
       // should have assignments that get caught by other rules.

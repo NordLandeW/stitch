@@ -12,7 +12,8 @@ import {
 import { JsdocSummary, parseJsdoc } from './jsdoc.js';
 import { logger } from './logger.js';
 import { GmlVisitorBase } from './parser.js';
-import { identifierFrom } from './parser.utility.js';
+import { identifierFrom, recoveredDelimiter } from './parser.utility.js';
+import { t } from './tokens.js';
 import type { Code } from './project.code.js';
 import { Diagnostic } from './project.diagnostics.js';
 import { Position, Range } from './project.location.js';
@@ -30,6 +31,14 @@ export function registerGlobals(file: Code) {
     const err = new StitchParserError(`Error parsing globals in ${file.path}`);
     err.cause = parseError;
     logger.error(err);
+    file.addDiagnostic(
+      'SYNTAX_ERROR',
+      Diagnostic.error(
+        'Internal global analysis failed; some results are unavailable.',
+        Range.physical(file.startPosition),
+        err,
+      ),
+    );
   }
 }
 
@@ -103,7 +112,7 @@ export class GmlGlobalDeclarationsVisitor extends GmlVisitorBase {
     isNotDef = false,
   ): Signifier | undefined {
     const name = children.Identifier?.[0];
-    if (!name) return;
+    if (!name || name.isInsertedInRecovery || !name.image) return;
     const range = this.PROCESSOR.range(name);
     return this.REGISTER_GLOBAL_BY_NAME(name.image, range, isNotDef);
   }
@@ -169,11 +178,16 @@ export class GmlGlobalDeclarationsVisitor extends GmlVisitorBase {
    * are globally visible.
    */
   override enumStatement(children: EnumStatementCstChildren) {
-    const symbol = this.REGISTER_GLOBAL(children)! as Signifier;
-    assert(symbol, 'Enum symbol should exist');
-    symbol.declaredAt(
-      this.PROCESSOR.range(children.Enum[0], children.EndBrace[0]),
+    const symbol = this.REGISTER_GLOBAL(children);
+    if (!symbol) return;
+    const closing = recoveredDelimiter(
+      this.PROCESSOR.file,
+      children.EndBrace?.[0],
+      children,
+      t.EndBrace,
+      '}',
     );
+    symbol.declaredAt(this.PROCESSOR.range(children.Enum[0], closing));
     symbol.enum = true;
     let type = symbol.getTypeByKind('Enum');
     if (!type) {
@@ -188,8 +202,9 @@ export class GmlGlobalDeclarationsVisitor extends GmlVisitorBase {
     this.PROCESSOR.project.types.set(`Enum.${symbol.name}`, type);
 
     // Upsert the enum members
-    for (let i = 0; i < children.enumMember.length; i++) {
-      const name = children.enumMember[i].children.Identifier[0];
+    for (let i = 0; i < (children.enumMember?.length || 0); i++) {
+      const name = children.enumMember[i].children.Identifier?.[0];
+      if (!name || name.isInsertedInRecovery || !name.image) continue;
       const range = this.PROCESSOR.range(name);
       // Does member already exist?
       const member = type.getMember(name.image) || type.addMember(name.image)!;
