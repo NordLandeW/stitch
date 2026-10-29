@@ -13,7 +13,7 @@ import {
   type YypResource,
 } from '@bscotch/yy';
 import { expect } from 'chai';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { LanguageProfile } from './language/version.js';
@@ -32,6 +32,7 @@ import { Native } from './project.native.js';
 import { Project, type ProjectOptions } from './project.js';
 import { Signifier } from './signifiers.js';
 import { Type, type TypeStore } from './types.js';
+import { importAssets } from './modules.js';
 
 type FixtureKind = 'scripts' | 'objects' | 'extensions';
 
@@ -551,6 +552,71 @@ describe('Project resource reconciliation with owned temporary files', function 
       }
       expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
     });
+  });
+
+  it('keeps Create field definitions canonical when another event declares a writing helper', async function () {
+    await withFixture(async (fixture) => {
+      const helper = 'function Update(){field=2;}var observed=field;';
+      await fixture.object(
+        'DefinitionOwner',
+        {
+          'Create_0.gml': 'field=1;',
+          'Alarm_0.gml': helper,
+        },
+        [0, 2],
+      );
+      const project = await fixture.load();
+      const create = fixture.code('DefinitionOwner', 'Create_0.gml');
+      const alarm = fixture.code('DefinitionOwner', 'Alarm_0.gml');
+      const verify = () => {
+        const field = fixture
+          .asset('DefinitionOwner', 'objects')
+          .variables!.getMember('field')!;
+        expect(field.def?.file?.path.absolute).to.equal(create.path.absolute);
+        for (const code of [create, alarm])
+          expect(
+            code.refs
+              .filter((reference) => reference.text === 'field')
+              .every((reference) => reference.item === field),
+          ).to.equal(true);
+      };
+      verify();
+      await alarm.reload('// shifted helper\n' + helper);
+      verify();
+      await alarm.reload(helper);
+      verify();
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+    });
+  });
+
+  it('imports a user-global dependency even when the target has a same-name native', async function () {
+    await withFixture(async (source) =>
+      withFixture(async (target) => {
+        await source.script(
+          'Dependency',
+          'function string(){return "custom";}',
+        );
+        await source.script(
+          'Consumer',
+          'function ReadCustom(){return global.string();}',
+        );
+        const from = await source.load();
+        const to = await target.load();
+        expect(to.self.getMember('string')?.native).to.be.ok;
+        expect(to.analysis.globalStorage.getMember('string')).to.equal(
+          undefined,
+        );
+        await importAssets(from, to, {
+          sourceAsset: 'Consumer',
+          onMissingDependency: 'include',
+        });
+        expect(to.getAssetByName('Dependency')).to.exist;
+        expect(
+          to.analysis.globalStorage.getMember('string')?.def?.file?.asset.name,
+        ).to.equal('Dependency');
+        expect(to.analysis.isCurrent).to.equal(true);
+      }),
+    );
   });
 
   it('clears and replaces object parents, diagnoses metadata cycles, and repairs inheritance without stale fields', async function () {
@@ -2249,6 +2315,17 @@ describe('YY-owned executable source contexts', function () {
       expect(
         consumer.getDiagnostics().MISSING_REQUIRED_ARGUMENT,
       ).to.have.lengthOf(0);
+      // Context-sensitive invocation must retain each public entry contract too.
+      await writeFile(
+        code.path.absolute,
+        code.content.replace(
+          'return argument0;',
+          'var calling_context = other; return argument0;',
+        ),
+        'utf8',
+      );
+      await code.reload();
+      expectValue(consumer, 'first_result', 'String');
       await fixture.updateExtension(
         fixture.asset('SourceExtension', 'extensions'),
         (yy) => {
@@ -2754,6 +2831,225 @@ describe('Extension argument metadata', function () {
         expect(kinds(parameters[0]!.type)).to.deep.equal(['String']);
         expect(kinds(parameters[1]!.type)).to.deep.equal(['Real']);
       }
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+    });
+  });
+});
+
+describe('Inherited method return summaries', function () {
+  it('keeps boolean returns through a constructor static, inheritance and an annotated instance', async function () {
+    await withFixture(async (fixture) => {
+      await fixture.script(
+        'Camera',
+        'function Camera() constructor {cameraX=0;cameraY=0;cameraW=1;cameraH=1;static pos_inbound=function(x,y,tol_x=0,tol_y=0){return x>=cameraX;};}global.cameraManager=new Camera();',
+      );
+      await fixture.script(
+        'Lighting',
+        'function Light() constructor {enabled=true;position={x:0,y:0};clipTolerance={x:0,y:0};static inbound=function(){if(!enabled)return false;return global.cameraManager.pos_inbound(position.x,position.y,clipTolerance.x,clipTolerance.y);};}function PointLight():Light() constructor {}',
+      );
+      await fixture.script(
+        'Consumer',
+        'var light=new Light();var first=light.inbound();\n/// @type {Struct.PointLight}\nvar light=new PointLight();var second=light.inbound();',
+      );
+      const project = await fixture.load();
+      const code = fixture.code('Consumer');
+      expectValue(code, 'first', 'Bool');
+      expectValue(code, 'second', 'Bool');
+      const inbound = project.types
+        .get('Struct.Light')!
+        .getMember('inbound')!
+        .getTypeByKind('Function')!;
+      expect(kinds(inbound.returns)).to.deep.equal(['Bool']);
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+    });
+  });
+});
+
+describe('Other-mode project inputs', function () {
+  it('reloads real options with imported callers, diagnostics recovery and cold equivalence', async function () {
+    await withFixture(async (fixture) => {
+      const path = pathy(fixture.file('options/main/options_main.yy')).absolute;
+      await mkdir(fixture.file('options/main'), { recursive: true });
+      const write = (setting: unknown) =>
+        writeFile(
+          path,
+          JSON.stringify({ option_legacy_other_behaviour: setting }),
+          'utf8',
+        );
+      await write(false);
+      await fixture.script(
+        'Reader',
+        'function ReadOther(){return other.value;}',
+      );
+      await fixture.script(
+        'Caller',
+        'global.value=true;function Outer()constructor{value=1;var callback=method({},ReadOther);var caller={value:"text"};var selected;with(caller){selected=callback();}result=selected;}var observed=(new Outer()).result;',
+      );
+      const project = await fixture.load();
+      const native = project.native;
+      const code = fixture.code('Caller');
+      expectValue(code, 'observed', 'String');
+      expect(project.legacyOtherBehaviour).to.equal(false);
+      const verifyCold = async () => {
+        const cold = await fixture.cold();
+        try {
+          expect(snapshot(project)).to.deep.equal(snapshot(cold));
+        } finally {
+          cold.dispose();
+        }
+      };
+      await verifyCold();
+      for (const setting of [true, undefined, 'invalid', false]) {
+        await write(setting);
+        await project.reloadResource(pathy(path));
+        expectAvailable(project);
+        expect(project.native).to.equal(native);
+        expect(project.legacyOtherBehaviour).to.equal(
+          typeof setting === 'boolean' ? setting : undefined,
+        );
+        if (typeof setting === 'boolean') {
+          expectValue(code, 'observed', setting ? 'Real' : 'String');
+          expect(project.publishedFor(path)).to.have.length(0);
+        } else {
+          expect(
+            kinds(definition(code, 'observed').item.type),
+          ).not.to.deep.equal(['Bool']);
+          expect(
+            project
+              .publishedFor(path)
+              .some(
+                (item) =>
+                  item.severity === (setting === undefined ? 'info' : 'error'),
+              ),
+          ).to.equal(true);
+        }
+        await verifyCold();
+      }
+      await writeFile(path, '{', 'utf8');
+      await project.reloadResource(pathy(path));
+      expectAvailable(project);
+      expect(project.legacyOtherBehaviour).to.equal(undefined);
+      expect(
+        project.publishedFor(path).some((item) => item.severity === 'error'),
+      ).to.equal(true);
+      await rm(path);
+      await project.reloadResource(pathy(path));
+      expect(project.legacyOtherBehaviour).to.equal(undefined);
+      expect(
+        project.publishedFor(path).every((item) => item.severity === 'info'),
+      ).to.equal(true);
+      await write(false);
+      await project.reloadResource(pathy(path));
+      expectValue(code, 'observed', 'String');
+      expect(project.publishedFor(path)).to.have.length(0);
+      await verifyCold();
+    });
+  });
+});
+
+describe('Nested invocation publication', function () {
+  it('publishes returned allocation graphs and their source declarations across calls', async function () {
+    await withFixture(async (fixture) => {
+      await mkdir(fixture.file('options/main'), { recursive: true });
+      await writeFile(
+        fixture.file('options/main/options_main.yy'),
+        JSON.stringify({ option_legacy_other_behaviour: false }),
+        'utf8',
+      );
+      const leaf = 'function Leaf(){return {payload:other.field};}';
+      await fixture.script('Leaf', leaf);
+      await fixture.script('Wrapper', 'function Wrapper(){return Leaf();}');
+      const consumer =
+        'function Probe(){var callback=method({},Wrapper);var caller={field:"text"};var result;with(caller){result=callback();}return result.payload;}var observed=Probe();';
+      await fixture.script('Consumer', consumer);
+      const project = await fixture.load();
+      const code = fixture.code('Consumer');
+      expectValue(code, 'observed', 'String');
+      const references = code.getReferenceCandidatesAt(
+        consumer.indexOf('result.payload') + 'result.'.length,
+      );
+      expect(references).to.have.length(1);
+      const target = references[0].item.def;
+      expect(target?.file).to.equal(fixture.code('Leaf'));
+      expect(target?.file && target.start.offset).to.equal(
+        leaf.indexOf('payload'),
+      );
+      const cold = await fixture.cold();
+      try {
+        expect(snapshot(project)).to.deep.equal(snapshot(cold));
+      } finally {
+        cold.dispose();
+      }
+    });
+  });
+
+  it('publishes named constructor results through two invocation import boundaries', async function () {
+    await withFixture(async (fixture) => {
+      await mkdir(fixture.file('options/main'), { recursive: true });
+      await writeFile(
+        fixture.file('options/main/options_main.yy'),
+        JSON.stringify({ option_legacy_other_behaviour: false }),
+        'utf8',
+      );
+      const source =
+        'function Box(input)constructor{var context=other;payload=input;}';
+      await fixture.script('Box', source);
+      await fixture.script(
+        'Middle',
+        'function Middle(){return new Box(other.field);}',
+      );
+      await fixture.script('Wrapper', 'function Wrapper(){return Middle();}');
+      const consumer =
+        'function Probe(){var cb=method({},Wrapper);var caller={field:"text"};var result;with(caller){result=cb();}return result.payload;}var observed=Probe();';
+      await fixture.script('Consumer', consumer);
+      const project = await fixture.load();
+      const code = fixture.code('Consumer');
+      expectValue(code, 'observed', 'String');
+      const refs = code.getReferenceCandidatesAt(
+        consumer.indexOf('result.payload') + 'result.'.length,
+      );
+      expect(refs).to.have.length(1);
+      const def = refs[0].item.def;
+      expect(def?.file).to.equal(fixture.code('Box'));
+      expect(def?.file && def.start.offset).to.equal(source.indexOf('payload'));
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+    });
+  });
+
+  it('keeps mutually recursive helper graphs closed across source files', async function () {
+    await withFixture(async (fixture) => {
+      await fixture.script(
+        'Left',
+        'function Left(){return {left:1,next:Right()};}',
+      );
+      await fixture.script(
+        'Right',
+        'function Right(){return {right:"text",next:Left()};}',
+      );
+      const project = await fixture.load();
+      const assertChain = (rightKind: string) => {
+        let current = project.self.getMember('Left')!.getTypeByKind('Function')!
+          .returns!.type[0];
+        for (let depth = 0; depth < 32; depth++) {
+          expect(kinds(current.getMember('left')!.type)).to.deep.equal([
+            'Real',
+          ]);
+          const right = current.getMember('next')!.type.type[0];
+          expect(kinds(right.getMember('right')!.type)).to.deep.equal([
+            rightKind,
+          ]);
+          current = right.getMember('next')!.type.type[0];
+        }
+      };
+      assertChain('String');
+      expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
+      const right = fixture.code('Right');
+      await writeFile(
+        right.path.absolute,
+        'function Right(){return {right:true,next:Left()};}',
+      );
+      await project.reloadResource(right.path);
+      assertChain('Bool');
       expect(snapshot(project)).to.deep.equal(snapshot(await fixture.cold()));
     });
   });

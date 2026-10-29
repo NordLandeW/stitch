@@ -313,8 +313,10 @@ export class Reference extends Range {
     const text = this.text;
     return (
       this.rename?.kind !== 'none' &&
-      this.item.isRenameable &&
-      (this.rename?.kind === 'string-key' || this.itemNamePattern.test(text))
+      this.rename?.kind !== 'implicit' &&
+      (this.rename?.kind === 'string-key'
+        ? !this.item.native && !this.item.resourceDefinition && !this.item.asset
+        : this.item.isRenameable && this.itemNamePattern.test(text))
     );
   }
 
@@ -326,20 +328,16 @@ export class Reference extends Range {
   toRenamed(newName: string): string {
     switch (this.rename?.kind) {
       case 'none':
+      case 'implicit':
         return this.text;
       case 'shorthand-value':
         return `${this.rename.property}: ${newName}`;
       case 'shorthand-property':
         return `${newName}: ${this.rename.value}`;
-      case 'string-key': {
-        const quote = this.text.startsWith("@'")
-          ? "'"
-          : this.text.startsWith("'")
-            ? "'"
-            : '"';
-        const prefix = this.text.startsWith('@') ? '@' : '';
-        return `${prefix}${quote}${newName.replaceAll('\\', '\\\\').replaceAll(quote, `\\${quote}`)}${quote}`;
-      }
+      case 'string-key':
+        // Canonical escaped strings preserve the actual key, including keys
+        // originally written as verbatim literals or containing control chars.
+        return JSON.stringify(newName);
       default:
         return this.text.replace(this.itemNamePattern, newName);
     }
@@ -366,6 +364,9 @@ export function planReferenceRename(
   const universe = allReferences && [...allReferences];
   const edits = new Map<string, ReferenceRenameEdit>();
   const targets = new Set(selected.map((reference) => reference.item));
+  const quotedOnly =
+    selected.length > 0 &&
+    selected.every((ref) => ref.rename?.kind === 'string-key');
   const tokens = GmlLexer.tokenize(newName);
   const token = tokens.tokens[0];
   const propertyOnly =
@@ -377,13 +378,14 @@ export function planReferenceRename(
         (reference.rename?.kind === 'identifier' && reference.rename.property),
     );
   if (
-    tokens.errors.length ||
-    tokens.tokens.length !== 1 ||
-    token.image !== newName ||
-    !(
-      token.tokenType.name === 'Identifier' ||
-      (propertyOnly && tokenMatcher(token, c.Keyword))
-    )
+    !quotedOnly &&
+    (tokens.errors.length ||
+      tokens.tokens.length !== 1 ||
+      token.image !== newName ||
+      !(
+        token.tokenType.name === 'Identifier' ||
+        (propertyOnly && tokenMatcher(token, c.Keyword))
+      ))
   )
     throw new Error(
       'The new name must be a valid GML identifier for every reference.',
@@ -395,8 +397,37 @@ export function planReferenceRename(
         `The name ${newName} already exists in this storage scope.`,
       );
   }
+  const possibleCaptures = universe || [
+    ...new Set(selected.flatMap((reference) => reference.file.refs || [])),
+  ];
+  for (const reference of possibleCaptures) {
+    if (
+      targets.has(reference.item) ||
+      reference.item.name !== newName ||
+      reference.role === 'type'
+    )
+      continue;
+    const recipe = reference.rename;
+    if (
+      recipe &&
+      recipe.kind !== 'shorthand-value' &&
+      !(recipe.kind === 'identifier' && !recipe.property)
+    )
+      continue;
+    const query = reference.queryRange || reference;
+    const scope = query.file.getScopeRangeAt?.(query.start.offset);
+    if (
+      [...targets].some(
+        (target) => scope?.local.getMember(target.name) === target,
+      )
+    )
+      throw new Error(
+        `The name ${newName} would capture another symbol's existing references.`,
+      );
+  }
   for (const reference of selected) {
     const recipe = reference.rename;
+    if (recipe?.kind === 'implicit') continue;
     if (
       reference.role !== 'type' &&
       (recipe?.kind === 'shorthand-value' ||

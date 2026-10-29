@@ -489,8 +489,7 @@ export async function activateStitchExtension(
     context('stitch.selectionIsSound', asset?.isSound ? asset.name : false);
     if (
       !stitchConfig.enableFunctionSignatureStatus ||
-      event.selections.length !== 1 ||
-      !selection.isEmpty
+      event.selections.length !== 1
     )
       return;
     const help = workspace.getSignatureHelp(document, selection.start);

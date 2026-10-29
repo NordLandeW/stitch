@@ -88,6 +88,78 @@ for (const failure of [
   );
 }
 
+for (const replaceExisting of [false, true]) {
+  test(
+    `metadata reconciliation ${replaceExisting ? 'replaces' : 'restores'} the resource in the real tree`,
+    { timeout: 30_000 },
+    async (t) => {
+      const host = await createTreeHost();
+      t.after(() => host.dispose());
+      const workspace = await host.activate();
+      const tree = actualTree(
+        host,
+        resourceView,
+        host.subject.GameMakerTreeProvider,
+      );
+      const project = await host.project();
+      project.yyp.Folders = [{ name: 'Owned', folderPath: 'folders/Owned.yy' }];
+      workspace.projects.push(project);
+      const previous = replaceExisting
+        ? host.subject.addCode(project, 'Restored', 'var before = 1;')
+        : undefined;
+      if (previous)
+        previous.asset.yy.parent = { name: 'Owned', path: 'folders/Owned.yy' };
+      tree.rebuild();
+      let restored: any;
+      // Resource loading is the external input port. The actual tracker,
+      // Project/Code registration, event bus and tree providers stay live.
+      project.reloadResource = async () => {
+        previous?.asset.retireModel();
+        project.yyp.resources = project.yyp.resources.filter(
+          (entry: any) => entry.id.name !== 'Restored',
+        );
+        restored = host.subject.addCode(
+          project,
+          'Restored',
+          'var after = "current";',
+        );
+        restored.asset.yy.parent = { name: 'Owned', path: 'folders/Owned.yy' };
+        await project.analysis.analyze();
+      };
+      const published: any[] = [];
+      const subscription = host.subject.stitchEvents.on(
+        'asset-changed',
+        (asset: any) => published.push(asset),
+      );
+      t.after(() => subscription.off());
+      workspace.externalChangeTracker.addChange({
+        type: 'create',
+        uri: host.vscode.Uri.file(
+          project.dir.join('scripts/Restored/Restored.yy').absolute,
+        ),
+      });
+      await workspace.externalChangeTracker.flush();
+      const visible: any[] = [],
+        pending = [...(tree.getChildren() || [])];
+      while (pending.length) {
+        const item = pending.pop();
+        if (item instanceof host.subject.TreeAsset) visible.push(item.asset);
+        else pending.push(...(tree.getChildren(item) || []));
+      }
+      assert(
+        visible.includes(restored.asset),
+        'The restored model must appear in the public tree children',
+      );
+      if (previous)
+        assert(
+          !visible.includes(previous.asset),
+          'The tree must release the retired asset',
+        );
+      assert.deepEqual(published, [restored.asset]);
+    },
+  );
+}
+
 test(
   'real inspector rebuild failure releases its already-created view and editor listener',
   { timeout: 30_000 },

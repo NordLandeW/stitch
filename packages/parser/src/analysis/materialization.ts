@@ -317,6 +317,9 @@ export function installTypeContributions(
     target.isConstructor = false;
     target.functionSource = undefined;
     target.methodSource = undefined;
+    target.allocationSource = undefined;
+    target.usesOther = false;
+    target.callsLocalCallable = false;
     return;
   }
   const source =
@@ -325,12 +328,15 @@ export function installTypeContributions(
     ) || sources[0];
   if (target.kind !== source.kind) target.kind = source.kind;
   target.semanticKey = source.semanticKey || target.semanticKey;
+  target.allocationSource = source.allocationSource;
   target.name = source.name;
   target.description = source.description;
   target.isConstructor = sources.some((entry) => entry.isConstructor);
   target.isGeneric = source.isGeneric;
   target.isReadonly = source.isReadonly;
   target.callKind = source.callKind;
+  target.usesOther = sources.some((entry) => entry.usesOther);
+  target.callsLocalCallable = sources.some((entry) => entry.callsLocalCallable);
   target.functionSource = source.functionSource;
   target.methodSource =
     source.methodSource &&
@@ -378,6 +384,7 @@ export function installSymbolContributions(
 ): void {
   if (!sources.length) {
     target.resourceDefinition = undefined;
+    target.canonicalKey = undefined;
     target.replaceDefinition(undefined);
     target.setType([]);
     return;
@@ -405,6 +412,7 @@ export function installSymbolContributions(
       host,
     ),
   );
+  target.canonicalKey = source.canonicalKey;
   // Copied GML metadata cannot perpetuate a removed resource declaration.
   target.resourceDefinition = resourceDefinition;
   if (resourceDefinition) {
@@ -419,4 +427,22 @@ export function installSymbolContributions(
     ? materializeSourceRange(source.declaration.declaration, host)
     : source.item.declaration;
   target.replaceDefinition(definition, declaration);
+}
+
+/** Copy an already merged view through an identity-preserving public mapping.
+ * Declaration priority and union normalization were resolved during preparation. */
+export function copyPreparedSymbol(
+  source: Signifier | undefined,
+  target: Signifier,
+  host: MaterializationHost,
+): void {
+  if (!source) {
+    installSymbolContributions([], target, host);
+    return;
+  }
+  const type = new TypeStore();
+  type.type = source.type.type.map((entry) => host.value(entry));
+  target.semanticKey = source.semanticKey;
+  target.replaceMetadata(source, type);
+  target.replaceDefinition(source.def, source.declaration);
 }

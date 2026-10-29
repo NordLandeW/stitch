@@ -4,6 +4,7 @@ export { importAssets, type ImportModuleOptions } from './modules.js';
 export * from './project.asset.js';
 export { Code } from './project.code.js';
 export type { Diagnostic } from './project.diagnostics.js';
+export { renamedPath } from './project.edits.js';
 export * from './project.js';
 export {
   FunctionArgRange,

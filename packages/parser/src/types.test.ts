@@ -10,6 +10,14 @@ import { KnownTypesMap, typeFromFeatherString } from './types.feather.js';
 import { Type, TypeStore } from './types.js';
 
 describe('Types', function () {
+  it('distinguishes an unknown function result from an explicit undefined return', function () {
+    const callable = Type.Function.named('result');
+    callable.returns = new TypeStore();
+    expect(callable.code).to.equal('function result(): Any');
+    callable.setReturnType(Type.Undefined);
+    expect(callable.code).to.equal('function result(): Undefined');
+  });
+
   it('preserves generic alias unions and leaves parameterized inputs unchanged', function () {
     const alternatives = [
       new Type('Real').named('T').genericize(),

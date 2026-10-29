@@ -80,6 +80,7 @@ export type Expression =
   | (SyntaxNode & {
       readonly kind: 'struct';
       readonly entries: readonly StructEntry[];
+      readonly memberGaps: readonly SourceOrigin[];
     })
   | FunctionExpression
   | (SyntaxNode & {
@@ -103,6 +104,7 @@ export type Expression =
     })
   | (SyntaxNode & {
       readonly kind: 'assign';
+      readonly docs?: JsdocSummary;
       readonly operator: string;
       readonly target: Expression;
       readonly value: Expression;
@@ -254,6 +256,8 @@ export interface UnitContext {
     Partial<Pick<LanguageProfile, 'nativeDegraded'>>;
   readonly strictUserArity?: boolean;
   readonly autoDeclareGlobalsPrefixes?: readonly string[];
+  /** Unknown when the project does not explicitly select an other-scope mode. */
+  readonly legacyOtherBehaviour?: boolean;
 }
 export type DeclarationRole =
   | 'local'
@@ -307,6 +311,8 @@ export interface BoundFunction {
   readonly selfOwner: TypeKey;
   readonly scope: string;
   readonly declaration?: Declaration;
+  readonly usesOther?: boolean;
+  readonly callsLocalCallable?: boolean;
 }
 export interface BoundUnit {
   readonly unitId: string;
@@ -318,6 +324,16 @@ export interface BoundUnit {
   readonly declarationSites: ReadonlyMap<string, Declaration>;
   readonly functions: ReadonlyMap<string, BoundFunction>;
   readonly diagnostics: readonly SemanticDiagnostic[];
+}
+
+/** Immutable executable input, addressed independently from a callable's shape. */
+export interface FunctionImplementation {
+  readonly bound: BoundUnit;
+  readonly functionId: string;
+  readonly fingerprint: string;
+}
+export function implementationKey(unitId: string, functionId: string): string {
+  return `implementation:${JSON.stringify([unitId, functionId])}`;
 }
 
 /** A definite resource field whose source format has no safe rename editor yet. */
@@ -343,6 +359,8 @@ export interface LookupRequest {
 }
 export interface SymbolView {
   readonly key: SymbolKey;
+  /** A per-instance flow slot may retain a shared source declaration identity. */
+  readonly canonicalKey?: SymbolKey;
   readonly item: Signifier;
   readonly origin?: SourceOrigin;
   readonly declaration?: Declaration;
@@ -353,7 +371,13 @@ export interface SymbolView {
   readonly intrinsic?: boolean;
 }
 export interface SemanticDependency {
-  readonly kind: 'lookup' | 'missing' | 'type' | 'usage' | 'capability';
+  readonly kind:
+    | 'lookup'
+    | 'missing'
+    | 'type'
+    | 'usage'
+    | 'capability'
+    | 'implementation';
   readonly owner: string;
   readonly name?: string;
   readonly target?: string;
@@ -370,6 +394,11 @@ export interface SemanticDependency {
 export interface SemanticEnvironment {
   lookup(request: LookupRequest): SymbolView | undefined;
   type(key: TypeKey): Type | undefined;
+  /** When supplied, absence is authoritative: never execute a carrier's old body. */
+  implementation?(
+    unitId: string,
+    functionId: string,
+  ): FunctionImplementation | undefined;
   observe(dependency: SemanticDependency): void;
   cancelled(): boolean;
 }
@@ -391,6 +420,8 @@ export type RenameRecipe =
   | { readonly kind: 'shorthand-value'; readonly property: string }
   | { readonly kind: 'shorthand-property'; readonly value: string }
   | { readonly kind: 'string-key'; readonly quote: string }
+  /** Context keywords reference an entity without spelling its name. */
+  | { readonly kind: 'implicit' }
   | { readonly kind: 'none' };
 export interface SemanticReference {
   readonly unitId: string;
@@ -428,6 +459,7 @@ export interface UnitEvaluation {
   readonly symbols: ReadonlyMap<SymbolKey, SymbolContribution>;
   readonly types: ReadonlyMap<TypeKey, Type>;
   readonly namedTypes: ReadonlyMap<string, TypeKey>;
+  readonly implementations: ReadonlyMap<string, FunctionImplementation>;
   readonly references: readonly SemanticReference[];
   readonly scopes: readonly SemanticScope[];
   readonly calls: readonly SemanticCall[];
@@ -438,6 +470,12 @@ export interface UnitEvaluation {
   readonly callsSuper: boolean;
   readonly diagnostics: readonly SemanticDiagnostic[];
   readonly dependencies: readonly SemanticDependency[];
+  /** Value-feedback ports, separate from declaration and type-shape lookups.
+   * Keys identify canonical container items, symbol cells or callable returns. */
+  readonly valueReads?: readonly string[];
+  readonly valueWrites?: readonly string[];
+  /** Position-independent fingerprints of owned export/lookup/type inputs. */
+  readonly semanticSummaries: ReadonlyMap<string, string>;
   /** Order/position independent semantic export description. */
   readonly summary: string;
 }

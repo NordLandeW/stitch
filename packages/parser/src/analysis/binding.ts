@@ -302,6 +302,25 @@ export function bindUnit(syntax: SyntaxUnit, context: UnitContext): BoundUnit {
     }
     return;
   }
+  function markContextUse(
+    scope: MutableScope,
+    kind: 'usesOther' | 'callsLocalCallable',
+  ) {
+    const fn = scope.functionId && functions.get(scope.functionId);
+    if (fn && !fn[kind]) functions.set(fn.node.id, { ...fn, [kind]: true });
+  }
+  function localCallee(node: Expression, scope: MutableScope): boolean {
+    if (node.kind === 'name')
+      return (
+        !!local(node.name.text, scope) ||
+        /^argument(?:\d+)?$/.test(node.name.text)
+      );
+    if (node.kind === 'member' || node.kind === 'index')
+      return localCallee(node.target, scope);
+    if (node.kind === 'conditional')
+      return localCallee(node.yes, scope) || localCallee(node.no, scope);
+    return false;
+  }
   function expression(
     node: Expression,
     scope: MutableScope,
@@ -312,6 +331,7 @@ export function bindUnit(syntax: SyntaxUnit, context: UnitContext): BoundUnit {
     switch (node.kind) {
       case 'name':
         stamp(node.name, scope);
+        if (node.name.text === 'other') markContextUse(scope, 'usesOther');
         break;
       case 'function':
         functionNode(node, scope, assigned, selfHint);
@@ -366,6 +386,8 @@ export function bindUnit(syntax: SyntaxUnit, context: UnitContext): BoundUnit {
         node.indices.forEach((child) => expression(child, scope));
         break;
       case 'call':
+        if (localCallee(node.target, scope))
+          markContextUse(scope, 'callsLocalCallable');
         expression(node.target, scope);
         node.arguments.forEach((arg) => {
           stamp(arg, scope);
@@ -454,7 +476,8 @@ export function bindUnit(syntax: SyntaxUnit, context: UnitContext): BoundUnit {
           key: `${node.id}:with`,
           parent: scope.key,
           selfOwner: `with:${node.id}`,
-          declarations: new Map(scope.declarations),
+          // with replaces self; var declarations still belong to the function.
+          declarations: scope.declarations,
         };
         scopes.set(inner.key, inner);
         prepare(node.body, inner);

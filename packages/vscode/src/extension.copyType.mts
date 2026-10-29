@@ -14,7 +14,14 @@ export function createCopyAsTypeCallback(provider: StitchWorkspace) {
 export function createCopyAsJsdocSelfCallback(provider: StitchWorkspace) {
   return async (file: vscode.Uri) => {
     const type = await uriToType(provider, file);
-    if (type && type.match(/^(Struct|Id.Instance|Asset.GMObject)/)) {
+    // @self consumes one named receiver; a union is valid for @type, but this
+    // annotation cannot express it without silently dropping alternatives.
+    if (
+      type &&
+      /^(Struct|Id\.Instance|Asset\.GMObject)(\.[a-zA-Z_][a-zA-Z_0-9]*)?$/.test(
+        type,
+      )
+    ) {
       copyToClipboard(`/// @self ${type}`);
     } else if (type) {
       // Notify the user that this type is not a self-type
@@ -48,14 +55,27 @@ async function uriToType(provider: StitchWorkspace, file: vscode.Uri) {
     !editor.selection.active.isEqual(position)
   )
     return;
-  const ref = code.getReferenceAt(document.offsetAt(position));
-  if (!ref) {
+  const refs = code.getReferenceCandidatesAt(document.offsetAt(position));
+  if (!refs.length) return;
+  try {
+    const alternatives = refs.flatMap((ref) => {
+      const store = ref.evaluatedType || ref.item.type;
+      return store.type.length
+        ? store.type.map((type) =>
+            (type.isConstructor && type.self
+              ? type.self
+              : type
+            ).toFeatherString({ complete: true }),
+          )
+        : ['Any'];
+    });
+    return [...new Set(alternatives)]
+      .sort((a, b) => a.localeCompare(b))
+      .join('|');
+  } catch (error) {
+    void vscode.window.showInformationMessage(
+      `Cannot copy a complete type annotation: ${error instanceof Error ? error.message : String(error)}`,
+    );
     return;
   }
-  const type = ref.evaluatedType || ref.item.type;
-  const isConstructor = type.constructs.length > 0;
-  if (isConstructor) {
-    return `Struct.${ref.item.name}`;
-  }
-  return type.toFeatherString();
 }

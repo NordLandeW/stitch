@@ -42,6 +42,7 @@ function analyze(
   externalTypes = new Map<string, Type>(),
   uri = 'semantic-test.gml',
   parseErrors = 0,
+  onStep?: () => void,
 ) {
   const parsed = new GmlParser().parse(source);
   expect(parsed.errors, source).to.have.length(parseErrors);
@@ -82,7 +83,10 @@ function analyze(
     },
     type: (key) => externalTypes.get(key),
     observe: () => {},
-    cancelled: () => false,
+    cancelled: () => {
+      onStep?.();
+      return false;
+    },
   };
   const evaluated = evaluateUnit(bound, environment);
   const result = {
@@ -156,6 +160,7 @@ function queryCode(analysis: ReturnType<typeof analyze>): Code {
       content: analysis.source,
       scopes: analysis.view.scopes,
       _refs: analysis.view.refs,
+      _structNewMemberRanges: analysis.view.structNewMemberRanges,
       _rangesAreSorted: true,
       project: { self: analysis.result.types.get('global') },
     },
@@ -164,6 +169,120 @@ function queryCode(analysis: ReturnType<typeof analyze>): Code {
 }
 
 describe('Transactional GML semantics', function () {
+  it('distinguishes container value reads from write-only accessor lookups', function () {
+    for (const reads of [false, true]) {
+      const { result } = analyze(
+        `global.pool = [1]; global.pool[0] = 2; ${reads ? 'var saved = global.pool[0];' : ''}`,
+      );
+      const array = [...result.types].find(
+        ([, type]) => type.kind === 'Array',
+      )![0];
+      expect(result.valueWrites).to.include(`items:${array}`);
+      expect(result.valueReads!.includes(`items:${array}`)).to.equal(reads);
+    }
+  });
+  it('records missing member value reads without treating write-only fields as inputs', function () {
+    const { result } = analyze(
+      'global.holder = {}; global.holder.output = 1; var saved = global.holder.input;',
+    );
+    const owner = [...result.types].find(([key]) =>
+      key.startsWith('struct:'),
+    )![0];
+    expect(result.valueReads).to.include(`symbol:${memberKey(owner, 'input')}`);
+    expect(result.valueReads).not.to.include(
+      `symbol:${memberKey(owner, 'output')}`,
+    );
+    expect(result.valueWrites).to.include(
+      `symbol:${memberKey(owner, 'output')}`,
+    );
+  });
+
+  it('tracks shared value cells without exposing function-local cells', function () {
+    const { bound, result } = analyze(
+      'function Probe() { var temporary = 1; temporary += 1; global.cell = temporary; return global.cell; }',
+    );
+    const fn = [...bound.functions.values()][0];
+    const local = `symbol:${memberKey(fn.localOwner, 'temporary')}`;
+    const shared = `symbol:${globalKey('cell')}`;
+    expect(result.valueReads).to.include(shared).and.not.include(local);
+    expect(result.valueWrites).to.include(shared).and.not.include(local);
+    expect(result.valueWrites).to.include(`returns:${fn.typeKey}`);
+  });
+
+  it('reads a provider result only when the caller consumes its value', function () {
+    const provider = analyze(
+      'function Supply() { return 1; }',
+      undefined,
+      undefined,
+      {},
+      undefined,
+      'provider.gml',
+    );
+    const symbol = provider.result.symbols.get(globalKey('Supply'))!;
+    const external = new Map([['Supply', symbol]]);
+    const key = [...provider.bound.functions.values()][0].typeKey;
+    for (const consumed of [false, true]) {
+      const caller = analyze(
+        consumed ? 'var result = Supply();' : 'Supply();',
+        external,
+        undefined,
+        {},
+        new Map(provider.result.types),
+      );
+      expect(caller.result.valueReads!.includes(`returns:${key}`)).to.equal(
+        consumed,
+      );
+    }
+  });
+
+  it('tracks item values consumed by native dependent return contracts', function () {
+    const getter = native('fetch_item', 1);
+    const fn = getter.item.getTypeByKind('Function')!;
+    const generic = Type.Any.named('T');
+    generic.isGeneric = true;
+    const array = new Type('Array');
+    array.items = value(generic);
+    fn.getParameter(0)!.setType(array);
+    fn.setReturnType(generic);
+    for (const consumed of [false, true]) {
+      for (const contents of ['1', '']) {
+        const { result } = analyze(
+          `var data = [${contents}]; ${consumed ? 'var result = ' : ''}fetch_item(data);`,
+          new Map([['fetch_item', getter]]),
+        );
+        const key = [...result.types].find(
+          ([, type]) => type.kind === 'Array',
+        )![0];
+        expect(result.valueReads!.includes(`items:${key}`)).to.equal(consumed);
+        if (consumed)
+          expect(
+            kinds(
+              [...result.symbols.values()].find(
+                (symbol) => symbol.item.name === 'result',
+              )!.item.type,
+            ),
+          ).to.eql(contents ? ['Real'] : []);
+      }
+    }
+  });
+
+  it('keeps unobserved container items pending while preserving real unknown inputs', function () {
+    const create = native('ds_map_create');
+    create.item.getTypeByKind('Function')!.setReturnType(new Type('Id.DsMap'));
+    const external = new Map([['ds_map_create', create]]);
+    const empty = analyze(
+      'function Probe(){var pool=ds_map_create();return pool[?"key"];}',
+      external,
+    );
+    expect(empty.returns('Probe').hasTypes).to.equal(false);
+    expect(empty.returns('Probe').toFeatherString()).to.equal('Any');
+    const seeded = analyze(
+      'function Probe(input){var pool=ds_map_create();pool[?"unknown"]=input;pool[?"number"]=1;return pool[?"key"];}',
+      external,
+    );
+    expect(kinds(seeded.returns('Probe'))).to.deep.equal(['Any', 'Real']);
+  });
+
   it('keeps shorthand source and member identities separate and expands either rename', function () {
     const source =
       'function Probe() { var original = 1; var holder = { original }; return holder.original; }';
@@ -314,6 +433,48 @@ describe('Transactional GML semantics', function () {
     ).to.deep.equal(['Never']);
   });
 
+  it('keeps abrupt paths and enclosing recovery inputs isolated from a block continuation', function () {
+    const source = [
+      'function Branch(flag){var result=1;if(flag){result="early";return result;}result=true;{var nested=result;result=2;}return result;}',
+      'function Catch(flag){var result=1;try{result="body";if(flag)throw result;result=false;}catch(problem){return result;}return result;}',
+      'function Finally(flag){var result=1;try{if(flag)return result;result="normal";}finally{var seen=result;}return result;}',
+    ].join('\n');
+    const analyzed = analyze(source);
+    expect(kinds(analyzed.returns('Branch'))).to.deep.equal(['Real', 'String']);
+    expect(kinds(analyzed.returns('Catch'))).to.deep.equal([
+      'Bool',
+      'Real',
+      'String',
+    ]);
+    expect(kinds(analyzed.returns('Finally'))).to.deep.equal([
+      'Real',
+      'String',
+    ]);
+    const nested = analyzed.view.refs.find(
+      (ref) =>
+        ref.start.offset === source.indexOf('nested=result') + 'nested='.length,
+    )!;
+    expect(kinds(nested.evaluatedType!)).to.deep.equal(['Bool']);
+  });
+
+  it('propagates loop aliases across same-shaped nested allocations from one call', function () {
+    const factory =
+      'function Make(){return {a:{field:0},b:{field:0},c:{field:0}};}';
+    const setup =
+      'function Probe(){var group=Make();var a=group.a;var b=group.b;var c=group.c;var alias=a;var next=b;var last=c;';
+    const finish = 'alias.field="changed";return c.field;}';
+    // Two iterations move alias from a through b to c. Losing the second step
+    // hides the later String write from c even though all initial shapes match.
+    for (const body of [
+      'repeat(2){alias=next;next=last;}',
+      'alias=next;next=last;alias=next;next=last;',
+    ]) {
+      const analyzed = analyze(factory + setup + body + finish);
+      expect(analyzed.result.diagnostics).to.have.length(0);
+      expect(kinds(analyzed.returns('Probe'))).to.deep.equal(['String']);
+    }
+  });
+
   it('supports known struct keys and writes through array element types', function () {
     const keyed = analyze(
       'function Probe(){var source={}; source[$ "value"]=42; return source.value;}',
@@ -393,6 +554,16 @@ describe('Transactional GML semantics', function () {
     expect(shape.getMember('field', true)).to.equal(undefined);
     expect(shape.getMember('count', true)).not.to.equal(undefined);
     expect(shape.getMember('action', true)).not.to.equal(undefined);
+  });
+
+  it('retains declaration navigation and rename across distinct constructed instances', function () {
+    const source =
+      'function Box()constructor{field=1;}function Probe(){var first=new Box();var second=new Box();return first.field+second.field;}';
+    const { view } = analyze(source);
+    const refs = view.refs.filter((ref) => ref.text === 'field');
+    expect(refs).to.have.length(3);
+    expect(new Set(refs.map((ref) => ref.item)).size).to.equal(1);
+    expect(planReferenceRename(refs, 'renamed', view.refs)).to.have.length(3);
   });
 
   it('resolves inherited members independently of reader and constructor source order', function () {
@@ -511,6 +682,455 @@ describe('Transactional GML semantics', function () {
       'function Probe(){\n/// @type {String}\nvar text=1;return text;}',
     );
     expect(kinds(constrained.returns('Probe'))).to.deep.equal(['String']);
+  });
+
+  it('applies each local type annotation at its declaration without changing earlier flow or symbol identity', function () {
+    const source = `function DirectionalLight() constructor { direction=1; }
+function PointLight() constructor { radius=1; }
+function Probe(input,count){
+  for(var i=0;i<count;i++){
+    /// @type {Struct.DirectionalLight}
+    var light=input;
+    light.direction;
+  }
+  for(var i=0;i<count;i++){
+    /// @type {Struct.PointLight}
+    var light=input;
+    light.radius;
+  }
+}`;
+    const analysis = analyze(source);
+    const code = queryCode(analysis);
+    const first = source.indexOf('light.direction');
+    const second = source.indexOf('light.radius');
+    const references = [first, second].map(
+      (offset) =>
+        analysis.view.refs.find(
+          (reference) => reference.start.offset === offset,
+        )!,
+    );
+    expect(references[0].item).to.equal(references[1].item);
+    expect(
+      references.map((reference) => reference.evaluatedType!.toFeatherString()),
+    ).to.deep.equal(['Struct.DirectionalLight', 'Struct.PointLight']);
+    expect(
+      code
+        .getCompletionCandidatesAt(first + 6)
+        .map((candidate) => candidate.name),
+    ).to.deep.equal(['direction']);
+    expect(
+      code
+        .getCompletionCandidatesAt(second + 6)
+        .map((candidate) => candidate.name),
+    ).to.deep.equal(['radius']);
+    expect(analysis.result.diagnostics).to.have.length(0);
+  });
+
+  it('retains a later local annotation across writes without leaking it into other control-flow paths', function () {
+    const source = `function Probe(input,flag){
+var item=1;
+var before=item;
+if(flag){
+  /// @type {String}
+  var item=input;
+  item=input;
+} else {
+  /// @type {Bool}
+  var item=input;
+  item=input;
+}
+return item;
+}`;
+    const analysis = analyze(source);
+    expect(kinds(analysis.returns('Probe'))).to.deep.equal(['Bool', 'String']);
+    const before = analysis.view.refs.find(
+      (reference) =>
+        reference.start.offset ===
+        source.indexOf('item;', source.indexOf('var before')),
+    )!;
+    expect(kinds(before.evaluatedType!)).to.deep.equal(['Real']);
+    expect(analysis.result.diagnostics).to.have.length(0);
+  });
+
+  it('applies explicit annotations to reassigned locals and members', function () {
+    for (const [setup, target] of [
+      ['var slot=1;', 'slot'],
+      ['var holder={slot:1};', 'holder.slot'],
+      ['var holder={slot:1};', 'holder[$ "slot"]'],
+    ]) {
+      const source = `function Probe(){${setup}\n/// @type {String}\n${target}=1;return ${target};}`;
+      expect(kinds(analyze(source).returns('Probe')), target).to.deep.equal([
+        'String',
+      ]);
+    }
+  });
+
+  it('consumes named variable documentation without annotating the following declaration', function () {
+    for (const tag of ['localvar', 'instancevar', 'globalvar']) {
+      const source = `function Probe(){\n/// @${tag} {String} message\nvar count=1;return count;}`;
+      const analysis = analyze(source);
+      expect(kinds(analysis.returns('Probe')), tag).to.deep.equal(['Real']);
+      const declared = [...analysis.result.symbols.values()].find(
+        (symbol) => symbol.item.name === 'message',
+      )!;
+      expect(kinds(declared.item.type), tag).to.deep.equal(['String']);
+    }
+  });
+
+  it('retains callback argument documentation and inline named type references', function () {
+    const source = `function PointLight() constructor {radius=1;}
+function Consume(callback){}
+function Probe(){
+  var holder={/** @type {Struct.PointLight} */ light:undefined};
+  Consume(/**
+   * @param {Struct.PointLight} light
+   * @returns {String}
+   */ function(light){var copied=light.radius;return 1;});
+}`;
+    const analysis = analyze(source);
+    const callback = [...analysis.bound.functions.values()].find(
+      (fn) => !fn.node.name,
+    )!;
+    const callable = analysis.result.types.get(callback.typeKey)!;
+    expect(callable.getParameter('light')!.type.toFeatherString()).to.equal(
+      'Struct.PointLight',
+    );
+    expect(kinds(callable.returns!)).to.deep.equal(['String']);
+    const copied = [...analysis.result.symbols.values()].find(
+      (symbol) => symbol.item.name === 'copied',
+    )!;
+    expect(kinds(copied.item.type)).to.deep.equal(['Real']);
+    const typeRefs = analysis.view.refs.filter(
+      (reference) => reference.role === 'type',
+    );
+    expect(typeRefs.map((reference) => reference.text)).to.deep.equal([
+      'Struct.PointLight',
+      'Struct.PointLight',
+    ]);
+    const constructor = analysis.result.symbols.get(
+      globalKey('PointLight'),
+    )!.item;
+    expect(
+      typeRefs.every((reference) => reference.item === constructor),
+    ).to.equal(true);
+    expect(
+      planReferenceRename(typeRefs, 'Lamp').map((edit) => edit.text),
+    ).to.deep.equal(['Struct.Lamp', 'Struct.Lamp']);
+  });
+
+  it('keeps with-body locals in the containing function scope and resolves annotated callable self', function () {
+    const source = `function Receiver() constructor {field="value";}
+function Probe(){
+  var receiver={};
+  /// @self Function.Receiver
+  with(receiver) {var carried=field;}
+  return carried;
+}`;
+    const analysis = analyze(source);
+    expect(kinds(analysis.returns('Probe'))).to.deep.equal(['String']);
+    const carried = analysis.view.refs.filter(
+      (reference) => reference.item.name === 'carried',
+    );
+    expect(carried).to.have.length(2);
+    expect(carried[0].item).to.equal(carried[1].item);
+    expect(carried[0].item.local).to.equal(true);
+    const fields = analysis.view.refs.filter(
+      (reference) => reference.item.name === 'field',
+    );
+    expect(fields[0].item).to.equal(fields[1].item);
+    expect(analysis.result.diagnostics).to.have.length(0);
+  });
+
+  it('preserves mixin effects through aliases and member calls', function () {
+    for (const call of ['Install()', 'alias()', 'holder.run()']) {
+      const source = `/// @mixin
+function Install(){installed="ready";}
+function Probe() constructor {var alias=Install;var holder={run:Install};${call};result=installed;}`;
+      const analysis = analyze(source);
+      const receiver = analysis.result.symbols
+        .get(globalKey('Probe'))!
+        .item.getTypeByKind('Function')!.self!;
+      expect(kinds(receiver.getMember('result')!.type), call).to.deep.equal([
+        'String',
+      ]);
+      expect(analysis.result.diagnostics, call).to.have.length(0);
+    }
+  });
+
+  it('retains documentation on returned anonymous functions', function () {
+    const analysis = analyze(
+      'function Factory(){\n/// @returns {String}\nreturn function(){return 1;};}',
+    );
+    const callback = [...analysis.bound.functions.values()].find(
+      (fn) => !fn.node.name,
+    )!;
+    expect(
+      kinds(analysis.result.types.get(callback.typeKey)!.returns!),
+    ).to.deep.equal(['String']);
+  });
+
+  it('analyzes documented parameter defaults and exposes their local query scope', function () {
+    const source =
+      'function DefaultValue(){return "s";}\n/// @param {String} value\nfunction Use(previous,value=DefaultValue()){return value;}';
+    const analysis = analyze(source);
+    const offset = source.lastIndexOf('DefaultValue');
+    const ref = analysis.view.refs.find(
+      (reference) => reference.start.offset === offset,
+    )!;
+    expect(ref.item.name).to.equal('DefaultValue');
+    expect(ref.item.def?.file && ref.item.def.start.offset).to.equal(
+      source.indexOf('DefaultValue'),
+    );
+    expect(
+      analysis.view.functionCalls.some((args) =>
+        args.some((arg) => arg.start.offset > offset),
+      ),
+    ).to.equal(true);
+    expect(
+      queryCode(analysis)
+        .getInScopeSymbolsAt(offset)
+        .map((item) => item.name),
+    ).to.include.members(['previous', 'value']);
+    expect(kinds(analysis.returns('Use'))).to.deep.equal(['String']);
+  });
+
+  it('preserves constructor identity over an unrelated self annotation', function () {
+    const source =
+      'function Other() constructor {foreign="x";}\n/// @self Struct.Other\nfunction Own() constructor {own=1;}\nfunction Probe(){return new Own();}';
+    const analysis = analyze(source);
+    const own = analysis.result.symbols
+      .get(globalKey('Own'))!
+      .item.getTypeByKind('Function')!;
+    const other = analysis.result.symbols
+      .get(globalKey('Other'))!
+      .item.getTypeByKind('Function')!;
+    expect(own.self!.name).to.equal('Own');
+    expect(own.self!.getMember('own')).to.exist;
+    expect(own.self!.getMember('foreign')).to.equal(undefined);
+    expect(other.self!.getMember('own')).to.equal(undefined);
+    expect(analysis.returns('Probe').toFeatherString()).to.equal('Struct.Own');
+  });
+
+  it('evaluates nested union-call arguments once rather than once per candidate', function () {
+    const counts: number[] = [];
+    for (const depth of [4, 8]) {
+      let count = 0;
+      const source =
+        'function A(v){return v;}function B(v){return v;}function Probe(flag){var f=flag?A:B;return ' +
+        'f('.repeat(depth) +
+        '1' +
+        ')'.repeat(depth) +
+        ';}';
+      const analysis = analyze(
+        source,
+        new Map(),
+        '2024.13.0.0',
+        {},
+        new Map(),
+        'calls.gml',
+        0,
+        () => count++,
+      );
+      expect(analysis.result.diagnostics).to.have.length(0);
+      counts.push(count);
+    }
+    // Operation counts protect complexity without depending on machine speed.
+    expect(counts[1]).to.be.lessThan(counts[0] * 3);
+  });
+
+  it('limits struct-key completion ranges to gaps and uses the contextual shape', function () {
+    const source =
+      'function Shape() constructor {alpha=1;beta="s";}\nfunction Probe(){var existing="yes";\n/// @type {Struct.Shape}\nvar options={ alpha:existing, };}';
+    const analysis = analyze(source);
+    const code = queryCode(analysis);
+    const valueOffset = source.lastIndexOf('existing');
+    expect(code.getStructNewMemberRangeAt(valueOffset)).to.equal(undefined);
+    expect(
+      code.getInScopeSymbolsAt(valueOffset).map((item) => item.name),
+    ).to.include('existing');
+    const gap = code.getStructNewMemberRangeAt(source.indexOf(', }') + 2)!;
+    expect(
+      gap.type
+        .listMembers()
+        .map((item) => item.name)
+        .sort(),
+    ).to.deep.equal(['alpha', 'beta']);
+    const callback = analyze(
+      'function Consume(options){}function Probe(){var options={run:function(){var inner=1;return inner;}};}',
+    );
+    expect(
+      queryCode(callback).getStructNewMemberRangeAt(
+        callback.source.lastIndexOf('inner'),
+      ),
+    ).to.equal(undefined);
+  });
+
+  it('uses assignment documentation for struct completion and conditional writes', function () {
+    const source =
+      'function Shape() constructor {alpha=1;beta="s";}function Probe(){var options;\n/// @type {Struct.Shape}\noptions={alpha:1, };}';
+    const analysis = analyze(source);
+    const gap = queryCode(analysis).getStructNewMemberRangeAt(
+      source.indexOf(', }') + 2,
+    )!;
+    expect(
+      gap.type
+        .listMembers()
+        .map((item) => item.name)
+        .sort(),
+    ).to.deep.equal(['alpha', 'beta']);
+    for (const [setup, target] of [
+      ['var current=undefined;', 'current'],
+      ['var holder={current:undefined};', 'holder.current'],
+    ]) {
+      const assigned = analyze(
+        `function Probe(){${setup}\n/// @type {String}\n${target}??=1;return ${target};}`,
+      );
+      expect(kinds(assigned.returns('Probe'))).to.deep.equal(['String']);
+    }
+  });
+
+  it('retains context-keyword navigation without renaming the keywords', function () {
+    const source =
+      'function Receiver() constructor {var owner=self;var receiver={};with(receiver){var previous=other;}}var instance=new Receiver();';
+    const analysis = analyze(source);
+    const refs = analysis.view.refs;
+    const keywordRefs = refs.filter((ref) =>
+      ['self', 'other'].includes(ref.text),
+    );
+    expect(keywordRefs.map((ref) => ref.text)).to.deep.equal(['self', 'other']);
+    const constructor = refs.find(
+      (ref) => ref.isDef && ref.text === 'Receiver',
+    )!.item;
+    expect(keywordRefs.every((ref) => ref.item === constructor)).to.equal(true);
+    const edits = planReferenceRename(
+      refs.filter((ref) => ref.item === constructor),
+      'Context',
+      refs,
+    );
+    expect(edits.map((edit) => edit.text)).to.deep.equal([
+      'Context',
+      'Context',
+    ]);
+    expect(
+      edits.every(
+        (edit) =>
+          !keywordRefs.some(
+            (ref) => ref.start.offset === edit.range.start.offset,
+          ),
+      ),
+    ).to.equal(true);
+  });
+
+  it('retains native argument references and the catch-header local scope', function () {
+    const argument = native('argument0');
+    argument.item.setType(Type.Any);
+    const count = native('argument_count');
+    count.item.setType(Type.Real);
+    const source =
+      'function Probe(value){var previous=argument0;var size=argument_count;try{}catch(error){return error;}}';
+    const analysis = analyze(
+      source,
+      new Map([
+        ['argument0', argument],
+        ['argument_count', count],
+      ]),
+    );
+    expect(
+      analysis.view.refs
+        .filter((ref) => ref.item.native)
+        .map((ref) => ref.text),
+    ).to.deep.equal(['argument0', 'argument_count']);
+    const code = queryCode(analysis);
+    expect(
+      code
+        .getInScopeSymbolsAt(source.indexOf('error'))
+        .map((item) => item.name),
+    ).to.include('error');
+  });
+
+  it('publishes prefix-declared globals as available symbols rather than only suppressing warnings', function () {
+    const source = 'function Probe(){return generated_value;}';
+    const analysis = analyze(source, new Map(), '2024.13.0.0', {
+      autoDeclareGlobalsPrefixes: ['generated_'],
+    });
+    const item = analysis.result.symbols.get(
+      globalKey('generated_value'),
+    )!.item;
+    expect(item.global).to.equal(true);
+    expect(item.placeholder).to.equal(false);
+    expect(item.def).to.exist;
+    expect(
+      queryCode(analysis)
+        .getInScopeSymbolsAt(source.indexOf('generated_value'))
+        .map((item) => item.name),
+    ).to.include('generated_value');
+    expect(analysis.result.diagnostics).to.have.length(0);
+  });
+
+  it('applies a declaration annotation to all variables in the same statement', function () {
+    const analysis = analyze(
+      'function Probe(){\n/// @type {String}\nvar first=1,second=2;return [first,second];}',
+    );
+    for (const name of ['first', 'second']) {
+      const symbol = [...analysis.result.symbols.values()].find(
+        (symbol) => symbol.item.name === name,
+      )!;
+      expect(kinds(symbol.item.type)).to.deep.equal(['String']);
+    }
+  });
+
+  it('renames quoted-only properties to safely escaped keys while protecting identifier uses', function () {
+    for (const name of [
+      'new key',
+      'quoted"key',
+      'line\nkey',
+      '',
+      'slash\\key',
+    ]) {
+      const source =
+        'function Probe(){var value={"old key":1};return value[$ "old key"];}';
+      const analysis = analyze(source);
+      const refs = analysis.view.refs.filter(
+        (ref) => ref.item.name === 'old key',
+      );
+      expect(refs).to.have.length(2);
+      const edits = planReferenceRename(refs, name, analysis.view.refs);
+      let renamed = source;
+      for (const edit of edits.sort(
+        (a, b) => b.range.start.offset - a.range.start.offset,
+      ))
+        renamed =
+          renamed.slice(0, edit.range.start.offset) +
+          edit.text +
+          renamed.slice(edit.range.end.offset + 1);
+      const updated = analyze(renamed);
+      expect(
+        updated.view.refs.filter((ref) => ref.item.name === name),
+      ).to.have.length(2);
+      expect(kinds(updated.returns('Probe'))).to.deep.equal(['Real']);
+    }
+    const ordinary = analyze(
+      'function Probe(){var value={key:1};return value.key;}',
+    );
+    expect(() =>
+      planReferenceRename(
+        ordinary.view.refs.filter((ref) => ref.item.name === 'key'),
+        'new key',
+        ordinary.view.refs,
+      ),
+    ).to.throw('valid GML identifier');
+  });
+
+  it('preserves one anonymous container contract when applying its declaration annotation at the write', function () {
+    const analysis = analyze(
+      'function Role() constructor {} function Store() constructor {\n/// @type {Struct<Struct.Role>}\nroles={};}',
+    );
+    const store = analysis.result.symbols
+      .get(globalKey('Store'))!
+      .item.getTypeByKind('Function')!.self!;
+    const roles = store.getMember('roles')!;
+    expect(roles.type.kind).to.equal('Struct');
+    expect(roles.type.toFeatherString()).to.equal('Struct<Struct.Role>');
   });
 
   it('keeps unbound dependent native results unknown and preserves resolved container items', function () {
@@ -1440,8 +2060,6 @@ describe('Transactional GML semantics', function () {
       second = functionValue('second');
     expect(first).not.to.equal(saved);
     expect(second).not.to.equal(first);
-    expect(first.methodSource).to.equal(saved);
-    expect(second.methodSource).to.equal(saved);
     expect(kinds(saved.returns!)).to.deep.equal(['Real']);
     expect(kinds(first.returns!)).to.deep.equal(['String']);
     expect(kinds(second.returns!)).to.deep.equal(['Bool']);
@@ -1518,6 +2136,29 @@ describe('Transactional GML semantics', function () {
       'provider.gml',
     );
     expect(changed.result.summary).not.to.equal(provider.result.summary);
+  });
+
+  it('keeps executable provenance and inferred returns for documented stored functions', function () {
+    const source = `function Camera() constructor {
+      cameraX=0;
+      /// @param {Real} x
+      static inside=function(x){return x>=cameraX;};
+      /// @param {String} label
+      label=function(label){return label;};
+    }
+    function Probe(){var camera=new Camera();return camera.inside(1);}
+    function Label(){var camera=new Camera();return camera.label("label");}`;
+    const result = analyze(source);
+    expect(kinds(result.returns('Probe'))).to.deep.equal(['Bool']);
+    expect(kinds(result.returns('Label'))).to.deep.equal(['String']);
+    const camera = result.result.symbols
+      .get(globalKey('Camera'))!
+      .item.getTypeByKind('Function')!;
+    for (const name of ['inside', 'label']) {
+      const method = camera.self!.getMember(name)!.getTypeByKind('Function')!;
+      expect(method.functionSource, name).to.exist;
+      expect(method.returns?.hasTypes, name).to.equal(true);
+    }
   });
 
   it('preserves readable metadata and checks reads separately from writes and fallback evidence', function () {

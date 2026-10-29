@@ -7,7 +7,7 @@ import {
   evaluateUnit,
 } from '../analysis/evaluation.js';
 import {
-  installSymbolContributions,
+  copyPreparedSymbol,
   installTypeContributions,
   materializeSourceRange,
   materializeUnit,
@@ -41,8 +41,10 @@ import {
   type Contribution,
 } from './contributions.js';
 import { DependencyIndex } from './dependencies.js';
+import { orderColdSources } from './ordering.js';
 import { LanguageProfile } from './version.js';
 import { WorklistHistory } from './worklist.js';
+import { ValueFeedbackIndex } from './value-feedback.js';
 
 interface UnitState {
   readonly code: Code;
@@ -52,6 +54,7 @@ interface UnitState {
   bound?: BoundUnit;
   declarations?: Contribution;
   evaluation?: UnitEvaluation;
+  worklistState?: string;
 }
 const services = new WeakMap<Project, ProjectAnalysis>();
 export function getProjectAnalysis(project: Project): ProjectAnalysis {
@@ -67,17 +70,50 @@ function digest(input: unknown): string {
     .update(JSON.stringify(input) ?? 'null')
     .digest('hex');
 }
+const contributionKeys = new WeakMap<Contribution, Set<string>>();
 function keys(part: Contribution | undefined): Set<string> {
+  if (part) {
+    const cached = contributionKeys.get(part);
+    if (cached) return cached;
+  }
   const result = new Set<string>();
   if (!part) return result;
+  contributionKeys.set(part, result);
   for (const symbol of part.symbols.values()) {
     result.add(symbol.key);
     result.add(`${symbol.owner}/lookup:${symbol.item.name}`);
   }
   for (const key of part.types.keys()) result.add(key);
   for (const key of part.namedTypes.keys()) result.add(key);
+  for (const key of part.implementations?.keys() || []) result.add(key);
   return result;
 }
+function contributionChanges(
+  previous: UnitEvaluation | undefined,
+  result: UnitEvaluation,
+  before?: Contribution,
+) {
+  const all = new Set([...keys(previous || before), ...keys(result)]);
+  const changed = new Set<string>();
+  if (!previous) for (const key of all) changed.add(key);
+  else {
+    for (const key of new Set([
+      ...previous.semanticSummaries.keys(),
+      ...result.semanticSummaries.keys(),
+    ]))
+      if (
+        previous.semanticSummaries.get(key) !==
+        result.semanticSummaries.get(key)
+      )
+        changed.add(key);
+    // A retired identity can remain in a consumer even when the surviving
+    // exported shape has not changed.
+    const surviving = keys(result);
+    for (const key of keys(previous)) if (!surviving.has(key)) changed.add(key);
+  }
+  return { all, changed };
+}
+
 const emptyView: CodeSemanticView = {
   refs: [],
   scopes: [],
@@ -101,6 +137,8 @@ export class ProjectAnalysis {
   private readonly dependencies = new DependencyIndex();
   private native?: Contribution;
   private nativeIdentity?: object;
+  private publicationBuffer?: ContributionGraph;
+  private readonly publicationValues = new WeakMap<Type, Type>();
   private inputKey = '';
   private running?: Promise<void>;
   private lastError: unknown;
@@ -117,7 +155,10 @@ export class ProjectAnalysis {
   private readonly publicTypes = new Map<string, Type>();
   private readonly publicSymbols = new Map<string, Signifier>();
   private readonly refsByUnit = new Map<string, readonly Reference[]>();
-  private readonly externalReferences = new Map<string, Reference[]>();
+  private readonly externalReferences = new Map<
+    string,
+    { units: Map<string, readonly Reference[]>; view?: readonly Reference[] }
+  >();
   private readonly pendingPublications = new Map<
     string,
     { code: Code; retired: boolean; semanticVersion: number }
@@ -140,6 +181,7 @@ export class ProjectAnalysis {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.publicationBuffer = undefined;
     this.revision++;
     this.generation++;
     for (const [uri, state] of this.units) {
@@ -147,7 +189,10 @@ export class ProjectAnalysis {
       state.code.retireAnalysis();
       this.dependencies.remove(uri);
     }
-    for (const code of this.retired) code.retireAnalysis();
+    for (const code of this.retired) {
+      this.removeRefs(code.path.absolute);
+      code.retireAnalysis();
+    }
     this.units.clear();
     this.dirty.clear();
     this.retired.clear();
@@ -210,7 +255,8 @@ export class ProjectAnalysis {
     return [...this.refsByUnit.values()].flat();
   }
   spellingReferences(uri: string): readonly Reference[] {
-    return this.externalReferences.get(uri) || [];
+    const group = this.externalReferences.get(uri);
+    return group ? (group.view ||= [...group.units.values()].flat()) : [];
   }
   document(uri: string): Code | undefined {
     return this.units.get(uri)?.code;
@@ -624,10 +670,12 @@ export class ProjectAnalysis {
     const cancelled = () => revision !== this.revision;
     const profile = this.profile();
     const lineage = this.project.analysisConfigurationLineage || ['Default'];
+    const legacyOtherBehaviour = this.project.legacyOtherBehaviour;
     const inputKey = digest([
       profile.key,
       lineage,
       this.project.options?.settings,
+      legacyOtherBehaviour,
     ]);
     const configurationChanged = inputKey !== this.inputKey;
     const states = new Map(
@@ -662,7 +710,14 @@ export class ProjectAnalysis {
       if (digest(description(oldMacros)) !== digest(description(macros)))
         changedMacros.add(name);
     }
-    const index = new ContributionIndex();
+    const index =
+      this.publicationBuffer?.index.fork(
+        (unit) =>
+          states.has(unit) ||
+          unit === '$native' ||
+          unit === '$resources' ||
+          unit === '$macros',
+      ) ?? new ContributionIndex();
     index.replace('$native', this.nativeInput());
     let resources = this.resourceInput(states);
     index.replace('$resources', resources);
@@ -688,6 +743,7 @@ export class ProjectAnalysis {
           processed.sourceMap.segments,
           profile.key,
           code.sourceContext,
+          legacyOtherBehaviour,
         ]);
         const reusable =
           preprocessKey === state.preprocessKey
@@ -721,6 +777,7 @@ export class ProjectAnalysis {
               code.isCreateEvent ||
               code.sourceContext.kind === 'instance-creation',
             language: profile,
+            legacyOtherBehaviour,
             autoDeclareGlobalsPrefixes:
               this.project.options?.settings?.autoDeclareGlobalsPrefixes,
           });
@@ -729,42 +786,196 @@ export class ProjectAnalysis {
           state.preprocessKey = preprocessKey;
         }
         state.evaluation = undefined;
+        state.worklistState = undefined;
       }
       index.replace(uri, state.evaluation || state.declarations);
       yield;
     }
     const queue = new Set(changed);
     for (const [uri, state] of states) if (!state.evaluation) queue.add(uri);
-    const dependencyIndex = new DependencyIndex();
-    for (const [uri, state] of states)
-      if (state.evaluation)
-        dependencyIndex.replace(uri, state.evaluation.dependencies);
-    for (const uri of changed) {
-      const old = this.units.get(uri);
-      const changeKeys = new Set([
-        ...keys(old?.evaluation || old?.declarations),
-        ...keys(states.get(uri)?.declarations),
-      ]);
-      // Stable user order keeps dependency-index registration history out of
-      // the scheduler state; the pending queue itself preserves exact order.
-      for (const user of [...this.dependencies.affected(changeKeys)].sort())
-        queue.add(user);
+    if (this.committedRevision < 0) {
+      // Prefer possible named providers only in the initial script/extension
+      // queue. Cycles and every later dependency retry keep ordinary scheduling.
+      const preferred: string[] = [];
+      const remaining: string[] = [];
+      for (const uri of queue) {
+        const kind = states.get(uri)?.bound?.context.kind;
+        (kind === 'script' || kind === 'extension'
+          ? preferred
+          : remaining
+        ).push(uri);
+      }
+      const ordered = orderColdSources(preferred, states, index, cancelled);
+      queue.clear();
+      for (const uri of [...ordered, ...remaining]) queue.add(uri);
     }
-    const evaluated = new Set<string>();
-    const history = new WorklistHistory();
+    const dependencyIndex = this.dependencies.clone();
     for (const [uri, state] of states)
-      history.setUnit(
+      if (!state.evaluation) dependencyIndex.remove(uri);
+    // Source positions can change without changing any exported semantics.
+    // Evaluate changed inputs first; enqueue their users only after comparing
+    // the new result with the previously committed semantic summary.
+    const evaluated = new Set<string>();
+    // Discover initial value ports before withdrawing partially discovered
+    // components. Otherwise a growing cycle can re-run its older members once
+    // for every newly evaluated provider. This set is fixed by transaction
+    // inputs and advances with History's per-unit evaluated flags.
+    const initialPending = new Set(
+      [...states]
+        .filter(
+          ([, state]) => !state.evaluation && state.bound && state.declarations,
+        )
+        .map(([uri]) => uri),
+    );
+    const history = new WorklistHistory();
+    const feedback = new ValueFeedbackIndex();
+    const unitOrder = new Map<string, number>();
+    for (const [uri, state] of states) {
+      unitOrder.set(uri, unitOrder.size);
+      // Dirty inputs have already reverted to declarations. Their last known
+      // value ports still locate the feedback that must be withdrawn together.
+      feedback.replace(
         uri,
-        state.evaluation,
-        keys(state.evaluation || state.declarations),
+        state.evaluation || this.units.get(uri)?.evaluation,
       );
+      if (state.worklistState) history.setUnitState(uri, state.worklistState);
+      else
+        state.worklistState = history.setUnit(
+          uri,
+          state.evaluation,
+          keys(state.evaluation || state.declarations),
+          feedback.effects(uri),
+        );
+    }
     history.setResourceBases(
       [...resources.types].map(
         ([key, type]) => [key, type.extends?.semanticKey] as const,
       ),
     );
-    while (queue.size) {
+    const deferred = new Set<string>();
+    let active: ReadonlySet<string> | undefined;
+    const baselines = new Map<
+      string,
+      {
+        previous?: UnitEvaluation;
+        declarations?: Contribution;
+        pending: boolean;
+      }
+    >();
+    const comparisonStates = new Map<string, string>();
+    let baselineBases: Map<string, string | undefined> | undefined;
+    let schedulingChanged = false;
+    const defer = (uri: string) => {
+      if (!deferred.has(uri)) {
+        deferred.add(uri);
+        schedulingChanged = true;
+      }
+    };
+    const solve = (members: ReadonlySet<string>) => {
+      const pending = [...queue].filter((uri) => members.has(uri));
+      const remaining = [...members].filter((uri) => !queue.has(uri));
+      remaining.sort(
+        (left, right) => unitOrder.get(left)! - unitOrder.get(right)!,
+      );
+      if (!baselineBases) {
+        baselineBases = new Map(
+          [...resources.types].map(([key, type]) => [
+            key,
+            type.extends?.semanticKey,
+          ]),
+        );
+        comparisonStates.set(
+          '$resource-bases',
+          digest([...baselineBases].sort()),
+        );
+      }
+      for (const uri of members) {
+        if (baselines.has(uri)) continue;
+        const state = states.get(uri)!;
+        const committed = this.units.get(uri);
+        const pending = !state.evaluation;
+        baselines.set(uri, {
+          previous: state.evaluation || committed?.evaluation,
+          declarations: state.declarations,
+          pending,
+        });
+        comparisonStates.set(
+          uri,
+          digest([
+            pending,
+            state.evaluation
+              ? state.worklistState
+              : committed?.worklistState || state.worklistState,
+          ]),
+        );
+      }
+      // Outside consumers cannot observe internal withdrawal/intermediate facts.
+      // Preserve existing work now; notify net changes only after convergence.
+      for (const uri of queue) if (!members.has(uri)) defer(uri);
+      queue.clear();
+      for (const uri of [...pending, ...remaining]) {
+        const state = states.get(uri)!;
+        state.evaluation = undefined;
+        state.worklistState = history.setUnit(
+          uri,
+          undefined,
+          keys(state.declarations),
+          feedback.effects(uri),
+        );
+        index.replace(uri, state.declarations);
+        dependencyIndex.remove(uri);
+        deferred.delete(uri);
+        queue.add(uri);
+      }
+      active = members;
+      schedulingChanged = true;
+    };
+    const finishComponent = () => {
+      const changedKeys = new Set<string>();
+      const retryKeys = new Set<string>();
+      for (const [uri, baseline] of baselines) {
+        const result = states.get(uri)?.evaluation;
+        if (!result) throw new Error(`Missing feedback evaluation for ${uri}`);
+        const changes = contributionChanges(
+          baseline.previous,
+          result,
+          baseline.declarations,
+        );
+        for (const key of changes.changed) changedKeys.add(key);
+        if (baseline.pending) for (const key of changes.all) retryKeys.add(key);
+      }
+      for (const [key, type] of resources.types)
+        if (baselineBases!.get(key) !== type.extends?.semanticKey)
+          changedKeys.add(key);
+      const users = dependencyIndex.affected(changedKeys);
+      for (const user of dependencyIndex.affected(retryKeys))
+        if (evaluated.has(user)) users.add(user);
+      // Component membership and comparison baselines are sets in History.
+      // Exit order must not depend on which member populated those sets first.
+      for (const user of [...users].sort()) if (!active!.has(user)) defer(user);
+      active = undefined;
+      baselines.clear();
+      comparisonStates.clear();
+      baselineBases = undefined;
+      schedulingChanged = true;
+    };
+    while (queue.size || deferred.size || active) {
       if (cancelled()) throw new AnalysisCancelled();
+      if (!queue.size) {
+        if (active) finishComponent();
+        if (!deferred.size) break;
+        for (const uri of deferred) queue.add(uri);
+        deferred.clear();
+        schedulingChanged = true;
+      }
+      if (!active && !initialPending.size) {
+        const members = feedback.component(queue.values().next().value!);
+        if (members) solve(members);
+      }
+      if (schedulingChanged) {
+        history.setSchedulingState(active, deferred, comparisonStates);
+        schedulingChanged = false;
+      }
       const uri = queue.values().next().value!;
       if (history.repeats(queue))
         throw new Error(
@@ -785,10 +996,13 @@ export class ProjectAnalysis {
           graph.namedType(key) || graph.typeSources(key).length
             ? graph.type(key)
             : undefined,
+        implementation: (unitId, functionId) =>
+          graph.implementation(unitId, functionId),
         observe: () => {},
         cancelled,
       };
-      const previous = state.evaluation;
+      const firstEvaluation = !state.evaluation;
+      const previous = state.evaluation || this.units.get(uri)?.evaluation;
       const result = evaluateUnit(state.bound, environment);
       state.evaluation = {
         ...result,
@@ -796,13 +1010,15 @@ export class ProjectAnalysis {
       };
       this.metrics.evaluated++;
       evaluated.add(uri);
+      history.markEvaluated(uri);
+      feedback.replace(uri, result);
       dependencyIndex.replace(uri, result.dependencies);
-      history.setUnit(uri, result, keys(result));
+      state.worklistState = history.setUnit(uri, result, keys(result));
       const before = index.units.get(uri);
       index.replace(uri, state.evaluation);
       if (
         state.code.isCreateEvent &&
-        previous?.callsSuper !== result.callsSuper
+        (firstEvaluation || previous?.callsSuper !== result.callsSuper)
       ) {
         const next = this.resourceInput(states);
         const changedBases = new Set<string>();
@@ -822,27 +1038,66 @@ export class ProjectAnalysis {
             ),
           );
           for (const user of [...dependencyIndex.affected(changedBases)].sort())
-            queue.add(user);
+            if (!active || active.has(user)) queue.add(user);
           queue.add(uri);
         }
       }
-      if (!previous || previous.summary !== result.summary) {
-        const changeKeys = new Set([
-          ...keys(before),
-          ...keys(state.evaluation),
-        ]);
-        for (const user of [...dependencyIndex.affected(changeKeys)].sort())
-          if (user !== uri) queue.add(user);
+      const changes = contributionChanges(previous, result, before);
+      for (const user of [...dependencyIndex.affected(changes.changed)].sort())
+        if (user !== uri && (!active || active.has(user))) queue.add(user);
+      if (firstEvaluation) {
+        // A consumer may have observed declaration-only input. Inside a solve,
+        // retry internal users now and outside users against the final result.
+        for (const user of [...dependencyIndex.affected(changes.all)].sort())
+          if (
+            user !== uri &&
+            evaluated.has(user) &&
+            (!active || active.has(user))
+          )
+            queue.add(user);
       }
+      if (initialPending.delete(uri) && !initialPending.size) {
+        // Early ordinary evaluations may already have drained their own queue
+        // entries. Revisit discovered feedback even if their outputs looked
+        // unchanged because another member still supported a retired fact.
+        for (const candidate of [...evaluated].sort())
+          if (feedback.component(candidate)) queue.add(candidate);
+      }
+      const members = initialPending.size ? undefined : feedback.component(uri);
+      if (members && !active) solve(members);
+      else if (
+        active &&
+        members &&
+        [...members].some((member) => !active!.has(member))
+      )
+        solve(new Set([...active, ...members]));
+      if (active)
+        for (const pending of [...queue])
+          if (!active.has(pending)) {
+            queue.delete(pending);
+            defer(pending);
+          }
       yield;
     }
     if (cancelled()) throw new AnalysisCancelled();
-    const staged = new ContributionGraph(index, this.source).complete();
-    // Preflight source positions and graph closure on detached objects.
-    for (const state of states.values())
-      if (state.evaluation && evaluated.has(state.code.path.absolute))
-        materializeUnit(state.evaluation, staged);
-    const publication = this.commit(staged, states, evaluated);
+    const previousBuffer = this.publicationBuffer;
+    // Preparation consumes private handles. A failed/cancelled publication must
+    // not leave a partly refreshed buffer eligible for another generation.
+    this.publicationBuffer = undefined;
+    const staged = ContributionGraph.prepare(
+      index,
+      this.source,
+      previousBuffer,
+      changed,
+    );
+    const publish = this.publicationUnits(staged, states, evaluated);
+    // Preflight the evaluation views that commit will replace, including
+    // definition-only consumers, before changing public handles or references.
+    for (const uri of publish)
+      materializeUnit(states.get(uri)!.evaluation!, staged);
+    if (cancelled()) throw new AnalysisCancelled();
+    const publication = this.commit(staged, states, publish);
+    this.publicationBuffer = staged;
     this.inputKey = inputKey;
     this.macroEnvironment = macros;
     for (const [uri, state] of states) {
@@ -867,29 +1122,112 @@ export class ProjectAnalysis {
     this.publishPending(revision);
   }
 
+  private publicationUnits(
+    staged: ContributionGraph,
+    states: ReadonlyMap<string, UnitState>,
+    evaluated: ReadonlySet<string>,
+  ): Set<string> {
+    let all = !staged.publicationReused;
+    for (const key of staged.updatedTypes) {
+      const previous = this.publicTypes.get(key);
+      if (previous && previous.kind !== staged.types.get(key)!.kind) all = true;
+    }
+    for (const key of staged.updatedSymbols) {
+      const previous = this.publicSymbols.get(key);
+      if (!previous) continue;
+      const source = staged.symbols.get(key)!;
+      const ownerKey = source.parent.semanticKey!;
+      if (
+        previous.name !== source.name ||
+        (previous.parent !== this.publicTypes.get(ownerKey) &&
+          !(
+            previous.asset &&
+            previous.parent === this.project.self &&
+            ownerKey === globalOwner
+          ))
+      )
+        all = true;
+    }
+    const affected = new Set(evaluated);
+    if (!all) {
+      const candidates = new Set(staged.updatedSymbols);
+      // Resource input may have registered a public handle before preparation.
+      // Keep the exact absent-domain check until those ingress writes are tracked.
+      for (const key of this.publicSymbols.keys())
+        if (!staged.symbols.has(key)) candidates.add(key);
+      const definitionKey = (symbol: Signifier | undefined) =>
+        symbol?.def?.file
+          ? `${symbol.def.file.path.absolute}:${symbol.def.start.offset}:${symbol.def.end.offset}`
+          : undefined;
+      const changed = new Set<string>();
+      const owners = new Set<string>();
+      for (const key of candidates) {
+        const previous = this.publicSymbols.get(key);
+        if (definitionKey(previous) === definitionKey(staged.symbols.get(key)))
+          continue;
+        changed.add(key);
+        for (const ref of previous?.refs || [])
+          if (ref.ownerUnitId) owners.add(ref.ownerUnitId);
+      }
+      // Public refs also contain macro-query occurrences. Verify the original
+      // evaluation relation on this bounded owner set to preserve publication scope.
+      for (const uri of owners)
+        if (
+          states
+            .get(uri)
+            ?.evaluation?.references.some((ref) => changed.has(ref.symbol))
+        )
+          affected.add(uri);
+    }
+    return new Set(
+      [...states]
+        .filter(
+          ([uri, state]) => state.evaluation && (all || affected.has(uri)),
+        )
+        .map(([uri]) => uri),
+    );
+  }
+
   private commit(
     staged: ContributionGraph,
     states: Map<string, UnitState>,
-    evaluated: Set<string>,
+    publish: ReadonlySet<string>,
   ): { published: Code[]; retired: Code[] } {
     const index = staged.index;
     const previousUses = new Map<Signifier, number>();
-    const previousDefinitions = new Map<string, string | undefined>();
-    const definitionKey = (symbol: Signifier) =>
-      symbol.def?.file
-        ? `${symbol.def.file.path.absolute}:${symbol.def.start.offset}:${symbol.def.end.offset}`
-        : undefined;
-    for (const [key, symbol] of this.publicSymbols) {
-      previousDefinitions.set(key, definitionKey(symbol));
-      if (!symbol.native && symbol.global && symbol.getTypeByKind('Function'))
-        previousUses.set(
-          symbol,
-          [...symbol.refs].filter((ref) => !ref.isDef).length,
-        );
+    const useCount = (symbol: Signifier) => {
+      let count = 0;
+      for (const ref of symbol.refs) if (!ref.isDef) count++;
+      return count;
+    };
+    const rememberUses = (symbol: Signifier | undefined) => {
+      if (
+        symbol &&
+        !previousUses.has(symbol) &&
+        !symbol.native &&
+        symbol.global &&
+        symbol.getTypeByKind('Function')
+      )
+        previousUses.set(symbol, useCount(symbol));
+    };
+    const rememberRemoved = (uri: string) => {
+      for (const ref of this.refsByUnit.get(uri) || []) rememberUses(ref.item);
+    };
+    for (const code of this.retired) rememberRemoved(code.path.absolute);
+    for (const uri of publish) {
+      rememberRemoved(uri);
+      const state = states.get(uri)!;
+      for (const ref of state.evaluation!.references)
+        rememberUses(this.publicSymbols.get(ref.symbol));
+      for (const macro of state.collection?.definitions || [])
+        rememberUses(this.publicSymbols.get(`macro:${macro.name}`));
+      const processed = state.syntax?.processed || state.code.preprocessed;
+      for (const macro of processed?.references || [])
+        rememberUses(this.publicSymbols.get(`macro:${macro.name}`));
     }
     this.publicTypes.set(globalOwner, this.globalStorage);
-    let replacedHandles = false;
-    for (const [key, source] of staged.types) {
+    for (const key of staged.updatedTypes) {
+      const source = staged.types.get(key)!;
       const previous = this.publicTypes.get(key);
       if (!previous || previous.kind !== source.kind) {
         // A stable storage key may acquire a different value kind after a
@@ -897,12 +1235,12 @@ export class ProjectAnalysis {
         const type = new Type(source.kind);
         type.semanticKey = key;
         this.publicTypes.set(key, type);
-        replacedHandles ||= !!previous;
       }
     }
     const replacedSymbols: Signifier[] = [];
-    for (const [key, source] of staged.symbols) {
-      const owner = this.publicTypes.get(staged.symbolSources(key)[0].owner)!;
+    for (const key of staged.updatedSymbols) {
+      const source = staged.symbols.get(key)!;
+      const owner = this.publicTypes.get(source.parent.semanticKey!)!;
       const previous = this.publicSymbols.get(key);
       if (
         !previous ||
@@ -921,7 +1259,6 @@ export class ProjectAnalysis {
         this.publicSymbols.set(key, item);
         if (previous) {
           replacedSymbols.push(previous);
-          replacedHandles = true;
         }
       }
     }
@@ -933,12 +1270,15 @@ export class ProjectAnalysis {
       symbol: (key) => this.publicSymbols.get(key)!,
       definition: (key) => staged.definition(key),
       value: (source) => {
-        if (source.semanticKey && this.publicTypes.has(source.semanticKey))
+        if (source.semanticKey && staged.types.has(source.semanticKey))
           return this.publicTypes.get(source.semanticKey)!;
-        let type = anonymous.get(source);
+        const values = staged.isPreparedValue(source)
+          ? this.publicationValues
+          : anonymous;
+        let type = values.get(source);
         if (!type) {
           type = new Type(source.kind);
-          anonymous.set(source, type);
+          values.set(source, type);
           installTypeContributions([source], type, host);
         }
         return type;
@@ -946,19 +1286,15 @@ export class ProjectAnalysis {
     };
     // No await, callback or diagnostic publication until every live view agrees.
     for (const [key, target] of this.publicTypes)
-      installTypeContributions(
-        staged.types.has(key) ? [staged.types.get(key)!] : [],
-        target,
-        host,
-      );
-    for (const [key, target] of this.publicSymbols) {
-      const sources = staged.symbolSources(key);
-      installSymbolContributions(
-        sources.map((source) => ({ ...source, item: staged.symbol(key) })),
-        target,
-        host,
-      );
-    }
+      if (staged.updatedTypes.has(key) || !staged.types.has(key))
+        installTypeContributions(
+          staged.types.has(key) ? [staged.types.get(key)!] : [],
+          target,
+          host,
+        );
+    for (const [key, target] of this.publicSymbols)
+      if (staged.updatedSymbols.has(key) || !staged.symbols.has(key))
+        copyPreparedSymbol(staged.symbols.get(key), target, host);
     // Public project.self is the bare-name presentation view. It is not an
     // analysis input or the storage receiver returned by the global keyword.
     const globals = this.publicTypes.get(globalOwner);
@@ -979,19 +1315,9 @@ export class ProjectAnalysis {
     const retired = [...this.retired];
     this.retired.clear();
     const published: Code[] = [];
-    const changedDefinitions = new Set<string>();
-    for (const [key, symbol] of this.publicSymbols)
-      if (definitionKey(symbol) !== previousDefinitions.get(key))
-        changedDefinitions.add(key);
-    for (const [uri, state] of states) {
-      const definitionChanged = state.evaluation?.references.some((ref) =>
-        changedDefinitions.has(ref.symbol),
-      );
-      if (
-        !state.evaluation ||
-        (!evaluated.has(uri) && !definitionChanged && !replacedHandles)
-      )
-        continue;
+    for (const uri of publish) {
+      const state = states.get(uri)!;
+      if (!state.evaluation) continue;
       this.removeRefs(uri);
       const previous = this.units.get(uri);
       if (state.syntax && state.syntax !== previous?.syntax)
@@ -1027,8 +1353,7 @@ export class ProjectAnalysis {
       for (const reference of state.code.preprocessed?.references || [])
         addMacro(reference.name, reference.origin, false);
       const refs = [...macroRefs, ...view.refs];
-      for (const ref of refs) ref.item.refs.add(ref);
-      this.refsByUnit.set(uri, refs);
+      this.registerRefs(uri, refs);
       state.code.replaceSemanticView({ ...view, refs });
       state.code.markAnalyzed(
         this.generation + 1,
@@ -1051,19 +1376,10 @@ export class ProjectAnalysis {
       if (!index.symbols.has(key)) this.publicSymbols.delete(key);
     for (const key of [...this.publicTypes.keys()])
       if (!index.types.has(key)) this.publicTypes.delete(key);
-    this.externalReferences.clear();
-    for (const refs of this.refsByUnit.values())
-      for (const ref of refs) {
-        if (ref.origin?.spelling.uri === ref.ownerUnitId) continue;
-        const uri = ref.origin?.spelling.uri;
-        if (!uri) continue;
-        let list = this.externalReferences.get(uri);
-        if (!list) this.externalReferences.set(uri, (list = []));
-        list.push(ref);
-      }
     this.generation++;
+    const usagePublications = new Map<Signifier, Code>();
     for (const [symbol, before] of previousUses) {
-      const after = [...symbol.refs].filter((ref) => !ref.isDef).length;
+      const after = useCount(symbol);
       const code = symbol.def?.file;
       if (
         before !== after &&
@@ -1071,7 +1387,17 @@ export class ProjectAnalysis {
         this.units.get(code.path.absolute)?.code === code &&
         !published.includes(code)
       )
-        published.push(code);
+        usagePublications.set(symbol, code);
+    }
+    // Retained handles keep their original Map order. Preserve diagnostic-only
+    // callback order too; a zero/single target needs no public-domain traversal.
+    const usageOrder =
+      usagePublications.size > 1
+        ? this.publicSymbols.values()
+        : usagePublications.keys();
+    for (const symbol of usageOrder) {
+      const code = usagePublications.get(symbol);
+      if (code && !published.includes(code)) published.push(code);
     }
     for (const code of published) code.computeUnusedSymbolDiagnostics();
     return { published, retired };
@@ -1093,8 +1419,36 @@ export class ProjectAnalysis {
     }
   }
 
+  private registerRefs(uri: string, refs: readonly Reference[]): void {
+    const spelled = new Map<string, Reference[]>();
+    for (const ref of refs) {
+      ref.item.refs.add(ref);
+      const spelling = ref.origin?.spelling.uri;
+      if (!spelling || spelling === ref.ownerUnitId) continue;
+      let list = spelled.get(spelling);
+      if (!list) spelled.set(spelling, (list = []));
+      list.push(ref);
+    }
+    this.refsByUnit.set(uri, refs);
+    for (const [spelling, list] of spelled) {
+      let group = this.externalReferences.get(spelling);
+      if (!group)
+        this.externalReferences.set(spelling, (group = { units: new Map() }));
+      group.units.set(uri, list);
+      group.view = undefined;
+    }
+  }
+
   private removeRefs(uri: string): void {
-    for (const ref of this.refsByUnit.get(uri) || []) ref.item.refs.delete(ref);
+    for (const ref of this.refsByUnit.get(uri) || []) {
+      ref.item.refs.delete(ref);
+      const spelling = ref.origin?.spelling.uri;
+      if (!spelling || spelling === ref.ownerUnitId) continue;
+      const group = this.externalReferences.get(spelling);
+      if (!group?.units.delete(uri)) continue;
+      if (!group.units.size) this.externalReferences.delete(spelling);
+      else group.view = undefined;
+    }
     this.refsByUnit.delete(uri);
   }
 }

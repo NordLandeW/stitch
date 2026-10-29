@@ -92,8 +92,8 @@ export function typeToHoverText(type: Type) {
       type.isConstructor
         ? type.self!.toFeatherString()
         : type.returns?.type.length
-        ? type.returns.toFeatherString()
-        : 'Undefined'
+          ? type.returns.toFeatherString()
+          : 'Any'
     }`;
   } else {
     code += type.toFeatherString();

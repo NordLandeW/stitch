@@ -172,6 +172,14 @@ describe('Feather type graph display', function () {
     const items = new TypeStore().addType([array, new Type('Real')]);
     array.items = items;
     expect(array.toFeatherString()).to.equal('Array<...|Real>');
+    expect(() => array.toFeatherString({ complete: true })).to.throw(
+      'recursive',
+    );
+    const named = new Type('Array').named('FiniteName');
+    named.items = new TypeStore().addType(named);
+    expect(named.toFeatherString({ complete: true })).to.equal(
+      'Array.FiniteName',
+    );
     expect(array.code).to.equal('Array<...|Real>');
     const fn = Type.Function.named('read');
     fn.setReturnType(array);
@@ -179,6 +187,34 @@ describe('Feather type graph display', function () {
     expect(array.items).to.equal(items);
     expect(array.items.type[0]).to.equal(array);
     expect(array.toFeatherString()).to.equal('Array<...|Real>');
+  });
+
+  it('prints same-named storage alternatives once inside nested unions without merging them', function () {
+    const first = new Type('Struct').named('Entry');
+    first.semanticKey = 'instance:first';
+    const second = new Type('Struct').named('Entry');
+    second.semanticKey = 'instance:second';
+    const items = new TypeStore().addType([
+      first,
+      second,
+      new Type('Struct').named('Other'),
+      new Type('Real'),
+      new Type('Real'),
+    ]);
+    const dictionary = new Type('Struct');
+    dictionary.items = items;
+    const array = new Type('Array').addItemType(dictionary);
+    for (const complete of [false, true]) {
+      expect(array.toFeatherString({ complete })).to.equal(
+        'Array<Struct<Struct.Entry|Struct.Other|Real>>',
+      );
+    }
+    expect(dictionary.items).to.equal(items);
+    expect(items.type).to.have.length(5);
+    expect(items.type[0]).to.equal(first);
+    expect(items.type[1]).to.equal(second);
+    expect(first.semanticKey).to.equal('instance:first');
+    expect(second.semanticKey).to.equal('instance:second');
   });
 
   it('expands shared acyclic paths and same-key distinct objects normally', function () {

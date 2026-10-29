@@ -18,6 +18,9 @@ import { Project, type ProjectOptions } from '../project.js';
 import { Signifier } from '../signifiers.js';
 import { Type, type TypeStore } from '../types.js';
 import { LanguageProfile } from './version.js';
+import { ContributionGraph, ContributionIndex } from './contributions.js';
+import { globalOwner, type UnitEvaluation } from '../analysis/model.js';
+import { value } from '../analysis/values.js';
 
 let fixtureId = 0;
 type Sources = Readonly<Record<string, string>>;
@@ -25,6 +28,7 @@ interface FixtureOptions {
   readonly resourceOrder?: readonly string[];
   readonly fileOrder?: readonly string[];
   readonly configuration?: string;
+  readonly legacyOtherBehaviour?: boolean;
 }
 
 function diagnosticSummary(diagnostic: Diagnostic) {
@@ -166,6 +170,10 @@ async function createProject(
   options: FixtureOptions = {},
 ): Promise<MemoryProject> {
   const project = new MemoryProject(options.configuration);
+  if (options.legacyOtherBehaviour !== undefined)
+    Object.defineProperty(project, 'legacyOtherBehaviour', {
+      value: options.legacyOtherBehaviour,
+    });
   await project.prepareBundledNative();
   for (const name of options.resourceOrder || Object.keys(sources))
     project.addTestResource(name);
@@ -350,6 +358,480 @@ function expectChain(project: MemoryProject, kind: string) {
 }
 
 describe('ProjectAnalysis through real Project and Code models', function () {
+  it('evaluates a reverse-registered cold provider chain once per unit and preserves warm edits', async function () {
+    const project = await createProject(chain, {
+      fileOrder: ['A', 'B', 'C', 'D'],
+    });
+    const fresh: MemoryProject[] = [];
+    try {
+      expectChain(project, 'Real');
+      // A real dependency chain needs no declaration-only retry when its providers
+      // are evaluated first. Count work, not wall time or an internal rank table.
+      expect(project.analysis.metrics.evaluated).to.equal(4);
+      fresh.push(
+        await createProject(chain, { fileOrder: ['D', 'C', 'B', 'A'] }),
+      );
+      expect(snapshot(project)).to.deep.equal(snapshot(fresh[0]));
+      await project
+        .testCode('D')
+        .reload('function audit_chain_d() { return "text"; }');
+      expectChain(project, 'String');
+      fresh.push(await createProject(currentSources(project)));
+      expect(snapshot(project)).to.deep.equal(snapshot(fresh[1]));
+    } finally {
+      for (const cold of fresh) cold.dispose();
+      project.dispose();
+    }
+  });
+
+  for (const [name, initializer, seed, changedSeed, initialKind] of [
+    [
+      'member',
+      'global.seed.state',
+      'global.seed={state:1};',
+      'global.seed={state:"text"};',
+      'Real',
+    ],
+    [
+      'allocation',
+      'provide()',
+      'function provide(){return {field:1};}',
+      'function provide(){return "text";}',
+      'Struct',
+    ],
+  ]) {
+    it(`retracts caller-owned static values after a ${name} initializer provider changes`, async function () {
+      const sources = {
+        Caller: 'var result=cached();',
+        Other: 'var second=cached();',
+        Cache: `function cached(){static cache=${initializer};var caller=other;return cache;}`,
+        Seed: seed,
+      };
+      const project = await createProject(sources, {
+        legacyOtherBehaviour: false,
+      });
+      const fresh: MemoryProject[] = [];
+      try {
+        expectValue(project.testCode('Caller'), 'result', initialKind);
+        expectValue(project.testCode('Other'), 'second', initialKind);
+        await project.testCode('Seed').reload(changedSeed);
+        // Two independent callers must not re-export each other's retired cache
+        // values as writes. The source now initializes only a String.
+        expectValue(project.testCode('Caller'), 'result', 'String');
+        expectValue(project.testCode('Other'), 'second', 'String');
+        expect(
+          kinds(callable(project, 'cached').statics!.getMember('cache')!.type),
+        ).to.deep.equal(['String']);
+        fresh.push(
+          await createProject(currentSources(project), {
+            legacyOtherBehaviour: false,
+          }),
+        );
+        expect(snapshot(project)).to.deep.equal(snapshot(fresh[0]));
+      } finally {
+        for (const cold of fresh) cold.dispose();
+        project.dispose();
+      }
+    });
+  }
+
+  it('keeps nested initialized-static writes separate from retained flow values', async function () {
+    const sources = {
+      Caller: 'var result=wrapped();',
+      Other: 'var second=cached(false);',
+      Cache: `function cached(flag){static cache=global.seed.state;var caller=other;
+        if(flag)cache="written";return cache;}
+        function wrapped(){var caller=other;cached(false);return cached(true);}`,
+      Seed: 'global.seed={state:1};',
+    };
+    const project = await createProject(sources, {
+      legacyOtherBehaviour: false,
+    });
+    const fresh: MemoryProject[] = [];
+    try {
+      expectValue(project.testCode('Caller'), 'result', 'String');
+      await project.testCode('Seed').reload('global.seed={state:true};');
+      expectValue(project.testCode('Caller'), 'result', 'String');
+      const retained = callable(project, 'cached').statics!.getMember(
+        'cache',
+      )!.type;
+      expect(kinds(retained)).to.deep.equal(['Bool', 'String']);
+      const second = definition(project.testCode('Other'), 'second').item.type;
+      expect(kinds(second)).to.deep.equal(['Bool', 'String']);
+      fresh.push(
+        await createProject(currentSources(project), {
+          legacyOtherBehaviour: false,
+        }),
+      );
+      expect(snapshot(project)).to.deep.equal(snapshot(fresh[0]));
+    } finally {
+      for (const cold of fresh) cold.dispose();
+      project.dispose();
+    }
+  });
+
+  for (const contextual of [false, true]) {
+    it(`retracts obsolete shared-container item writes through ${contextual ? 'contextual wrappers' : 'direct statements'}`, async function () {
+      const write = (name: string, body: string) =>
+        contextual
+          ? `function ${name}(){var caller=other;${body}} ${name}();`
+          : body;
+      const sources = {
+        State: 'global.data=ds_map_create();',
+        Alpha: write('write_a', 'global.data[?"a"]=supply();'),
+        Beta: write('write_b', 'global.data[?"b"]=true;'),
+        Source: 'function supply(){return 1;}',
+        Read: 'var result=global.data[?"a"];',
+      };
+      const project = await createProject(sources, {
+        legacyOtherBehaviour: false,
+      });
+      let cold: MemoryProject | undefined;
+      try {
+        expect(
+          kinds(definition(project.testCode('Read'), 'result').item.type),
+        ).to.deep.equal(['Bool', 'Real']);
+        await project
+          .testCode('Source')
+          .reload('function supply(){return "new";}');
+        cold = await createProject(currentSources(project), {
+          legacyOtherBehaviour: false,
+        });
+        // This map abstraction merges both keys' current writes. The Bool is
+        // still valid, while neither writer may re-export the retired Real.
+        expect(
+          kinds(definition(cold.testCode('Read'), 'result').item.type),
+        ).to.deep.equal(['Bool', 'String']);
+        expect(
+          kinds(definition(project.testCode('Read'), 'result').item.type),
+        ).to.deep.equal(['Bool', 'String']);
+        expect(snapshot(project)).to.deep.equal(snapshot(cold));
+      } finally {
+        cold?.dispose();
+        project.dispose();
+      }
+    });
+  }
+
+  for (const access of ['items', 'members'] as const) {
+    it(`retracts superseded provider values from cyclic ${access} read-back writes`, async function () {
+      const sources = {
+        State:
+          access === 'items'
+            ? 'global.data=ds_map_create();'
+            : 'global.data={};',
+        Alpha:
+          access === 'items'
+            ? 'global.data[?"source"]=supply();var saved=global.data[?"feedback"];global.data[?"copy"]=saved;'
+            : 'global.data.copy=supply();global.data.copy=global.data.feedback;',
+        Beta:
+          access === 'items'
+            ? 'var saved=global.data[?"source"];global.data[?"feedback"]=saved;'
+            : 'global.data.feedback=global.data.copy;',
+        Source: 'function supply(){return 1;}',
+        Read:
+          access === 'items'
+            ? 'var result=global.data[?"source"];'
+            : 'var result=global.data.copy;',
+      };
+      const project = await createProject(sources, {
+        legacyOtherBehaviour: false,
+      });
+      let cold: MemoryProject | undefined;
+      try {
+        const observed = () =>
+          kinds(definition(project.testCode('Read'), 'result').item.type);
+        expect(observed()).to.include('Real');
+        await project
+          .testCode('Source')
+          .reload('function supply(){return "new";}');
+        cold = await createProject(currentSources(project), {
+          legacyOtherBehaviour: false,
+        });
+        const expected = kinds(
+          definition(cold.testCode('Read'), 'result').item.type,
+        );
+        expect(expected).to.include('String');
+        expect(expected).not.to.include('Real');
+        // Rewriting values read from the shared map must not keep a removed
+        // provider fact alive solely through the two consumers' feedback cycle.
+        expect(observed()).to.deep.equal(expected);
+        expect(snapshot(project)).to.deep.equal(snapshot(cold));
+      } finally {
+        cold?.dispose();
+        project.dispose();
+      }
+    });
+  }
+
+  it('retracts superseded return values through mutually recursive providers', async function () {
+    const sources = {
+      Alpha: 'function CycleA(flag){if(flag)return 1;return CycleB();}',
+      Beta: 'function CycleB(){return CycleA(true);}',
+      Read: 'var result=CycleA(true);',
+    };
+    const project = await createProject(sources, {
+      legacyOtherBehaviour: false,
+    });
+    let cold: MemoryProject | undefined;
+    try {
+      expectValue(project.testCode('Read'), 'result', 'Real');
+      await project
+        .testCode('Alpha')
+        .reload('function CycleA(flag){if(flag)return "new";return CycleB();}');
+      cold = await createProject(currentSources(project), {
+        legacyOtherBehaviour: false,
+      });
+      expectValue(cold.testCode('Read'), 'result', 'String');
+      expectValue(project.testCode('Read'), 'result', 'String');
+      expect(snapshot(project)).to.deep.equal(snapshot(cold));
+    } finally {
+      cold?.dispose();
+      project.dispose();
+    }
+  });
+
+  it('keeps cached allocation aliases independent of container feedback startup order', async function () {
+    const sources = {
+      State:
+        'function init(){static state=undefined;if(state!=undefined)return state;state={};state.map=ds_map_create();state.sprites=ds_map_create();state.grid=ds_grid_create(2,2);sprite(0);return state;}',
+      Material:
+        'function Mat(key) constructor {field=key;static duplicate=function(key){if(field==key)return self;return getmat(key);};}',
+      Factory:
+        'function getmat(key){static map=init().map;var material=map[?key];if(material==undefined){material=new Mat(key);map[?key]=material;}return material;}',
+      Sprite:
+        'function sprite(key){static cache=init().sprites;var material=cache[?key];if(material==undefined){material=getmat(key);cache[?key]=material;}return material;}',
+      Writer:
+        'function fill(){static grid=init().grid;grid[#0,0]=surface();var saved=grid[#0,1];grid[#0,2]=saved;}function surface(){return getmat(0);}',
+      Reader:
+        'function read(){static grid=init().grid;var item=grid[#0,0];grid[#0,1]=item;return item;}var result=read();',
+    };
+    const observed = (project: MemoryProject) =>
+      sorted(
+        definition(project.testCode('Reader'), 'result').item.type.type.map(
+          (type) => ({
+            kind: type.kind,
+            name: type.name,
+            key: type.semanticKey?.replaceAll(
+              project.dir.absolute,
+              '<project>',
+            ),
+          }),
+        ),
+      );
+    let expected: ReturnType<typeof observed> | undefined;
+    for (const fileOrder of [
+      Object.keys(sources),
+      Object.keys(sources).reverse(),
+    ]) {
+      const project = await createProject(sources, {
+        fileOrder,
+        legacyOtherBehaviour: false,
+      });
+      try {
+        const before = observed(project);
+        expected ??= before;
+        // Equal visible names can conceal distinct mutable aliases. Compare the
+        // public storage identities, normalized only for each fixture's root.
+        expect(before).to.deep.equal(expected);
+        const view = snapshot(project);
+        for (const name of ['Writer', 'Reader'])
+          project.analysis.invalidate(project.testCode(name));
+        await project.analysis.analyze();
+        expect(observed(project)).to.deep.equal(before);
+        expect(snapshot(project)).to.deep.equal(view);
+        assertAvailable(project);
+      } finally {
+        project.dispose();
+      }
+    }
+  });
+
+  it('preserves independent unknown and boolean seeds while retracting and retiring cyclic inputs', async function () {
+    const sources = {
+      State: 'global.data=ds_map_create();',
+      Alpha:
+        'global.data[?"source"]=supply();var saved=global.data[?"feedback"];global.data[?"copy"]=saved;',
+      Beta: 'var saved=global.data[?"source"];global.data[?"feedback"]=saved;',
+      Source: 'function supply(){return 1;}',
+      Extra:
+        'function opaque(input){return input;}global.data[?"unknown"]=opaque();global.data[?"boolean"]=false;',
+      Read: 'var result=global.data[?"source"];',
+    };
+    const project = await createProject(sources, {
+      legacyOtherBehaviour: false,
+    });
+    try {
+      await project
+        .testCode('Source')
+        .reload('function supply(){return "new";}');
+      const observed = () =>
+        kinds(definition(project.testCode('Read'), 'result').item.type);
+      expect(observed()).to.include.members(['Any', 'Bool', 'String']);
+      expect(observed()).not.to.include('Real');
+      await project.retireTestResource('Extra');
+      expect(observed()).to.deep.equal(['String']);
+      const cold = await createProject(currentSources(project), {
+        legacyOtherBehaviour: false,
+      });
+      try {
+        expect(snapshot(project)).to.deep.equal(snapshot(cold));
+      } finally {
+        cold.dispose();
+      }
+    } finally {
+      project.dispose();
+    }
+  });
+
+  it('discovers and removes feedback edges across distinct containers', async function () {
+    const writeOnly = 'global.first[?"source"]=supply();';
+    const readBack = `${writeOnly}var saved=global.second[?"feedback"];global.first[?"copy"]=saved;`;
+    const project = await createProject(
+      {
+        State: 'global.first=ds_map_create();global.second=ds_map_create();',
+        Alpha: writeOnly,
+        Beta: 'var saved=global.first[?"source"];global.second[?"feedback"]=saved;',
+        Source: 'function supply(){return 1;}',
+        Read: 'var result=global.second[?"feedback"];',
+      },
+      { legacyOtherBehaviour: false },
+    );
+    try {
+      await project.testCode('Alpha').reload(readBack);
+      await project
+        .testCode('Source')
+        .reload('function supply(){return "new";}');
+      expectValue(project.testCode('Read'), 'result', 'String');
+      await project.testCode('Alpha').reload(writeOnly);
+      await project
+        .testCode('Source')
+        .reload('function supply(){return false;}');
+      expectValue(project.testCode('Read'), 'result', 'Bool');
+      const cold = await createProject(currentSources(project), {
+        legacyOtherBehaviour: false,
+      });
+      try {
+        expect(snapshot(project)).to.deep.equal(snapshot(cold));
+      } finally {
+        cold.dispose();
+      }
+    } finally {
+      project.dispose();
+    }
+  });
+
+  // GML methods bind instance/struct self; an outer function's var locals do
+  // not become lexical captures. Exercise a returned method with explicit self.
+  // https://manual.gamemaker.io/lts/en/GameMaker_Language/GML_Overview/Method_Variables.htm
+  for (const mode of ['rebound fields', 'returned bound method'] as const) {
+    it(`retracts cyclic values propagated through ${mode}`, async function () {
+      const project = await createProject(
+        {
+          State: 'global.data={};',
+          Source: 'function supply(){return 1;}',
+          Factory:
+            mode === 'rebound fields'
+              ? 'function apply(){self.copy=supply();self.copy=self.feedback;}'
+              : 'function build(){return function(flag){if(flag)return supply();return self.feedback;};}',
+          Alpha:
+            mode === 'rebound fields'
+              ? 'method(global.data,apply)();'
+              : 'function write_result(flag){global.data.copy=method(global.data,build())(flag);}',
+          Beta: 'global.data.feedback=global.data.copy;',
+          Read: 'var result=global.data.copy;',
+        },
+        { legacyOtherBehaviour: false },
+      );
+      try {
+        expect(
+          kinds(definition(project.testCode('Read'), 'result').item.type),
+        ).to.include('Real');
+        await project
+          .testCode('Source')
+          .reload('function supply(){return "new";}');
+        const cold = await createProject(currentSources(project), {
+          legacyOtherBehaviour: false,
+        });
+        try {
+          const expected = kinds(
+            definition(cold.testCode('Read'), 'result').item.type,
+          );
+          expect(expected).to.include('String').and.not.include('Real');
+          expect(
+            kinds(definition(project.testCode('Read'), 'result').item.type),
+          ).to.deep.equal(expected);
+          expect(snapshot(project)).to.deep.equal(snapshot(cold));
+        } finally {
+          cold.dispose();
+        }
+      } finally {
+        project.dispose();
+      }
+    });
+  }
+
+  for (const fileOrder of [
+    ['Provider', 'Writer', 'Consumer'],
+    ['Provider', 'Consumer', 'Writer'],
+    ['Consumer', 'Provider', 'Writer'],
+    ['Writer', 'Provider', 'Consumer'],
+    ['Consumer', 'Writer', 'Provider'],
+    ['Writer', 'Consumer', 'Provider'],
+  ]) {
+    it(`refreshes exported container aliases in ${fileOrder.join(' -> ')} order`, async function () {
+      const sources = {
+        Provider:
+          'function make_pool(){static state={pool:ds_map_create()};return state;}',
+        Writer:
+          'function fill_pool(input){static pool=make_pool().pool;pool[?"key"]=input;}',
+        Consumer:
+          'function use_pool(){static pool=make_pool().pool;return ds_map_exists(pool,"key");}var result=use_pool();',
+      };
+      const project = await createProject(sources, { fileOrder });
+      const consumer = project.testCode('Consumer');
+      const assertPool = (expected: string) => {
+        const service = project.analysis as unknown as {
+          units: ReadonlyMap<string, { evaluation: UnitEvaluation }>;
+        };
+        const exported = service.units.get(consumer.path.absolute)!.evaluation;
+        const symbol = exported.symbols.get(
+          'function:global:use_pool:statics/member:pool',
+        )!;
+        expect(
+          symbol.item.type.toFeatherString(),
+          fileOrder.join(' -> '),
+        ).to.equal(expected);
+        expect(
+          callable(project, 'use_pool')
+            .statics!.getMember('pool')!
+            .type.toFeatherString(),
+        ).to.equal(expected);
+        expectValue(consumer, 'result', 'Bool');
+        expect(missing(consumer, 'make_pool')).to.deep.equal([]);
+        expect(
+          consumer.refs.find((ref) => ref.item.name === 'make_pool')?.item.def
+            ?.file?.asset.name,
+        ).to.equal('Provider');
+      };
+      assertPool('Id.DsMap<Any>');
+      await project
+        .testCode('Writer')
+        .reload(
+          'function fill_pool(){static pool=make_pool().pool;pool[?"key"]="text";}',
+        );
+      assertPool('Id.DsMap<String>');
+      expect(snapshot(project)).to.deep.equal(
+        snapshot(await createProject(currentSources(project))),
+      );
+      await project.testCode('Writer').reload('');
+      assertPool('Id.DsMap');
+      expect(snapshot(project)).to.deep.equal(
+        snapshot(await createProject(currentSources(project))),
+      );
+    });
+  }
+
   it('separates explicit global storage from native bare reads, writes, completion and rename', async function () {
     const source =
       'global.fps="user value";var explicit=global.fps;var builtin=fps;fps=30;';
@@ -999,6 +1481,245 @@ describe('ProjectAnalysis through real Project and Code models', function () {
     expect(() => planReferenceRename(ordinary, 'Renamed')).to.throw('captured');
   });
 
+  it('completes all with receivers with lexical precedence and partial coverage', async function () {
+    for (const alternatives of ['first:second', 'second:first']) {
+      const source = `function VisibleGlobal(){} function Probe(flag){
+        var shadowed="local";var first={shared:1,onlyFirst:true,shadowed:1};
+        var second={shared:"text",onlySecond:1,shadowed:false};
+        with(flag?${alternatives}){var inspected=shared;}return 0;}`;
+      const project = await createProject({ WithUnion: source });
+      const code = project.testCode('WithUnion');
+      const cursor = source.indexOf('var inspected');
+      const candidates = new Map(
+        code
+          .getCompletionCandidatesAt(cursor)
+          .map((candidate) => [candidate.name, candidate]),
+      );
+      expect(kinds(candidates.get('shared')!.type)).to.deep.equal([
+        'Real',
+        'String',
+      ]);
+      expect(candidates.get('shared')!.symbols).to.have.length(2);
+      expect(candidates.get('shared')!.availability).to.deep.equal({
+        present: 2,
+        total: 2,
+      });
+      for (const name of ['onlyFirst', 'onlySecond'])
+        expect(candidates.get(name)!.availability, name).to.deep.equal({
+          present: 1,
+          total: 2,
+        });
+      expect(kinds(candidates.get('shadowed')!.type)).to.deep.equal(['String']);
+      expect(
+        candidates.get('shadowed')!.symbols.every((symbol) => symbol.local),
+      ).to.equal(true);
+      expect(candidates.get('shadowed')!.availability).to.deep.equal({
+        present: 2,
+        total: 2,
+      });
+      expect(candidates.get('VisibleGlobal')!.availability).to.deep.equal({
+        present: 2,
+        total: 2,
+      });
+      expect(
+        code
+          .getInScopeSymbolsAt(cursor)
+          .filter((symbol) => symbol.name === 'shared'),
+      ).to.have.length(2);
+      expect(
+        code
+          .getCompletionCandidatesAt(source.indexOf('return 0'))
+          .map((candidate) => candidate.name),
+      ).not.to.include('onlyFirst');
+    }
+  });
+
+  it('keeps a concrete receiver in the singular with scope query alongside unknown coverage', async function () {
+    const source = 'with(context){var inspected=field;}';
+    const project = await createProject({
+      Provider:
+        'globalvar context;function Context()constructor{field=1;}context=new Context();',
+      Consumer: source,
+    });
+    const code = project.testCode('Consumer');
+    const cursor = source.indexOf('var inspected');
+    const concrete = project.self.getMember('context')!.getTypeByKind('Struct');
+    expect(concrete).not.to.equal(undefined);
+    expect(code.getScopeRangeAt(cursor)!.self).to.equal(concrete);
+    expect(code.getScopeCandidatesAt(cursor)).to.have.length(2);
+    expect(
+      code
+        .getCompletionCandidatesAt(cursor)
+        .find((candidate) => candidate.name === 'field')!.availability,
+    ).to.deep.equal({ present: 1, total: 2 });
+  });
+
+  it('keeps unknown with coverage while excluding noone from body alternatives', async function () {
+    for (const other of ['unknownReceiver', 'noone'])
+      for (const alternatives of [`{known:1}:${other}`, `${other}:{known:1}`]) {
+        const source = `function Probe(flag,unknownReceiver){var localOnly="local";with(flag?${alternatives}){var inspected=localOnly;}return 0;}`;
+        const project = await createProject({ WithOptional: source });
+        const code = project.testCode('WithOptional');
+        const candidates = new Map(
+          code
+            .getCompletionCandidatesAt(source.indexOf('var inspected'))
+            .map((candidate) => [candidate.name, candidate]),
+        );
+        const total = other === 'noone' ? 1 : 2;
+        expect(
+          candidates.get('known')!.availability,
+          alternatives,
+        ).to.deep.equal({ present: 1, total });
+        expect(
+          candidates.get('localOnly')!.availability,
+          alternatives,
+        ).to.deep.equal({ present: total, total });
+        expect(kinds(candidates.get('localOnly')!.type)).to.deep.equal([
+          'String',
+        ]);
+      }
+  });
+
+  it('refreshes unrelated global completions without semantic reevaluation', async function () {
+    const source =
+      'global.local=2;var first=global.local;global.local="local";var last=global.local;';
+    const project = await createProject({
+      Provider: 'global.external=1;global.removed="before";',
+      Consumer: source,
+    });
+    const consumer = project.testCode('Consumer');
+    const first = source.indexOf('global.local', 1) + 'global.'.length;
+    const last = source.lastIndexOf('global.local') + 'global.'.length;
+    const at = (offset: number) =>
+      new Map(
+        consumer
+          .getCompletionCandidatesAt(offset)
+          .map((candidate) => [candidate.name, kinds(candidate.type)]),
+      );
+    expect(at(first).get('local')).to.deep.equal(['Real']);
+    expect(at(last).get('local')).to.deep.equal(['String']);
+    expect(at(first).get('external')).to.deep.equal(['Real']);
+    const before = counters(project);
+    await project
+      .testCode('Provider')
+      .reload('global.external="updated";global.added=true;');
+    expect(delta(project, before).evaluated).to.equal(1);
+    expect(at(first).get('external')).to.deep.equal(['String']);
+    expect(at(first).get('added')).to.deep.equal(['Bool']);
+    expect(at(first).has('removed')).to.equal(false);
+    expect(at(first).get('local')).to.deep.equal(['Real']);
+    expect(at(last).get('local')).to.deep.equal(['String']);
+    expect(snapshot(project)).to.deep.equal(
+      snapshot(await createProject(currentSources(project))),
+    );
+  });
+
+  it('retains actual global lookup and negative lookup dependencies', async function () {
+    const project = await createProject({
+      Provider: 'global.external=1;',
+      Consumer: 'var actual=global.external;var future=global.future;',
+    });
+    const consumer = project.testCode('Consumer');
+    expectValue(consumer, 'actual', 'Real');
+    expect(missing(consumer, 'future').length).to.be.greaterThan(0);
+    await project
+      .testCode('Provider')
+      .reload('global.external="updated";global.future=true;');
+    expectValue(consumer, 'actual', 'String');
+    expectValue(consumer, 'future', 'Bool');
+    expect(missing(consumer, 'future')).to.deep.equal([]);
+    await project.testCode('Provider').reload('global.external=1;');
+    expectValue(consumer, 'actual', 'Real');
+    expect(missing(consumer, 'future').length).to.be.greaterThan(0);
+    expect(snapshot(project)).to.deep.equal(
+      snapshot(await createProject(currentSources(project))),
+    );
+  });
+
+  it('does not reevaluate semantic dependents when only a provider source position changes', async function () {
+    const sources = {
+      Provider: 'function audit_position_provider() { return 1; }',
+      Consumer:
+        'function audit_position_user() { return audit_position_provider(); } var result = audit_position_user();',
+      Other: 'function audit_position_other() { return "other"; }',
+    };
+    const project = await createProject(sources);
+    const before = counters(project);
+    await project
+      .testCode('Provider')
+      .reload('// shift source positions\n' + sources.Provider);
+    const work = delta(project, before);
+    expect(work.parsed).to.equal(1);
+    expect(work.bound).to.equal(1);
+    expect(work.evaluated).to.equal(1);
+    const consumer = project.testCode('Consumer');
+    const reference = consumer.refs.find(
+      (ref) => ref.item.name === 'audit_position_provider',
+    )!;
+    const definition = reference.item.def;
+    if (!definition?.file)
+      throw new Error('The provider must retain a source definition');
+    expect(definition.start.line).to.equal(2);
+    expectValue(consumer, 'result', 'Real');
+    expect(snapshot(project)).to.deep.equal(
+      snapshot(await createProject(currentSources(project))),
+    );
+  });
+
+  it('does not reevaluate consumers of unchanged sibling exports when a function body changes', async function () {
+    const sources = {
+      Provider:
+        'function audit_changing() { return 1; } function audit_stable() { return 2; }',
+      Consumer: 'var result = audit_stable();',
+    };
+    const project = await createProject(sources);
+    const before = counters(project);
+    await project
+      .testCode('Provider')
+      .reload(sources.Provider.replace('return 1', 'return "changed"'));
+    expect(delta(project, before).evaluated).to.equal(1);
+    expectValue(project.testCode('Consumer'), 'result', 'Real');
+    expect(snapshot(project)).to.deep.equal(
+      snapshot(await createProject(currentSources(project))),
+    );
+  });
+
+  it('keeps anonymous annotation storage isolated across declarations and units', async function () {
+    const sources = {
+      First:
+        'function first_shape(){\n/// @type {Struct}\nvar own; own.first=1; return own;} function sibling_shape(){\n/// @type {Struct}\nvar own; own.sibling=true; return own;} function first_array(){\n/// @type {Array}\nvar own; own[0]=1; return own;}',
+      Second:
+        'function second_shape(){\n/// @type {Struct}\nvar own; own.second="text"; return own;} function second_array(){\n/// @type {Array}\nvar own; own[0]="text"; return own;}',
+      Consumer:
+        'var first=first_shape(); var second=second_shape(); var sibling=sibling_shape(); var a=first.first; var b=second.second; var c=sibling.sibling; var x=first_array()[0]; var y=second_array()[0];',
+    };
+    const project = await createProject(sources);
+    const consumer = project.testCode('Consumer');
+    expectValue(consumer, 'a', 'Real');
+    expectValue(consumer, 'b', 'String');
+    expectValue(consumer, 'c', 'Bool');
+    expectValue(consumer, 'x', 'Real');
+    expectValue(consumer, 'y', 'String');
+    const first = consumer.refs.find((ref) => ref.item.name === 'first')!.item
+      .type.type[0];
+    const second = consumer.refs.find((ref) => ref.item.name === 'second')!.item
+      .type.type[0];
+    const sibling = consumer.refs.find((ref) => ref.item.name === 'sibling')!
+      .item.type.type[0];
+    expect(first.getMember('second')).to.equal(undefined);
+    expect(first.getMember('sibling')).to.equal(undefined);
+    expect(second.getMember('first')).to.equal(undefined);
+    expect(sibling.getMember('first')).to.equal(undefined);
+    await project
+      .testCode('First')
+      .reload('// location only\n' + sources.First);
+    expectValue(consumer, 'x', 'Real');
+    expectValue(consumer, 'y', 'String');
+    expect(snapshot(project)).to.deep.equal(
+      snapshot(await createProject(currentSources(project))),
+    );
+  });
+
   it('does no additional inference work for an independent chain when another chain changes', async function () {
     const left = {
       LeftUser:
@@ -1039,6 +1760,48 @@ describe('ProjectAnalysis through real Project and Code models', function () {
     expect(work.parsed).to.equal(minimal.parsed);
     expect(work.bound).to.equal(minimal.bound);
     expect(work.evaluated).to.equal(minimal.evaluated);
+  });
+
+  it('preserves diagnostic-only provider notification order when callers touch functions in reverse order', async function () {
+    const project = await createProject({
+      First: 'function first_target(){return 1;}',
+      Second: 'function second_target(){return 2;}',
+      Consumer: 'var result=0;',
+    });
+    const versions = ['First', 'Second'].map(
+      (name) => project.testCode(name).analysisState.semanticVersion,
+    );
+    try {
+      for (const [text, expected] of [
+        [
+          'var result=second_target()+first_target();',
+          ['Consumer', 'First', 'Second'],
+        ],
+        [
+          'var result=second_target()+first_target()+first_target();',
+          ['Consumer', 'First'],
+        ],
+        ['var result=0;', ['Consumer', 'First', 'Second']],
+      ] as const) {
+        project.publications.length = 0;
+        await project.testCode('Consumer').reload(text);
+        expect(
+          project.publications.map(
+            (event) =>
+              [...project.testCodes].find(
+                ([, code]) => code.path.absolute === event.filePath,
+              )?.[0],
+          ),
+        ).to.deep.equal(expected);
+        expect(
+          ['First', 'Second'].map(
+            (name) => project.testCode(name).analysisState.semanticVersion,
+          ),
+        ).to.deep.equal(versions);
+      }
+    } finally {
+      project.dispose();
+    }
   });
 
   it('refreshes definition-file UNUSED publication on call addition/removal without reevaluating the unchanged body', async function () {
@@ -2061,6 +2824,11 @@ describe('ProjectAnalysis editor host and transaction boundaries', function () {
     const oldCst = code.cst;
     const oldSyntaxVersion = code.analysisState.syntaxVersion;
     const failure = new Error('injected failure after real syntax preparation');
+    const failedText = 'var value = "uncommitted";';
+    const retryEditorAnalysis = async () => {
+      await code.readContent(failedText);
+      await project.analysis.analyze();
+    };
     const prepare = code.prepareSyntax;
     let preparations = 0;
     const restore = patchInstance(
@@ -2073,9 +2841,7 @@ describe('ProjectAnalysis editor host and transaction boundaries', function () {
       },
     );
     try {
-      expect(
-        await rejection(code.reload('var value = "uncommitted";')),
-      ).to.equal(failure);
+      expect(await rejection(code.reload(failedText))).to.equal(failure);
       expect(preparations).to.equal(1);
       expect(code.cst).to.equal(oldCst);
       expect(code.analysisState.syntaxVersion).to.equal(oldSyntaxVersion);
@@ -2089,10 +2855,18 @@ describe('ProjectAnalysis editor host and transaction boundaries', function () {
       expect(project.publishedFor(code)).to.deep.include(
         diagnosticSummary(diagnostics[0]),
       );
+      // Passive queries retain the explicit failure. The editor queue's explicit
+      // readContent + analyze retry must reject again while the fault persists.
+      expect(await rejection(project.analysis.analyze())).to.equal(failure);
+      expect(preparations).to.equal(1);
+      expect(await rejection(retryEditorAnalysis())).to.equal(failure);
+      expect(preparations).to.equal(2);
+      expect(code.analysisState.status).to.equal('failed');
+      expect(code.refs).to.deep.equal([]);
     } finally {
       restore();
     }
-    await code.reload('var value = "recovered";');
+    await retryEditorAnalysis();
     expectValue(code, 'value', 'String');
     expect(project.analysis.error).to.equal(undefined);
     expect(project.analysis.isCurrent).to.equal(true);
@@ -2163,6 +2937,64 @@ async function objectDefinitionsProject(
 }
 
 describe('Object Variable Definitions in the project analysis view', function () {
+  for (const order of [
+    ['Other', 'Dialogue'],
+    ['Dialogue', 'Other'],
+  ]) {
+    it(`refreshes annotated instance export shapes in ${order.join(' -> ')} order`, async function () {
+      const inputs: Record<string, ObjectDefinitionFixture> = {
+        Other: { create: 'payload=1;function active(){return payload;}' },
+        Dialogue: {
+          create:
+            '/// @type {Id.Instance.Other}\nconnectedTO=undefined;\n/// @param {Id.Instance.Other} toInst\nfunction init(toInst=undefined){connectedTO=toInst;}\nfunction plan_destroy(){call_later(1,time_source_units_frames,function(){instance_destroy();},false);}',
+        },
+      };
+      const project = await objectDefinitionsProject(
+        Object.fromEntries(order.map((name) => [name, inputs[name]])),
+      );
+      const code = project.testCode('Dialogue');
+      const assertShape = (expected: string) => {
+        const service = project.analysis as unknown as {
+          units: ReadonlyMap<string, { evaluation: UnitEvaluation }>;
+        };
+        const exported = service.units.get(code.path.absolute)!.evaluation;
+        const field = exported.symbols.get(
+          'object:Dialogue:self/member:connectedTO',
+        )!;
+        expect(field.item.type.toFeatherString()).to.equal('Id.Instance.Other');
+        expect(
+          field.item.type.type[0]!.getMember('payload')!.type.toFeatherString(),
+        ).to.equal(expected);
+        expect(
+          definition(code, 'connectedTO')
+            .item.type.type[0]!.getMember('payload')!
+            .type.toFeatherString(),
+        ).to.equal(expected);
+        expect(missing(code, 'connectedTO')).to.deep.equal([]);
+        expect(
+          code.refs.some(
+            (ref) =>
+              ref.item.name === 'connectedTO' &&
+              !ref.isDef &&
+              ref.item.def?.file === code,
+          ),
+        ).to.equal(true);
+      };
+      assertShape('Real');
+      await project
+        .testCode('Other')
+        .reload('payload="changed";function active(){return payload;}');
+      assertShape('String');
+      expect(snapshot(project)).to.deep.equal(
+        snapshot(
+          await objectDefinitionsProject({
+            ...inputs,
+            Other: { create: project.testCode('Other').content },
+          }),
+        ),
+      );
+    });
+  }
   it('inherits editor fields before an overriding Create without inheriting parent Create writes or locking later flow types', async function () {
     const inputs = {
       Parent: {
@@ -2343,5 +3175,873 @@ describe('Object Variable Definitions in the project analysis view', function ()
       cold?.dispose();
       project.dispose();
     }
+  });
+});
+
+describe('Missing read placeholders', function () {
+  it('keeps incomplete member reads out of declaration shapes and refreshes later real writes', async function () {
+    const source = `function Box() constructor { radius=1; }
+      function Probe(input) {
+        /// @type {Struct.Box}
+        var box=input;
+        return box.ra;
+      }`;
+    const project = await createProject({
+      provider: source,
+      consumer: 'function Consumer(){var box=new Box();return box.radius;}',
+    });
+    let cold: MemoryProject | undefined;
+    try {
+      const provider = project.testCode('provider'),
+        consumer = project.testCode('consumer');
+      const box = () => project.types.get('Struct.Box')!;
+      expect(missing(provider, 'ra')).not.to.have.length(0);
+      expect(
+        provider.refs.some((ref) => ref.item.name === 'ra' && !ref.item.def),
+      ).to.equal(true);
+      expect(box().getMember('ra')).to.equal(undefined);
+      const before = project.analysis.metrics.evaluated;
+      await provider.reload(source.replace('box.ra', 'box.razz'));
+      expect(project.analysis.metrics.evaluated - before).to.equal(1);
+      expect(missing(provider, 'razz')).not.to.have.length(0);
+      expect(box().getMember('razz')).to.equal(undefined);
+      expect(kinds(callable(project, 'Consumer').returns)).to.deep.equal([
+        'Real',
+      ]);
+      await consumer.reload(
+        'function Consumer(){var box=new Box();return box.future;}',
+      );
+      expect(missing(consumer, 'future')).not.to.have.length(0);
+      await provider.reload(
+        source.replace(
+          'return box.ra;',
+          'box.future="text"; return box.future;',
+        ),
+      );
+      expect(box().getMember('future')?.type.kind).to.equal('String');
+      expect(missing(consumer, 'future')).to.have.length(0);
+      expect(kinds(callable(project, 'Consumer').returns)).to.deep.equal([
+        'String',
+      ]);
+      await provider.reload(source);
+      expect(box().getMember('future')).to.equal(undefined);
+      expect(missing(consumer, 'future')).not.to.have.length(0);
+      cold = await createProject(currentSources(project));
+      expect(snapshot(project)).to.deep.equal(snapshot(cold));
+    } finally {
+      cold?.dispose();
+      project.dispose();
+    }
+  });
+
+  it('keeps undeclared implicit reads separate from receiver members', async function () {
+    const project = await createProject({
+      provider:
+        'function Box() constructor { radius=1; static inspect=function(){return absent;}; }',
+    });
+    try {
+      const code = project.testCode('provider');
+      expect(missing(code, 'absent')).not.to.have.length(0);
+      expect(
+        code.refs.some((ref) => ref.item.name === 'absent' && !ref.item.def),
+      ).to.equal(true);
+      expect(project.types.get('Struct.Box')!.getMember('absent')).to.equal(
+        undefined,
+      );
+    } finally {
+      project.dispose();
+    }
+  });
+});
+
+describe('Cold-start source scheduling', function () {
+  it('orders expanded macro providers and preserves their incremental public results', async function () {
+    const sources = {
+      Consumer: '#macro COLD_READ cold_macro_provider()\nvar result=COLD_READ;',
+      Provider: 'function cold_macro_provider(){return 1;}',
+    };
+    const project = await createProject(sources);
+    try {
+      expect(project.analysis.metrics.evaluated).to.equal(2);
+      expectValue(project.testCode('Consumer'), 'result', 'Real');
+      expect(
+        missing(project.testCode('Consumer'), 'cold_macro_provider'),
+      ).to.deep.equal([]);
+      await project
+        .testCode('Provider')
+        .reload('function cold_macro_provider(){return "text";}');
+      expectValue(project.testCode('Consumer'), 'result', 'String');
+      const cold = await createProject(currentSources(project));
+      try {
+        expect(snapshot(project)).to.deep.equal(snapshot(cold));
+      } finally {
+        cold.dispose();
+      }
+    } finally {
+      project.dispose();
+    }
+  });
+
+  it('keeps cyclic providers and their edits semantically equivalent to a fresh cold project', async function () {
+    const sources = {
+      Left: 'function cold_left(flag){if(flag)return cold_right(false);return 1;} var result=cold_left(true);',
+      Right:
+        'function cold_right(flag){if(flag)return cold_left(false);return 1;}',
+    };
+    const project = await createProject(sources);
+    try {
+      expectValue(project.testCode('Left'), 'result', 'Real');
+      await project
+        .testCode('Right')
+        .reload(
+          'function cold_right(flag){if(flag)return cold_left(false);return "text";}',
+        );
+      const cold = await createProject(currentSources(project));
+      try {
+        expect(snapshot(project)).to.deep.equal(snapshot(cold));
+      } finally {
+        cold.dispose();
+      }
+      assertAvailable(project);
+    } finally {
+      project.dispose();
+    }
+  });
+
+  async function fixture(
+    providerFirst: boolean,
+    kind: 'script' | 'extension' = 'script',
+  ): Promise<MemoryProject> {
+    const project = new MemoryProject();
+    await project.prepareBundledNative();
+    const text = 'var result = cold_source_value();';
+    const asset = new MemoryObject(project, 'ColdConsumer', { create: text });
+    project.assets.set(asset.name.toLowerCase(), asset);
+    project.yyp.resources.push(asset.resource);
+    project.addTestResource('ColdProvider');
+    const consumer = () => {
+      const code = new Code(asset, asset.dir.join('Create_0.gml'));
+      asset.gmlFiles.set(code.path.absolute.toLowerCase(), code);
+      project.testCodes.set('ColdConsumer', code);
+      code.content = text;
+    };
+    const provider = () => {
+      const code = project.addTestCode(
+        'ColdProvider',
+        'function cold_source_value(){return 1;}',
+      );
+      code.setSourceContext({ kind });
+    };
+    for (const add of providerFirst
+      ? [provider, consumer]
+      : [consumer, provider])
+      add();
+    await project.analysis.analyze();
+    assertAvailable(project);
+    return project;
+  }
+
+  for (const kind of ['script', 'extension'] as const) {
+    it(`avoids declaration-only retries when the ${kind} provider registers after its event consumer`, async function () {
+      const project = await fixture(false, kind);
+      let reversed: MemoryProject | undefined;
+      try {
+        expectValue(project.testCode('ColdConsumer'), 'result', 'Real');
+        const reference = project
+          .testCode('ColdConsumer')
+          .refs.find((ref) => ref.text === 'cold_source_value')!;
+        expect(reference.item.def?.file).to.equal(
+          project.testCode('ColdProvider'),
+        );
+        expect(project.analysis.metrics.evaluated).to.equal(2);
+        reversed = await fixture(true, kind);
+        expect(reversed.analysis.metrics.evaluated).to.equal(2);
+        expect(snapshot(project)).to.deep.equal(snapshot(reversed));
+      } finally {
+        reversed?.dispose();
+        project.dispose();
+      }
+    });
+  }
+
+  it('preserves dirty-first evaluation after the first cold publication', async function () {
+    const project = await fixture(false);
+    try {
+      const before = project.analysis.metrics.evaluated;
+      await project
+        .testCode('ColdConsumer')
+        .readContent('var result = cold_source_value(); var marker = true;');
+      await project
+        .testCode('ColdProvider')
+        .readContent('function cold_source_value(){return "changed";}');
+      await project.analysis.analyze();
+      expectValue(project.testCode('ColdConsumer'), 'result', 'String');
+      expectValue(project.testCode('ColdConsumer'), 'marker', 'Bool');
+      // The dirty event runs first, then retries after its dirty provider.
+      // Applying cold source priority to this transaction would evaluate twice.
+      expect(project.analysis.metrics.evaluated - before).to.equal(3);
+    } finally {
+      project.dispose();
+    }
+  });
+});
+
+describe('Callable implementation dependencies', function () {
+  it('does not reevaluate an unrelated method consumer after a same-shaped sibling body edit', async function () {
+    const provider = `function MethodPair() constructor {
+      static changing=function(){var internal=1;return 1;};
+      static stable=function(){return 2;};
+    }`;
+    const sources = {
+      Provider: provider,
+      Consumer:
+        '/// @param {Struct.MethodPair} pair\nfunction ReadStable(pair){return pair.stable();}',
+    };
+    const project = await createProject(sources);
+    let cold: MemoryProject | undefined;
+    try {
+      expect(kinds(callable(project, 'ReadStable').returns)).to.deep.equal([
+        'Real',
+      ]);
+      const before = counters(project);
+      await project
+        .testCode('Provider')
+        .reload(provider.replace('internal=1', 'internal=3'));
+      expect(kinds(callable(project, 'ReadStable').returns)).to.deep.equal([
+        'Real',
+      ]);
+      expect(delta(project, before).evaluated).to.equal(1);
+      cold = await createProject(currentSources(project));
+      expect(snapshot(project)).to.deep.equal(snapshot(cold));
+    } finally {
+      cold?.dispose();
+      project.dispose();
+    }
+  });
+
+  it('refreshes an executed body through an unchanged nested carrier without reevaluating the carrier', async function () {
+    const provider = 'function ReadContext(){return other.left;}';
+    const project = await createProject(
+      {
+        Provider: provider,
+        Carrier: 'global.callbacks={nested:[ReadContext]};',
+        Executor: `function RunContext(){var callback=method({},global.callbacks.nested[0]);
+        var caller={left:"text",right:1};var result;with(caller){result=callback();}return result;}`,
+      },
+      { legacyOtherBehaviour: false },
+    );
+    let cold: MemoryProject | undefined;
+    try {
+      expect(kinds(callable(project, 'RunContext').returns)).to.deep.equal([
+        'String',
+      ]);
+      const carrier = project.testCode('Carrier');
+      const before = counters(project);
+      const version = carrier.analysisState.semanticVersion;
+      await project
+        .testCode('Provider')
+        .reload(provider.replace('other.left', 'other.right'));
+      expect(kinds(callable(project, 'RunContext').returns)).to.deep.equal([
+        'Real',
+      ]);
+      expect(delta(project, before).evaluated).to.equal(2);
+      expect(carrier.analysisState.semanticVersion).to.equal(version);
+      cold = await createProject(currentSources(project), {
+        legacyOtherBehaviour: false,
+      });
+      expect(snapshot(project)).to.deep.equal(snapshot(cold));
+    } finally {
+      cold?.dispose();
+      project.dispose();
+    }
+  });
+
+  it('tracks nested returned callback implementations and their current bound receivers', async function () {
+    const provider = `function MakeCallback(){var owner={left:"text",right:1};
+      return method(owner,function(){return left;});}`;
+    const project = await createProject({
+      Provider: provider,
+      Carrier: 'global.callback=MakeCallback();',
+      Executor: 'function RunCallback(){return global.callback();}',
+    });
+    let cold: MemoryProject | undefined;
+    try {
+      expect(kinds(callable(project, 'RunCallback').returns)).to.deep.equal([
+        'String',
+      ]);
+      await project
+        .testCode('Provider')
+        .reload(provider.replace('return left', 'return right'));
+      expect(kinds(callable(project, 'RunCallback').returns)).to.deep.equal([
+        'Real',
+      ]);
+      cold = await createProject(currentSources(project));
+      expect(snapshot(project)).to.deep.equal(snapshot(cold));
+    } finally {
+      cold?.dispose();
+      project.dispose();
+    }
+  });
+
+  it('propagates implementation reads made by defaults statics and base constructors', async function () {
+    const source = `function Initialize(){return other.left;}
+      function WithDefault(input=Initialize()){return input;}
+      function WithStatic(){static cached=Initialize();return cached;}
+      function BaseContext()constructor{other.mark=other.left;}
+      function DerivedContext():BaseContext()constructor{}`;
+    const project = await createProject(
+      {
+        Provider: source,
+        Executor: `function RunDefaults(){var callback=method({},WithDefault);var caller={left:"text",right:1};var result;
+        with(caller){result=callback();}return result;}
+      function RunStatics(){var callback=method({},WithStatic);var caller={left:"text",right:1};var result;
+        with(caller){result=callback();}return result;}
+      function RunBase(){var caller={left:"text",right:1,mark:false};var result;with(caller){result=new DerivedContext();}return caller.mark;}`,
+      },
+      { legacyOtherBehaviour: false },
+    );
+    let cold: MemoryProject | undefined;
+    try {
+      for (const name of ['RunDefaults', 'RunStatics', 'RunBase'])
+        expect(kinds(callable(project, name).returns), name).to.include(
+          'String',
+        );
+      await project
+        .testCode('Provider')
+        .reload(source.replaceAll('other.left', 'other.right'));
+      for (const name of ['RunDefaults', 'RunStatics', 'RunBase']) {
+        expect(kinds(callable(project, name).returns), name).to.include('Real');
+        expect(kinds(callable(project, name).returns), name).not.to.include(
+          'String',
+        );
+      }
+      cold = await createProject(currentSources(project), {
+        legacyOtherBehaviour: false,
+      });
+      expect(snapshot(project)).to.deep.equal(snapshot(cold));
+    } finally {
+      cold?.dispose();
+      project.dispose();
+    }
+  });
+
+  it('withdraws deleted callback implementations and recovers after provider restoration', async function () {
+    const provider = 'function RetainedCallback(){return other.field;}';
+    const project = await createProject(
+      {
+        Provider: provider,
+        Carrier: 'global.callback=RetainedCallback;',
+        Executor:
+          'function RunRetained(){var callback=method({},global.callback);var caller={field:"text"};var result;with(caller){result=callback();}return result;}',
+      },
+      { legacyOtherBehaviour: false },
+    );
+    let cold: MemoryProject | undefined;
+    try {
+      expect(kinds(callable(project, 'RunRetained').returns)).to.deep.equal([
+        'String',
+      ]);
+      await project.retireTestResource('Provider');
+      expect(kinds(callable(project, 'RunRetained').returns)).not.to.include(
+        'String',
+      );
+      expect(
+        missing(project.testCode('Carrier'), 'RetainedCallback'),
+      ).not.to.have.length(0);
+      project.addTestCode('Provider', provider);
+      await project.analysis.analyze();
+      expect(kinds(callable(project, 'RunRetained').returns)).to.deep.equal([
+        'String',
+      ]);
+      cold = await createProject(currentSources(project), {
+        fileOrder: ['Executor', 'Carrier', 'Provider'],
+        legacyOtherBehaviour: false,
+      });
+      expect(snapshot(project)).to.deep.equal(snapshot(cold));
+    } finally {
+      cold?.dispose();
+      project.dispose();
+    }
+  });
+
+  it('distinguishes same-signature callable origins when a carrier switches targets', async function () {
+    const project = await createProject(
+      {
+        Provider:
+          'function LeftContext(){return other.left;} function RightContext(){return other.right;}',
+        Carrier: 'global.callback=LeftContext;',
+        Executor:
+          'function RunSelected(){var callback=method({},global.callback);var caller={left:"text",right:1};var result;with(caller){result=callback();}return result;}',
+      },
+      { legacyOtherBehaviour: false },
+    );
+    let cold: MemoryProject | undefined;
+    try {
+      expect(kinds(callable(project, 'RunSelected').returns)).to.deep.equal([
+        'String',
+      ]);
+      await project.testCode('Carrier').reload('global.callback=RightContext;');
+      expect(kinds(callable(project, 'RunSelected').returns)).to.deep.equal([
+        'Real',
+      ]);
+      cold = await createProject(currentSources(project), {
+        legacyOtherBehaviour: false,
+      });
+      expect(snapshot(project)).to.deep.equal(snapshot(cold));
+    } finally {
+      cold?.dispose();
+      project.dispose();
+    }
+  });
+});
+
+describe('Incremental semantic publication', function () {
+  it('retains unchanged source versions while replacing a registered document at the same URI', async function () {
+    const project = await createProject({
+      Provider:
+        'function Candidate(){return 1;} function Obsolete(){return 2;}',
+      Consumer: 'var result=Candidate();',
+      Stable: 'function Keep(){return true;}',
+    });
+    const old = project.testCode('Provider');
+    const stable = project.testCode('Stable');
+    const stableType = callable(project, 'Keep');
+    const obsolete = project.self.getMember('Obsolete')!;
+    const prepare = ContributionGraph.prepare;
+    let checked = false;
+    const restore = patchInstance(
+      ContributionGraph,
+      'prepare',
+      (...args: Parameters<typeof prepare>) => {
+        const previous = args[2]!.index;
+        const oldVersion = previous.units.get(old.path.absolute)!;
+        const stableVersion = previous.units.get(stable.path.absolute)!;
+        expect(args[0]).not.to.equal(previous);
+        expect(args[0].units.get(old.path.absolute)).not.to.equal(oldVersion);
+        expect(args[0].units.get(stable.path.absolute)).to.equal(stableVersion);
+        const candidate = prepare(...args);
+        expect(previous.units.get(old.path.absolute)).to.equal(oldVersion);
+        expect(previous.units.get(stable.path.absolute)).to.equal(
+          stableVersion,
+        );
+        checked = true;
+        return candidate;
+      },
+    );
+    let cold: MemoryProject | undefined;
+    try {
+      const replacement = project.addTestCode(
+        'Provider',
+        'function Candidate(){return "new";}',
+      );
+      await project.analysis.analyze();
+      restore();
+      expect(checked).to.equal(true);
+      expect(project.analysis.document(old.path.absolute)).to.equal(
+        replacement,
+      );
+      expect(old.analysisState.status).to.equal('retired');
+      expectValue(project.testCode('Consumer'), 'result', 'String');
+      expect(project.self.getMember('Candidate')!.def?.file).to.equal(
+        replacement,
+      );
+      expect(obsolete.def).to.equal(undefined);
+      expect(obsolete.type.hasTypes).to.equal(false);
+      expect(callable(project, 'Keep')).to.equal(stableType);
+      cold = await createProject(currentSources(project));
+      expect(snapshot(project)).to.deep.equal(snapshot(cold));
+    } finally {
+      restore();
+      cold?.dispose();
+      project.dispose();
+    }
+  });
+
+  it('refreshes captured native input after a warm transaction without replacing the native object', async function () {
+    const source = 'var result=audit_branch_native;';
+    const project = await createProject({ Consumer: source });
+    let cold: MemoryProject | undefined;
+    const install = (target: MemoryProject, type: Type) => {
+      const owner = target.native!.globalSelf;
+      const member = new Signifier(owner, 'audit_branch_native', type);
+      member.global = true;
+      member.writable = false;
+      member.def = {};
+      owner.setOwnMember(member);
+      target.analysis.captureNative();
+    };
+    try {
+      const native = project.native;
+      for (const type of [Type.Real, Type.String]) {
+        install(project, type);
+        await project.analysis.analyze();
+        expect(project.native).to.equal(native);
+        expectValue(project.testCode('Consumer'), 'result', type.kind);
+      }
+      cold = new MemoryProject();
+      await cold.prepareBundledNative();
+      install(cold, Type.String);
+      cold.addTestCode('Consumer', source);
+      await cold.analysis.analyze();
+      expect(snapshot(project)).to.deep.equal(snapshot(cold));
+    } finally {
+      cold?.dispose();
+      project.dispose();
+    }
+  });
+
+  it('withdraws externally spelled references on failure and preserves their owner order through recovery and retirement', async function () {
+    const sources = {
+      Provider: 'global.audit_macro_value=1;',
+      Macros: '#macro AUDIT_PICK global.audit_macro_value\n',
+      Consumer: 'var result=AUDIT_PICK;',
+      Stable: 'var kept=AUDIT_PICK;',
+    };
+    const project = await createProject(sources);
+    const consumer = project.testCode('Consumer');
+    const uri = project.testCode('Macros').path.absolute;
+    const external = () => project.analysis.spellingReferences(uri);
+    const verify = () =>
+      expect(external()).to.deep.equal(
+        project.analysis.references.filter(
+          (ref) => ref.origin?.spelling.uri === uri && ref.ownerUnitId !== uri,
+        ),
+      );
+    const before = external();
+    expect(
+      before.some((ref) => ref.ownerUnitId === consumer.path.absolute),
+    ).to.equal(true);
+    verify();
+    const failure = new Error('injected macro reference owner failure');
+    const restore = patchInstance(project.analysis, 'resourceInput', () => {
+      throw failure;
+    });
+    let cold: MemoryProject | undefined;
+    try {
+      expect(
+        await rejection(consumer.reload('var changed=AUDIT_PICK;')),
+      ).to.equal(failure);
+      expect(consumer.refs).to.deep.equal([]);
+      expect(
+        external().some((ref) => ref.ownerUnitId === consumer.path.absolute),
+      ).to.equal(false);
+      expect(
+        before.some((ref) => ref.ownerUnitId === consumer.path.absolute),
+      ).to.equal(true);
+      verify();
+      restore();
+      await consumer.reload('var changed=AUDIT_PICK;');
+      verify();
+      cold = await createProject(currentSources(project));
+      expect(snapshot(project)).to.deep.equal(snapshot(cold));
+      await project.retireTestResource('Consumer');
+      verify();
+      project.addTestCode('Consumer', sources.Consumer);
+      await project.analysis.analyze();
+      verify();
+    } finally {
+      restore();
+      cold?.dispose();
+      project.dispose();
+    }
+  });
+
+  it('preflights definition-only consumer views before changing live definitions', async function () {
+    const sources = {
+      Provider: 'function moved_definition(){return 1;}',
+      Consumer: 'var result=moved_definition();',
+    };
+    const project = await createProject(sources);
+    const consumer = project.testCode('Consumer');
+    const symbol = project.self.getMember('moved_definition')!;
+    const previousDefinition = symbol.def;
+    const previousVersion = consumer.analysisState.semanticVersion;
+    const failure = new Error('injected definition consumer source failure');
+    const prepare = ContributionGraph.prepare;
+    const restore = patchInstance(
+      ContributionGraph,
+      'prepare',
+      (...args: Parameters<typeof ContributionGraph.prepare>) => {
+        const staged = prepare(...args);
+        const source = staged.source;
+        patchInstance(staged, 'source', (uri: string) => {
+          if (uri === consumer.path.absolute) throw failure;
+          return source(uri);
+        });
+        return staged;
+      },
+    );
+    try {
+      expect(
+        await rejection(
+          project.testCode('Provider').reload('\n' + sources.Provider),
+        ),
+      ).to.equal(failure);
+      expect(symbol.def).to.equal(previousDefinition);
+      expect(consumer.analysisState.semanticVersion).to.equal(previousVersion);
+      restore();
+      await project.testCode('Provider').reload('\n' + sources.Provider);
+      const moved = symbol.def;
+      const queried = consumer.refs.find(
+        (ref) => ref.item.name === 'moved_definition',
+      )?.item.def;
+      expect(moved?.file && moved.start.line).to.equal(2);
+      expect(queried?.file && queried.start.line).to.equal(2);
+    } finally {
+      restore();
+      project.dispose();
+    }
+  });
+
+  it('withdraws pending retired owners and their external references when disposed before another analysis', async function () {
+    const project = await createProject({
+      Provider: 'function kept(){return 1;}',
+      Macros: '#macro FINISH kept()\n',
+      Consumer: 'var result=FINISH;',
+    });
+    const analysis = project.analysis;
+    const consumer = project.testCode('Consumer');
+    const spelling = project.testCode('Macros').path.absolute;
+    const refs = [...consumer.refs];
+    expect(refs.length).to.be.greaterThan(0);
+    expect(analysis.spellingReferences(spelling).length).to.be.greaterThan(0);
+    analysis.retire(consumer);
+    project.dispose();
+    expect(analysis.references).to.deep.equal([]);
+    expect(analysis.spellingReferences(spelling)).to.deep.equal([]);
+    expect(consumer.analysisState.status).to.equal('retired');
+    for (const ref of refs) expect(ref.item.refs.has(ref)).to.equal(false);
+    project.dispose();
+    expect(analysis.references).to.deep.equal([]);
+  });
+
+  it('withdraws retired contributions after a pre-publication failure has cleared retirement notifications', async function () {
+    const project = await createProject({
+      Provider: 'function RetireMe(){return 1;}',
+      Consumer: 'var result=RetireMe();',
+      Stable: 'function Keep(){return true;}',
+    });
+    const symbol = project.self.getMember('RetireMe')!;
+    const stable = callable(project, 'Keep');
+    const failure = new Error('injected before publication preparation');
+    const restore = patchInstance(project.analysis, 'resourceInput', () => {
+      throw failure;
+    });
+    let cold: MemoryProject | undefined;
+    try {
+      expect(await rejection(project.retireTestResource('Provider'))).to.equal(
+        failure,
+      );
+      restore();
+      const consumer = project.testCode('Consumer');
+      await consumer.reload('var result=RetireMe();\n');
+      expect(missing(consumer, 'RetireMe')).not.to.have.lengthOf(0);
+      expect(symbol.def).to.equal(undefined);
+      expect(callable(project, 'Keep')).to.equal(stable);
+      cold = await createProject(currentSources(project));
+      expect(snapshot(project)).to.deep.equal(snapshot(cold));
+    } finally {
+      restore();
+      cold?.dispose();
+      project.dispose();
+    }
+  });
+
+  it('keeps unrelated public graph work across local allocation and missing-member edits', async function () {
+    const initial = {
+      Stable: 'function Keep()constructor{field=1;}',
+      Edit: 'function Edit(){var target={field:1};return target.field;}',
+    };
+    const project = await createProject(initial);
+    const stable = callable(project, 'Keep');
+    const symbol = project.self.getMember('Keep')!;
+    const replace = stable.replaceOwnMembers.bind(stable);
+    const metadata = symbol.replaceMetadata.bind(symbol);
+    let typeCopies = 0,
+      symbolCopies = 0;
+    stable.replaceOwnMembers = (...args) => {
+      typeCopies++;
+      return replace(...args);
+    };
+    symbol.replaceMetadata = (...args) => {
+      symbolCopies++;
+      return metadata(...args);
+    };
+    for (const source of [
+      'function Edit(){var extra={nested:1};var target={field:1};return target.field;}',
+      'function Edit(){var target={field:1};return target.missing;}',
+      initial.Edit,
+    ]) {
+      await project.testCode('Edit').reload(source);
+      expect(typeCopies).to.equal(0);
+      expect(symbolCopies).to.equal(0);
+      expect(callable(project, 'Keep')).to.equal(stable);
+      expect(project.self.getMember('Keep')).to.equal(symbol);
+      expect(snapshot(project)).to.deep.equal(
+        snapshot(await createProject({ ...initial, Edit: source })),
+      );
+    }
+  });
+
+  for (const outcome of ['cancel', 'failure']) {
+    it(`discards a consumed private publication buffer after ${outcome} before commit`, async function () {
+      const initial = 'function Candidate(){return 1;}';
+      const changed = 'function Candidate(){return "candidate";}';
+      const recovered = 'function Candidate(){return true;}';
+      const project = await createProject({ A: initial });
+      const code = project.testCode('A');
+      const publicType = callable(project, 'Candidate');
+      const failure = new Error(
+        'injected after private publication preparation',
+      );
+      const prepare = ContributionGraph.prepare;
+      let attempts = 0;
+      const restore = patchInstance(
+        ContributionGraph,
+        'prepare',
+        (...args: Parameters<typeof prepare>) => {
+          const candidate = prepare(...args);
+          attempts++;
+          expect(kinds(publicType.returns)).to.deep.equal(['Real']);
+          if (attempts === 1) {
+            if (outcome === 'failure') throw failure;
+            code.setBufferContent(recovered);
+          } else {
+            expect(
+              args[2],
+              'consumed publication buffer must not survive cancellation/failure',
+            ).to.equal(undefined);
+          }
+          return candidate;
+        },
+      );
+      try {
+        if (outcome === 'failure') {
+          expect(await rejection(code.reload(changed))).to.equal(failure);
+          expect(code.refs).to.deep.equal([]);
+          expect(code.getDiagnostics().ANALYSIS[0].message).to.include(
+            failure.message,
+          );
+          await code.readContent(recovered);
+          await project.analysis.analyze();
+        } else {
+          await code.reload(changed);
+        }
+      } finally {
+        restore();
+      }
+      expect(attempts).to.equal(2);
+      expect(kinds(publicType.returns)).to.deep.equal(['Bool']);
+      expect(snapshot(project)).to.deep.equal(
+        snapshot(await createProject({ A: recovered })),
+      );
+    });
+  }
+
+  it('clears retired public handles and references while preserving unrelated handles', async function () {
+    const project = await createProject({
+      A: 'function RetireMe(){return 1;}',
+      B: 'function KeepMe(){return 2;}',
+    });
+    const symbol = project.self.getMember('RetireMe')!;
+    const type = symbol.getTypeByKind('Function')!;
+    const keep = callable(project, 'KeepMe');
+    const references = [...symbol.refs];
+    await project.retireTestResource('A');
+    expect(symbol.type.hasTypes).to.equal(false);
+    expect(symbol.def).to.equal(undefined);
+    expect(symbol.refs.size).to.equal(0);
+    expect(type.returns).to.equal(undefined);
+    expect(type.listMembers(true)).to.deep.equal([]);
+    expect(callable(project, 'KeepMe')).to.equal(keep);
+    for (const reference of references)
+      expect(project.analysis.references).not.to.include(reference);
+    expect(snapshot(project)).to.deep.equal(
+      snapshot(await createProject(currentSources(project))),
+    );
+  });
+
+  it('preserves a shared anonymous public union while copying only one keyed owner', function () {
+    const project = new MemoryProject();
+    const shared = Type.Struct;
+    shared.items = value(shared);
+    const globals = Type.Struct,
+      left = Type.Struct,
+      right = Type.Struct;
+    globals.semanticKey = globalOwner;
+    left.semanticKey = 'left';
+    right.semanticKey = 'right';
+    left.items = value(shared);
+    right.items = value(shared);
+    const symbols = [
+      new Signifier(globals, 'left', left),
+      new Signifier(globals, 'right', right),
+    ];
+    for (const symbol of symbols) {
+      symbol.semanticKey = `global:${symbol.name}`;
+      globals.setOwnMember(symbol);
+    }
+    const root = {
+      types: new Map([
+        [globalOwner, globals],
+        ['right', right],
+      ]),
+      namedTypes: new Map<string, string>(),
+      symbols: new Map(
+        symbols.map((item) => [
+          item.semanticKey!,
+          {
+            key: item.semanticKey!,
+            item,
+            owner: globalOwner,
+            unitId: 'root',
+            exported: true,
+          },
+        ]),
+      ),
+    };
+    const index = (description: string) => {
+      const current = new ContributionIndex();
+      const changed = Type.Struct;
+      changed.semanticKey = 'left';
+      changed.description = description;
+      changed.items = value(shared);
+      current.replace('root', root);
+      current.replace('left', {
+        types: new Map([['left', changed]]),
+        symbols: new Map(),
+        namedTypes: new Map(),
+      });
+      return current;
+    };
+    // Exercise the actual synchronous publication boundary with a closed input
+    // graph and no documents, avoiding parser allocation identities in this case.
+    const commit = Reflect.get(project.analysis, 'commit') as (
+      graph: ContributionGraph,
+      states: Map<never, never>,
+      evaluated: Set<string>,
+    ) => unknown;
+    const first = ContributionGraph.prepare(index('before'), () => undefined);
+    commit.call(project.analysis, first, new Map<never, never>(), new Set());
+    const publicLeft = project.self.getMember('left')!.getTypeByKind('Struct')!;
+    const publicRight = project.self
+      .getMember('right')!
+      .getTypeByKind('Struct')!;
+    const next = ContributionGraph.prepare(
+      index('after'),
+      () => undefined,
+      first,
+    );
+    expect(publicLeft.description).to.equal('before');
+    commit.call(project.analysis, next, new Map<never, never>(), new Set());
+    expect(publicLeft.description).to.equal('after');
+    expect(value(publicLeft.items, publicRight.items).type).to.have.length(1);
+    expect(publicLeft.items!.type[0]).to.equal(publicRight.items!.type[0]);
+    expect(publicLeft.items!.type[0]).not.to.equal(
+      next.type('left').items!.type[0],
+    );
+    expect(publicLeft.items!.type[0].items!.type[0]).to.equal(
+      publicLeft.items!.type[0],
+    );
   });
 });

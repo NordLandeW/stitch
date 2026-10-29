@@ -203,28 +203,42 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     document: vscode.TextDocument,
     position: vscode.Position,
   ): vscode.SignatureHelp | undefined {
-    const argRange = this.getFunctionArg(document, position);
-    if (!argRange?.param?.parent) {
-      return;
-    }
-    const param = argRange.param;
-    const func = argRange.type;
-    // Create the signature help
-    const signature = new vscode.SignatureInformation(
-      func.code,
-      func.description,
-    );
-    signature.activeParameter = param.idx!;
-    signature.parameters = func.listParameters().map((p) => {
-      return new vscode.ParameterInformation(
-        p?.name || 'unknown',
-        p?.description,
+    const ranges =
+      this.getGmlFile(document)?.getFunctionArgCandidatesAt(
+        document.offsetAt(position),
+      ) || [];
+    const signatures = new Map<string, vscode.SignatureInformation>();
+    for (const range of ranges) {
+      const func = range.type;
+      const signature = new vscode.SignatureInformation(
+        func.code,
+        func.description,
       );
-    });
+      signature.activeParameter = range.param?.idx ?? range.idx;
+      signature.parameters = func
+        .listParameters()
+        .map(
+          (param) =>
+            new vscode.ParameterInformation(
+              param?.name || 'unknown',
+              param?.description,
+            ),
+        );
+      signatures.set(signature.label, signature);
+    }
+    if (!signatures.size) return;
     const help = new vscode.SignatureHelp();
-    help.signatures = [signature];
-    help.activeSignature = 0;
-    help.activeParameter = param.idx!;
+    help.signatures = [...signatures.values()].sort((a, b) =>
+      a.label.localeCompare(b.label),
+    );
+    const compatible = help.signatures.findIndex(
+      (signature) =>
+        signature.activeParameter !== undefined &&
+        signature.activeParameter < signature.parameters.length,
+    );
+    help.activeSignature = Math.max(0, compatible);
+    help.activeParameter =
+      help.signatures[help.activeSignature].activeParameter ?? 0;
     return help;
   }
 
@@ -379,6 +393,14 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     const read = {};
     this.diskReads.set(code, read);
     await code.project.withResourceUpdate(async () => {
+      // Resource moves may retire this Code while its close notification waits
+      // behind the resource transaction. Recheck before touching the old path.
+      if (
+        this.disposed ||
+        this.diskReads.get(code) !== read ||
+        this.getGmlFile(uri) !== code
+      )
+        return;
       const text = await code.path.read();
       if (
         this.disposed ||
@@ -403,6 +425,10 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
       this.analysis.forget(code);
       code.releaseBuffer();
     }
+    // Undo may restore resource metadata before closing the moved working copy.
+    // Reconcile that metadata first; the closed URI can already be retired.
+    await this.externalChangeTracker.flush();
+    if (this.getGmlFile(document) !== code) return;
     // Closing an unsaved buffer must restore the on-disk model as well.
     await this.onChangeFile(document.uri);
   }
@@ -634,13 +660,22 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
   ): void {
     if (!event || this.disposed) return;
     const document = 'document' in event ? event.document : event;
-    if (
-      document.languageId !== 'gml' ||
-      document.uri.scheme !== 'file' ||
-      document.isClosed
-    )
-      return;
+    if (document.uri.scheme !== 'file' || document.isClosed) return;
     if ('contentChanges' in event && !event.contentChanges.length) return;
+    if (
+      document.uri.path.endsWith('.yy') ||
+      document.uri.path.endsWith('.yyp')
+    ) {
+      // Workspace edits and Undo can change metadata without saving it. Feed
+      // those buffers through the same reconciliation joined by every query.
+      if ('contentChanges' in event)
+        this.externalChangeTracker.addChange({
+          type: 'change',
+          uri: document.uri,
+        });
+      return;
+    }
+    if (document.languageId !== 'gml') return;
     const code = this.getGmlFile(document);
     if (!code) return;
     this.diskReads.delete(code);

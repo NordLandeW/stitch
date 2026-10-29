@@ -38,6 +38,8 @@ export class Signifier extends Flags {
   refs = new Set<Reference>();
   /** Stable storage identity used by the transactional semantic model. */
   semanticKey: string | undefined;
+  /** Shared declaration identity for independently tracked instance storage. */
+  canonicalKey: string | undefined;
   /** Input-owned provenance is independent of native/type constraints. */
   resourceDefinition: ResourceDefinition | undefined;
 
@@ -58,6 +60,7 @@ export class Signifier extends Flags {
     this.idx = source.idx;
     this._native = source._native;
     this.resourceDefinition = source.resourceDefinition;
+    this.canonicalKey = source.canonicalKey;
     this.copyFlagsFrom(source);
   }
 

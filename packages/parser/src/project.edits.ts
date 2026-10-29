@@ -26,7 +26,7 @@ export interface ProjectEditBatch {
   readonly label: string;
   /** All edits refer to pre-rename physical paths. */
   readonly documents: readonly ProjectDocumentEdit[];
-  /** Ordered moves, performed after the document edits. */
+  /** Ordered moves; document paths and offsets describe their pre-move inputs. */
   readonly renames: readonly { readonly from: string; readonly to: string }[];
   /** Call after asynchronous preflight and immediately before applying edits. */
   readonly validate: () => void;

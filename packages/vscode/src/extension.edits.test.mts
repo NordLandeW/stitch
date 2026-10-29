@@ -203,16 +203,17 @@ test(
 );
 
 test(
-  'submits UTF-16 half-open ranges at pre-rename URIs before an ordered rename chain',
+  'submits UTF-16 half-open edits to the final resources after their moves',
   { timeout: 30_000 },
   async (t) => {
     const text = 'first😀\r\nsecond\n';
     const f = await fixture(t, { A: text, B: 'tail' });
     const a = f.documents.A.uri.fsPath;
     const b = f.documents.B.uri.fsPath;
-    const temporary = path.join(f.host.root, 'swap.temporary');
+    const renamedA = path.join(f.host.root, 'RenamedA.gml');
+    const renamedB = path.join(f.host.root, 'RenamedB.gml');
     const batch: ProjectEditBatch = {
-      label: 'Ordered buffer and resource rename',
+      label: 'Buffer and resource rename',
       documents: [
         change(f.documents.A, text, [
           { start: 5, end: 7, text: 'STAR' },
@@ -222,9 +223,8 @@ test(
         change(f.documents.B, 'tail', [{ start: 0, end: 4, text: 'TAIL' }]),
       ],
       renames: [
-        { from: a, to: temporary },
-        { from: b, to: a },
-        { from: temporary, to: b },
+        { from: a, to: renamedA },
+        { from: b, to: renamedB },
       ],
       validate: () => {
         f.events.push('validate');
@@ -240,73 +240,46 @@ test(
         label: batch.label,
         needsConfirmation: false,
       });
+    const moves = edit.operations.filter(
+      (operation: any) => operation.kind === 'renameFile',
+    );
     assert.deepEqual(
-      edit.operations.map((operation: any) =>
-        operation.kind === 'replace'
-          ? {
-              kind: operation.kind,
-              path: operation.uri.fsPath,
-              start: [
-                operation.range.start.line,
-                operation.range.start.character,
-              ],
-              end: [operation.range.end.line, operation.range.end.character],
-              text: operation.newText,
-            }
-          : {
-              kind: operation.kind,
-              from: operation.oldUri.fsPath,
-              to: operation.newUri.fsPath,
-              options: operation.options,
-            },
-      ),
+      moves.map((move: any) => [move.oldUri.fsPath, move.newUri.fsPath]),
       [
-        { kind: 'replace', path: a, start: [0, 5], end: [0, 7], text: 'STAR' },
+        [a, renamedA],
+        [b, renamedB],
+      ],
+    );
+    const replacements = edit.operations.filter(
+      (operation: any) => operation.kind === 'replace',
+    );
+    assert(
+      moves.every(
+        (move: any) =>
+          edit.operations.indexOf(move) <
+          edit.operations.indexOf(replacements[0]),
+      ),
+    );
+    assert.deepEqual(
+      replacements.map((operation: any) => ({
+        path: operation.uri.fsPath,
+        start: [operation.range.start.line, operation.range.start.character],
+        end: [operation.range.end.line, operation.range.end.character],
+        text: operation.newText,
+      })),
+      [
+        { path: renamedA, start: [0, 5], end: [0, 7], text: 'STAR' },
+        { path: renamedA, start: [1, 0], end: [1, 6], text: 'SECOND' },
         {
-          kind: 'replace',
-          path: a,
-          start: [1, 0],
-          end: [1, 6],
-          text: 'SECOND',
-        },
-        {
-          kind: 'replace',
-          path: a,
+          path: renamedA,
           start: [2, 0],
           end: [2, 0],
           text: '// EOF insertion',
         },
-        { kind: 'replace', path: b, start: [0, 0], end: [0, 4], text: 'TAIL' },
-        {
-          kind: 'renameFile',
-          from: a,
-          to: temporary,
-          options: { overwrite: false, ignoreIfExists: false },
-        },
-        {
-          kind: 'renameFile',
-          from: b,
-          to: a,
-          options: { overwrite: false, ignoreIfExists: false },
-        },
-        {
-          kind: 'renameFile',
-          from: temporary,
-          to: b,
-          options: { overwrite: false, ignoreIfExists: false },
-        },
+        { path: renamedB, start: [0, 0], end: [0, 4], text: 'TAIL' },
       ],
     );
-    assert.deepEqual(
-      edit
-        .entries()
-        .map(([uri, edits]: [any, any[]]) => [uri.fsPath, edits.length]),
-      [
-        [a, 3],
-        [b, 1],
-      ],
-    );
-    // The editor boundary is recording-only, not a second application implementation.
+    // Recording the boundary is not proof of editor application or Undo.
     assert.equal(f.documents.A.getText(), text);
     assert.equal(f.documents.B.getText(), 'tail');
   },
@@ -416,3 +389,83 @@ test(
     }
   },
 );
+
+for (const editMovedDocument of [false, true]) {
+  test(`dependent resource moves retain directory Undo and ${editMovedDocument ? 'edit' : 'include'} the moved buffer`, async (t) => {
+    const f = await fixture(t, { 'Old/Old': 'original', project: 'metadata' });
+    const document = f.documents['Old/Old'],
+      project = f.documents.project;
+    const old = path.dirname(document.uri.fsPath),
+      next = path.join(f.host.root, 'New');
+    const finalFile = path.join(next, 'New.gml');
+    const renames = [
+      { from: document.uri.fsPath, to: path.join(old, 'New.gml') },
+      { from: old, to: next },
+    ];
+    assert.equal(
+      await f.host.subject.applyProjectEdits({
+        label: 'Nested resource rename',
+        documents: [
+          change(project, 'metadata', [
+            { start: 0, end: 8, text: 'new metadata' },
+          ]),
+          ...(editMovedDocument
+            ? [
+                change(document, 'original', [
+                  { start: 0, end: 8, text: 'updated' },
+                ]),
+              ]
+            : []),
+        ],
+        renames,
+        validate() {},
+      }),
+      true,
+    );
+    const operations = f.applications[0].edit.operations;
+    const moves = operations.filter(
+      (operation: any) => operation.kind === 'renameFile',
+    );
+    assert.deepEqual(
+      moves.map((move: any) => ({
+        from: move.oldUri.fsPath,
+        to: move.newUri.fsPath,
+      })),
+      renames,
+    );
+    const first = operations.indexOf(moves[0]),
+      second = operations.indexOf(moves[1]);
+    // Real VS Code groups adjacent file edits against one working-copy view.
+    // The parent move must see the completed child group, and remain a native
+    // directory move so Undo removes the destination directory as well.
+    assert(
+      operations
+        .slice(first + 1, second)
+        .some(
+          (operation: any) =>
+            operation.kind === 'replace' && operation.newText === '',
+        ),
+    );
+    const finalText = operations
+      .slice(second + 1)
+      .filter((operation: any) => operation.kind === 'replace');
+    assert(
+      finalText.some(
+        (operation: any) =>
+          operation.uri.fsPath === project.uri.fsPath &&
+          operation.newText === 'new metadata',
+      ),
+    );
+    const movedText = finalText.filter(
+      (operation: any) => operation.uri.fsPath === finalFile,
+    );
+    assert.equal(movedText.length, 1);
+    assert.equal(movedText[0].newText, editMovedDocument ? 'updated' : '');
+    if (!editMovedDocument)
+      assert.deepEqual(movedText[0].range.start, movedText[0].range.end);
+    // This observes the API boundary; actual application/Undo belongs to the
+    // isolated real-host validation, not a second editor implementation here.
+    assert.equal(document.getText(), 'original');
+    assert.equal(project.getText(), 'metadata');
+  });
+}

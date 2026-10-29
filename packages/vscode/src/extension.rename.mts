@@ -53,17 +53,17 @@ export class StitchRenameProvider implements vscode.RenameProvider {
     );
     const signifier = ref.item;
     assertUserClaim(signifier, 'No signifier found for reference');
-    assertUserClaim(signifier.name, 'No name found for signifier');
+    assertUserClaim(
+      signifier.name || ref.rename?.kind === 'string-key',
+      'No name found for signifier',
+    );
     assertUserClaim(
       text === ref.item.name || ref.rename?.kind === 'string-key',
       'This source range does not directly spell the symbol',
     );
     assertUserClaim(!signifier.native, 'Cannot rename native functions');
     assertUserClaim(!signifier.asset, 'Rename assets using the asset tree');
-    assertUserClaim(
-      signifier.isRenameable && ref.isRenameable,
-      'Cannot rename this symbol',
-    );
+    assertUserClaim(ref.isRenameable, 'Cannot rename this symbol');
     return { ref, text, range };
   }
 

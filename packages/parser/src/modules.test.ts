@@ -1,11 +1,25 @@
 import { expect } from 'chai';
 import { computeAssetDeps, importAssets } from './modules.js';
 import { Project } from './project.js';
+import { Native } from './project.native.js';
 import { resetSandbox } from './test.lib.js';
 import { assert } from './util.js';
 import { assertThrowsAsync } from './util.test.js';
 
 describe('Modules', function () {
+  const listSpecFiles = Native.listSpecFiles;
+  const findHelpLinksFile = Native.findHelpLinksFile;
+  before(function () {
+    // Import semantics use bundled native declarations; runtime discovery and
+    // release-network availability are covered independently.
+    Native.listSpecFiles = async () => [Native.fallbackGmlSpecPath];
+    Native.findHelpLinksFile = async () => undefined;
+  });
+  after(function () {
+    Native.listSpecFiles = listSpecFiles;
+    Native.findHelpLinksFile = findHelpLinksFile;
+  });
+
   it('can compute intra-project dependencies', async function () {
     const projectDir = 'samples/project';
     const project = await Project.initialize(projectDir);
@@ -42,6 +56,7 @@ describe('Modules', function () {
       onMissingDependency: 'skip',
     });
     expect(targetProject.getAssetByName('o_child1_child')).to.exist;
+    expect(targetProject.analysis.isCurrent).to.equal(true);
   });
 
   it('can perform a deep import', async function () {
@@ -60,6 +75,31 @@ describe('Modules', function () {
     expect(targetProject.getAssetByName('o_child1_child')).to.exist;
     expect(targetProject.getAssetByName('o_child1')).to.exist;
     expect(targetProject.getAssetByName('o_parent')).to.exist;
+  });
+
+  it('propagates imported-code analysis failures to the import caller', async function () {
+    const target = await resetSandbox();
+    const source = await Project.initialize('samples/project');
+    const analyze = target.initiallyParseAssetCode;
+    const failure = new Error('Imported analysis failed');
+    const rejected = Promise.reject(failure);
+    // Keep the injected failure observed even when testing an implementation
+    // that drops the returned promise instead of making importAssets await it.
+    void rejected.catch(() => {});
+    target.initiallyParseAssetCode = () => rejected;
+    try {
+      await importAssets(source, target, {
+        sourceAsset: 'o_child1_child',
+        onMissingDependency: 'skip',
+      }).then(
+        () => expect.fail('Import returned before its analysis failure'),
+        (error) => expect(error).to.equal(failure),
+      );
+    } finally {
+      target.initiallyParseAssetCode = analyze;
+      target.dispose();
+      source.dispose();
+    }
   });
 
   xit('can identify import conflicts', async function () {

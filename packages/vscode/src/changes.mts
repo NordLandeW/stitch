@@ -137,7 +137,7 @@ export class ChangeTracker {
         // Change to the yyp file implies that we have deleted
         // or added an asset, so we need to respond to that.
         if (uri.path.endsWith('.yyp')) {
-          logger.info(`yyp file changed on disk. Reloading!`);
+          logger.info(`yyp inputs changed. Reloading!`);
           await project.reloadYyp();
           if (this.disposed) return;
           stitchEvents.emit('project-changed', project);
@@ -190,8 +190,14 @@ export class ChangeTracker {
             this.cache.igorCacheIsClean = true;
           }
         }
-        if (asset) {
-          stitchEvents.emit('asset-changed', asset, type, uri);
+        const currentAsset = project.getAsset(pathy(uri.fsPath));
+        // Undo can restore metadata after the YYP buffer has already retired
+        // the old resource. A new model needs a tree rebuild, not a refresh of
+        // a missing or retired TreeAsset retained before reconciliation.
+        if (currentAsset !== asset)
+          stitchEvents.emit('project-changed', project);
+        if (currentAsset) {
+          stitchEvents.emit('asset-changed', currentAsset, type, uri);
         }
       } catch (error) {
         logger.error(error);

@@ -854,3 +854,373 @@ test(
     assert(!dotNames.includes('_local'));
   },
 );
+
+// A type-name reference denotes the constructor, while an instance expression
+// denotes its current value. Both must keep their distinct semantic categories.
+test(
+  'constructor type annotations retain class highlighting without recoloring instance values',
+  { timeout: 30_000 },
+  async (t) => {
+    const f = await fixture(t, {
+      Definition: 'function PointLight() constructor { radius = 1; }',
+      Consumer:
+        'function Probe(){\n/// @type {Struct.PointLight}\nvar light = new PointLight();\nreturn light.radius;\n}',
+    });
+    const document = f.documents.Consumer;
+    const annotation = span(document, 'Struct.PointLight');
+    const constructor = span(document, 'PointLight', annotation.end);
+    const declaration = span(document, 'light');
+    const use = span(document, 'light', declaration.end);
+    const tokens = tokenSpans(
+      document,
+      await f.tokens.provideDocumentSemanticTokens(document, token),
+    );
+    for (const expected of [
+      { ...annotation, type: 'class' },
+      { ...constructor, type: 'class' },
+      { ...declaration, type: 'variable' },
+      { ...use, type: 'variable' },
+    ]) {
+      assert.deepEqual(
+        tokens.filter((entry: any) => entry.start === expected.start),
+        [expected],
+      );
+    }
+  },
+);
+
+test(
+  'ordinary and dot-triggered completion use unsaved partial identifiers and recover after editing',
+  { timeout: 30_000 },
+  async (t) => {
+    const prefix =
+      'function Probe(){\nvar receiver = {radius:1};\nvar localValue = 2;\n';
+    const f = await fixture(t, {
+      Definition: 'function sharedFunction() { return 1; }',
+      Consumer: `${prefix}return localValue;\n}`,
+    });
+    const document = f.documents.Consumer;
+    const provider = new f.host.subject.StitchCompletionProvider(f.workspace);
+    const label = (item: any) =>
+      typeof item.label === 'string' ? item.label : item.label.label;
+    for (const [expression, triggerCharacter] of [
+      ['loc', undefined],
+      ['receiver.', '.'],
+      ['receiver.ra', undefined],
+      ['sha', undefined],
+    ] as const) {
+      document.setText(`${prefix}${expression}\n}`);
+      f.workspace.onChangeDoc({
+        document,
+        contentChanges: [{ text: expression.at(-1) }],
+      });
+      const items = await provider.provideCompletionItems(
+        document,
+        document.positionAt(prefix.length + expression.length),
+        token,
+        { triggerKind: triggerCharacter ? 1 : 0, triggerCharacter },
+      );
+      assert(items, `Completion must return a current view for ${expression}`);
+      const names = items.map(label);
+      if (expression.startsWith('receiver.')) {
+        assert.deepEqual(names, ['radius']);
+      } else {
+        assert(names.includes('localValue'), expression);
+        assert(names.includes('sharedFunction'), expression);
+      }
+      assert.equal(f.files.Consumer.content, document.getText());
+    }
+  },
+);
+
+test(
+  'struct values and nested function bodies retain ordinary and member completion',
+  { timeout: 30_000 },
+  async (t) => {
+    const source =
+      'function Probe(){var existing="yes";var receiver={radius:1};var opts={a:existing,b:receiver.radius,run:function(){var inner=1;return inner;}};}';
+    const f = await fixture(t, { Consumer: source });
+    const document = f.documents.Consumer;
+    const provider = new f.host.subject.StitchCompletionProvider(f.workspace);
+    for (const [spelling, expected, triggerCharacter] of [
+      ['existing', 'existing', undefined],
+      ['radius', 'radius', '.'],
+      ['inner', 'inner', undefined],
+    ] as const) {
+      const offset = source.lastIndexOf(spelling);
+      const items = await provider.provideCompletionItems(
+        document,
+        document.positionAt(offset + 1),
+        token,
+        { triggerKind: triggerCharacter ? 1 : 0, triggerCharacter },
+      );
+      assert(items);
+      const names = items.map((item: any) =>
+        typeof item.label === 'string' ? item.label : item.label.label,
+      );
+      assert(names.includes(expected), `${spelling}: ${names.join(',')}`);
+      if (spelling !== 'inner')
+        assert(
+          !names.includes('a'),
+          'An enclosing struct must not capture a value-expression request',
+        );
+    }
+  },
+);
+
+test(
+  'copy commands preserve the full union at a multiply bound member',
+  { timeout: 30_000 },
+  async (t) => {
+    const source =
+      'function Probe(flag){var receiver=flag?{shared:1}:{shared:"text"};return receiver.shared;}';
+    const f = await fixture(t, { Consumer: source });
+    const document = f.documents.Consumer;
+    const selection = {
+      active: document.positionAt(source.lastIndexOf('shared')),
+    };
+    f.host.vscode.window.activeTextEditor = { document, selection };
+    await f.host.subject.createCopyAsTypeCallback(f.workspace)(document.uri);
+    await f.host.subject.createCopyAsJsdocTypeCallback(f.workspace)(
+      document.uri,
+    );
+    assert.deepEqual(
+      f.host.logs.filter((entry: any[]) => entry[0] === 'clipboard'),
+      [
+        ['clipboard', 'Real|String'],
+        ['clipboard', '/// @type {Real|String}'],
+      ],
+    );
+  },
+);
+
+test(
+  'language analysis failure does not block an independent run or clean command',
+  { timeout: 30_000 },
+  async (t) => {
+    const f = await fixture(t, { Consumer: 'function Probe(){return 1;}' });
+    const failure = new Error('Injected language analysis failure');
+    f.files.Consumer.prepareSyntax = () => {
+      throw failure;
+    };
+    f.files.Consumer.setBufferContent('function Probe(){return 2;}');
+    let runtimeRequests = 0;
+    f.project.kill = async () => {};
+    // Stop at runtime discovery: no compiler, runner, terminal or process is launched.
+    f.project.resolveRuntime = async () => {
+      runtimeRequests++;
+      return undefined;
+    };
+    assert.equal(await f.project.run({ config: 'Test', clean: true }), false);
+    assert.equal(await f.project.run({ config: 'Test' }), false);
+    assert.equal(runtimeRequests, 2);
+    assert.equal(f.project.analysis.error, failure);
+    await assert.rejects(
+      f.project.run({ config: 'Absent', clean: true }),
+      /Unknown analysis configuration/,
+    );
+    assert.equal(runtimeRequests, 2);
+  },
+);
+
+test(
+  'copy annotations reject truncated recursive displays without replacing the clipboard',
+  { timeout: 30_000 },
+  async (t) => {
+    const source =
+      'function Probe(){var items=[];items[0]=items;return items;}';
+    const f = await fixture(t, { Consumer: source });
+    const document = f.documents.Consumer;
+    f.host.vscode.window.activeTextEditor = {
+      document,
+      selection: { active: document.positionAt(source.lastIndexOf('items')) },
+    };
+    await f.host.subject.createCopyAsJsdocTypeCallback(f.workspace)(
+      document.uri,
+    );
+    assert.equal(
+      f.host.logs.filter((entry: any[]) => entry[0] === 'clipboard').length,
+      0,
+    );
+    assert.equal(
+      f.host.logs.filter((entry: any[]) => entry[0] === 'information').length,
+      1,
+    );
+  },
+);
+
+test(
+  'signature help retains every callable alternative at one argument',
+  { timeout: 30_000 },
+  async (t) => {
+    const source =
+      'function First(value){return value;}function Second(text,extra){return text;}function Probe(flag){var selected=flag?First:Second;return selected(1);}';
+    const f = await fixture(t, { Consumer: source });
+    const document = f.documents.Consumer;
+    const help = await f.workspace.provideSignatureHelp(
+      document,
+      document.positionAt(source.lastIndexOf('(1)') + 1),
+      token,
+    );
+    assert(help);
+    assert.equal(help.signatures.length, 2);
+    assert(
+      help.signatures.some((signature: any) =>
+        signature.label.includes('First'),
+      ),
+    );
+    assert(
+      help.signatures.some((signature: any) =>
+        signature.label.includes('Second'),
+      ),
+    );
+    assert.deepEqual(
+      help.signatures.map((signature: any) =>
+        signature.parameters.map((param: any) => param.label),
+      ),
+      [['value'], ['text', 'extra']],
+    );
+  },
+);
+
+test(
+  'copy self refuses a receiver union that the annotation grammar cannot represent',
+  { timeout: 30_000 },
+  async (t) => {
+    const source =
+      'function First() constructor{}function Second() constructor{}function Probe(flag){var receiver=flag?new First():new Second();return receiver;}';
+    const f = await fixture(t, { Consumer: source });
+    const document = f.documents.Consumer;
+    f.host.vscode.window.activeTextEditor = {
+      document,
+      selection: {
+        active: document.positionAt(source.lastIndexOf('receiver')),
+      },
+    };
+    await f.host.subject.createCopyAsJsdocTypeCallback(f.workspace)(
+      document.uri,
+    );
+    await f.host.subject.createCopyAsJsdocSelfCallback(f.workspace)(
+      document.uri,
+    );
+    assert.deepEqual(
+      f.host.logs.filter((entry: any[]) => entry[0] === 'clipboard'),
+      [['clipboard', '/// @type {Struct.First|Struct.Second}']],
+    );
+    assert.equal(
+      f.host.logs.filter((entry: any[]) => entry[0] === 'information').length,
+      1,
+    );
+  },
+);
+
+test(
+  'signature help selects the callable that owns the current argument slot',
+  { timeout: 30_000 },
+  async (t) => {
+    const source =
+      'function First(value){return value;}function Second(text,extra){return text;}function Probe(flag){var selected=flag?First:Second;return selected(1,2);}';
+    const f = await fixture(t, { Consumer: source });
+    const document = f.documents.Consumer;
+    const help = await f.workspace.provideSignatureHelp(
+      document,
+      document.positionAt(source.lastIndexOf(',2)') + 1),
+      token,
+    );
+    assert(help);
+    assert.equal(help.signatures.length, 2);
+    assert(help.signatures[help.activeSignature].label.includes('Second'));
+    assert.equal(help.activeParameter, 1);
+    assert.equal(
+      help.signatures[help.activeSignature].parameters[help.activeParameter]
+        .label,
+      'extra',
+    );
+  },
+);
+
+test(
+  'quoted property names remain renameable after empty or keyword renames',
+  { timeout: 30_000 },
+  async (t) => {
+    for (const name of ['', 'self', 'other', 'global']) {
+      const quoted = JSON.stringify(name);
+      const source = `function Probe(){var value={${quoted}:1};return value[$ ${quoted}];}`;
+      const f = await fixture(t, { Consumer: source });
+      const document = f.documents.Consumer;
+      const at = document.positionAt(source.lastIndexOf(quoted) + 1);
+      const prepared = await f.rename.prepareRename(document, at, token);
+      assert.equal(prepared.placeholder, name);
+      const edits = editSpans(
+        f,
+        await f.rename.provideRenameEdits(document, at, 'restored', token),
+      );
+      assert.equal(edits.length, 2);
+      assert(edits.every((edit: any) => edit.newText === '"restored"'));
+    }
+  },
+);
+
+test(
+  'rename rejects capturing unselected references without banning harmless shadowing',
+  { timeout: 30_000 },
+  async (t) => {
+    for (const called of [true, false]) {
+      const source = `function Helper(){return 1;}function Probe(){var scratch=0;${called ? 'Helper();' : ''}return scratch;}`;
+      const f = await fixture(t, { Consumer: source });
+      const document = f.documents.Consumer;
+      const at = document.positionAt(source.lastIndexOf('scratch'));
+      if (called)
+        await assert.rejects(
+          f.rename.provideRenameEdits(document, at, 'Helper', token),
+          /capture/,
+        );
+      else
+        assert.equal(
+          editSpans(
+            f,
+            await f.rename.provideRenameEdits(document, at, 'Helper', token),
+          ).length,
+          2,
+        );
+    }
+  },
+);
+
+// Reversing equivalent receiver alternatives must not recolor the same member.
+test(
+  'mixed union member highlighting is independent of receiver alternative order',
+  { timeout: 30_000 },
+  async (t) => {
+    const observed: string[] = [];
+    for (const reverse of [false, true]) {
+      const alternatives = ['{shared:function(){return 1;}}', '{shared:2}'];
+      if (reverse) alternatives.reverse();
+      const source = `function Probe(flag){var receiver=flag?${alternatives[0]}:${alternatives[1]};var selected=receiver.shared;selected;return receiver.shared;}`;
+      const f = await fixture(t, { Consumer: source });
+      const document = f.documents.Consumer;
+      const at = source.lastIndexOf('shared');
+      const tokens = tokenSpans(
+        document,
+        await f.tokens.provideDocumentSemanticTokens(document, token),
+      );
+      const selected = tokens.filter((entry: any) => entry.start === at);
+      assert.equal(selected.length, 1);
+      observed.push(selected[0].type);
+      const variable = tokens.filter(
+        (entry: any) => entry.start === source.indexOf('selected;'),
+      );
+      assert.equal(variable.length, 1);
+      assert.equal(
+        variable[0].type,
+        'variable',
+        'A single binding with a mixed callable union remains a variable',
+      );
+    }
+    assert.equal(observed[0], observed[1]);
+    assert(
+      !['function', 'class'].includes(observed[0]),
+      'A possibly noncallable member must not be colored as an unconditional callable',
+    );
+  },
+);

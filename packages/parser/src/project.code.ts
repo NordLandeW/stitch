@@ -389,6 +389,20 @@ export class Code {
     return match;
   }
 
+  /** All callable alternatives at the innermost argument position. */
+  getFunctionArgCandidatesAt(
+    offset: number | LinePosition,
+    column?: number,
+  ): readonly FunctionArgRange[] {
+    const selected = this.getFunctionArgRangeAt(offset, column);
+    if (!selected) return [];
+    return this.functionArgRanges.filter(
+      (range) =>
+        range.start.offset === selected.start.offset &&
+        range.end.offset === selected.end.offset,
+    );
+  }
+
   getStructNewMemberRangeAt(
     offset: number | LinePosition,
     column?: number,
@@ -417,7 +431,22 @@ export class Code {
     }
     for (const scopeRange of this.scopes) {
       if (this.isInRange(scopeRange, offset)) {
-        return scopeRange;
+        if (scopeRange.isDotAccessor) return scopeRange;
+        // The singular compatibility API prefers a concrete receiver at the
+        // selected range. Plural completion still retains unknown alternatives.
+        return (
+          this.scopes.find(
+            (candidate) =>
+              !candidate.isDotAccessor &&
+              candidate.start.offset === scopeRange.start.offset &&
+              candidate.end.offset === scopeRange.end.offset &&
+              (candidate.dotReceivers || [candidate.self]).some((receiver) =>
+                ['Struct', 'Id.Instance', 'Asset.GMObject'].includes(
+                  receiver.kind,
+                ),
+              ),
+          ) || scopeRange
+        );
       }
     }
     // Default to the last scope,
@@ -425,39 +454,66 @@ export class Code {
     return this.scopes.at(-1);
   }
 
+  /** Runtime alternatives at the same most-specific lexical query range. */
+  getScopeCandidatesAt(
+    offset: number | LinePosition,
+    column?: number,
+  ): readonly Scope[] {
+    const selected = this.getScopeRangeAt(offset, column);
+    if (!selected) return [];
+    if (selected.isDotAccessor) return [selected];
+    const seen = new Map<Type, Set<Type>>();
+    return this.scopes.filter((scope) => {
+      if (
+        scope.isDotAccessor ||
+        scope.start.offset !== selected.start.offset ||
+        scope.end.offset !== selected.end.offset
+      )
+        return false;
+      let receivers = seen.get(scope.local);
+      if (!receivers) seen.set(scope.local, (receivers = new Set()));
+      if (receivers.has(scope.self)) return false;
+      receivers.add(scope.self);
+      return true;
+    });
+  }
+
   /** Aggregate names for presentation while retaining every real binding. */
   getCompletionCandidatesAt(
     offset: number | LinePosition,
     column?: number,
   ): CompletionCandidate[] {
-    const scope = this.getScopeRangeAt(offset, column);
+    const scopes = this.getScopeCandidatesAt(offset, column);
+    const scope = scopes[0];
     if (!scope) return [];
-    if (!scope.isDotAccessor) {
-      return this.getInScopeSymbolsAt(offset, column).map((symbol) => ({
-        name: symbol.name,
-        symbols: [symbol],
-        type: symbol.type,
-        availability: { present: 1, total: 1 },
-      }));
-    }
-    const receivers = scope.dotReceivers || [scope.self];
+    const branches = scope.isDotAccessor
+      ? (scope.dotReceivers || [scope.self]).map((receiver) => {
+          const symbols = [
+            'Struct',
+            'Enum',
+            'Id.Instance',
+            'Asset.GMObject',
+          ].includes(receiver.kind)
+            ? receiver.listMembers()
+            : [];
+          return { scope, symbols, receiver };
+        })
+      : scopes.map((scope) => ({
+          scope,
+          symbols: this.lexicalScopeSymbols(scope),
+          receiver: undefined,
+        }));
     const candidates = new Map<
       string,
       {
-        symbols: Set<Signifier>;
+        symbols: Map<string | Signifier, Signifier>;
         types: Type[];
         present: number;
       }
     >();
-    for (const receiver of receivers) {
-      if (
-        !['Struct', 'Enum', 'Id.Instance', 'Asset.GMObject'].includes(
-          receiver.kind,
-        )
-      )
-        continue;
+    for (const { scope, symbols, receiver } of branches) {
       const names = new Set<string>();
-      for (const symbol of receiver.listMembers()) {
+      for (const symbol of symbols) {
         if (
           symbol.hidden ||
           names.has(symbol.name) ||
@@ -465,7 +521,7 @@ export class Code {
         )
           continue;
         names.add(symbol.name);
-        if (receiver.semanticKey === globalOwner) {
+        if (receiver?.semanticKey === globalOwner) {
           const definedInProject = !symbol.native && !!symbol.def?.file;
           const canLiveOnGlobal =
             !symbol.macro && !getTypeOfKind(symbol, ['Enum']);
@@ -473,10 +529,13 @@ export class Code {
         }
         let candidate = candidates.get(symbol.name);
         if (!candidate) {
-          candidate = { symbols: new Set(), types: [], present: 0 };
+          candidate = { symbols: new Map(), types: [], present: 0 };
           candidates.set(symbol.name, candidate);
         }
-        candidate.symbols.add(symbol);
+        candidate.symbols.set(
+          symbol.canonicalKey || symbol.semanticKey || symbol,
+          symbol,
+        );
         candidate.types.push(
           ...(scope.memberTypes?.get(symbol) || symbol.type).type,
         );
@@ -487,11 +546,11 @@ export class Code {
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([name, candidate]) => ({
         name,
-        symbols: [...candidate.symbols].sort((a, b) =>
+        symbols: [...candidate.symbols.values()].sort((a, b) =>
           (a.semanticKey || a.name).localeCompare(b.semanticKey || b.name),
         ),
         type: value(...candidate.types),
-        availability: { present: candidate.present, total: receivers.length },
+        availability: { present: candidate.present, total: branches.length },
       }));
   }
 
@@ -499,22 +558,16 @@ export class Code {
     offset: number | LinePosition,
     column?: number,
   ): Signifier[] {
-    if (typeof offset === 'number' && typeof column === 'number') {
-      offset = { line: offset, column };
-    }
-    const scopeRange = this.getScopeRangeAt(offset);
-    if (!scopeRange) {
-      return [];
-    }
-    if (scopeRange.isDotAccessor) {
-      return [
-        ...new Set(
-          this.getCompletionCandidatesAt(offset).flatMap(
-            (item) => item.symbols,
-          ),
+    return [
+      ...new Set(
+        this.getCompletionCandidatesAt(offset, column).flatMap(
+          (item) => item.symbols,
         ),
-      ];
-    }
+      ),
+    ];
+  }
+
+  private lexicalScopeSymbols(scopeRange: Scope): Signifier[] {
     // Add to a flat list, and remove all entries that don't have
     // a definition if they are not native
     const allSignifiers = [
@@ -636,16 +689,26 @@ export class Code {
       service.document(this.path.absolute) !== this
     )
       return;
+    // The editor queue explicitly retries failed analysis by reading its current
+    // snapshot again. Equal text must retry too; passive analyze() stays sticky.
+    const retryFailed = () => {
+      if (this._analysisStatus === 'failed') service.invalidate(this);
+    };
     if (typeof content === 'string') {
       this.setBufferContent(content);
+      retryFailed();
       return;
     }
     const buffer = this.project.options?.documentText?.(this.path.absolute);
     if (typeof buffer === 'string') {
       this.setBufferContent(buffer);
+      retryFailed();
       return;
     }
-    if (this.bufferOwned && !forceDisk) return;
+    if (this.bufferOwned && !forceDisk) {
+      retryFailed();
+      return;
+    }
     const version = this._contentVersion,
       epoch = this.bufferEpoch;
     const disk = await this.path.read();
@@ -660,10 +723,12 @@ export class Code {
     const latest = this.project.options?.documentText?.(this.path.absolute);
     if (typeof latest === 'string') {
       this.setBufferContent(latest);
+      retryFailed();
       return;
     }
     this.bufferOwned = false;
     this.content = disk;
+    retryFailed();
   }
 
   get hasSyntaxErrors(): boolean {
@@ -951,9 +1016,14 @@ export class Code {
     return allDiagnostics;
   }
 
+  /** Refresh and publish diagnostics, including an already-current view. */
   updateDiagnostics() {
+    const semanticVersion = this._semanticVersion;
     getProjectAnalysis(this.project).analyzeSync();
-    return Object.values(this.diagnostics).flat();
+    // A newly committed view already publishes through the service.
+    return this._semanticVersion === semanticVersion
+      ? this.publishDiagnostics()
+      : Object.values(this.diagnostics).flat();
   }
 
   /** @deprecated The service binds all declarations before evaluating any unit. */

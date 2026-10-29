@@ -43,7 +43,30 @@ function ordered(node: CstNode): (CstNode | IToken)[] {
 
 /** CST normalization is the only semantic layer that knows parser rule names. */
 export function normalizeSyntax(input: SyntaxInput): SyntaxUnit {
-  let nextId = 0;
+  let identity = {
+    owner: input.unitId,
+    next: 0,
+    functions: new Map<string, number>(),
+  };
+  function functionScope<T>(node: CstNode, normalize: () => T): T {
+    const parent = identity;
+    const identifier = token(node, 'Identifier')?.image;
+    // Allocation identity follows function sites within their enclosing owner.
+    // Body content belongs to semantic fingerprints, not to storage identity.
+    const anchor = identifier ? `named:${identifier}` : 'anonymous';
+    const occurrence = parent.functions.get(anchor) || 0;
+    parent.functions.set(anchor, occurrence + 1);
+    identity = {
+      owner: `${parent.owner}/${anchor}:${occurrence}`,
+      next: 0,
+      functions: new Map(),
+    };
+    try {
+      return normalize();
+    } finally {
+      identity = parent;
+    }
+  }
   const jsdocs: JsdocSummary[] = [];
   const diagnostics: SemanticDiagnostic[] = [];
   function base(
@@ -60,7 +83,7 @@ export function normalizeSyntax(input: SyntaxInput): SyntaxUnit {
       ? Math.max(first, Math.min(rawEnd!, Math.max(0, input.text.length - 1)))
       : first;
     return {
-      id: `${input.unitId}:${role}:${nextId++}`,
+      id: `${identity.owner}:${role}:${identity.next++}`,
       start: first,
       end: last,
       origin: input.origin(first, last),
@@ -103,13 +126,25 @@ export function normalizeSyntax(input: SyntaxInput): SyntaxUnit {
           : [result];
       for (const entry of list) {
         statements.push(entry);
-        pending = entry.kind === 'doc' ? entry.docs : undefined;
+        pending =
+          entry.kind === 'doc' &&
+          !['localvar', 'instancevar', 'globalvar'].includes(entry.docs.kind)
+            ? entry.docs
+            : undefined;
       }
     }
     return { ...base(node, 'block'), kind: 'block', statements };
   }
   function empty(node: CstNode): Statement {
     return { ...base(node, 'empty'), kind: 'empty' };
+  }
+  function documented(
+    value: Expression,
+    annotation?: JsdocSummary,
+  ): Expression {
+    return annotation && (value.kind === 'function' || value.kind === 'assign')
+      ? { ...value, docs: annotation }
+      : value;
   }
   function statement(node: CstNode, annotation?: JsdocSummary): Statement {
     const b = () => base(node, node.name);
@@ -118,20 +153,23 @@ export function normalizeSyntax(input: SyntaxInput): SyntaxUnit {
         return block(node, ordered(node).filter(isNode));
       case 'extensionFunction': {
         const body = child(node, 'statements');
-        return {
-          ...b(),
-          kind: 'function',
-          expression: {
+        return functionScope(
+          node,
+          (): Statement => ({
             ...b(),
             kind: 'function',
-            extension: true,
-            name: name(token(node, 'Identifier'), node),
-            parameters: [],
-            constructor: false,
-            body: body ? statement(body) : empty(node),
-            docs: annotation,
-          },
-        };
+            expression: {
+              ...b(),
+              kind: 'function',
+              extension: true,
+              name: name(token(node, 'Identifier'), node),
+              parameters: [],
+              constructor: false,
+              body: body ? statement(body) : empty(node),
+              docs: annotation,
+            },
+          }),
+        );
       }
       case 'statements':
         return block(node, children(node, 'statement'));
@@ -217,6 +255,7 @@ export function normalizeSyntax(input: SyntaxInput): SyntaxUnit {
           expression: {
             ...b(),
             kind: 'assign',
+            docs: annotation,
             operator: token(node, 'AssignmentOperator')?.image || '=',
             target,
             value: expression(child(node, 'assignmentRightHandSide')),
@@ -227,7 +266,10 @@ export function normalizeSyntax(input: SyntaxInput): SyntaxUnit {
         return {
           ...b(),
           kind: 'expression',
-          expression: expression(child(node, 'expression'), true),
+          expression: documented(
+            expression(child(node, 'expression'), true),
+            annotation,
+          ),
           docs: annotation,
         };
       case 'functionStatement': {
@@ -247,7 +289,7 @@ export function normalizeSyntax(input: SyntaxInput): SyntaxUnit {
         return {
           ...b(),
           kind: node.name === 'throwStatement' ? 'throw' : 'return',
-          value: rhs ? expression(rhs) : undefined,
+          value: rhs ? documented(expression(rhs), annotation) : undefined,
         };
       }
       case 'breakStatement':
@@ -488,6 +530,7 @@ export function normalizeSyntax(input: SyntaxInput): SyntaxUnit {
         );
         const comment = child(part, 'jsdoc');
         annotation = comment ? docs(comment)[0] : undefined;
+        current = documented(current, annotation);
       } else if (!isNode(part) && [',', ')'].includes(part.image)) {
         const first =
           delimiter && Number.isFinite(delimiter.endOffset)
@@ -513,37 +556,40 @@ export function normalizeSyntax(input: SyntaxInput): SyntaxUnit {
     const parameters = child(node, 'functionParameters');
     const suffix = child(node, 'constructorSuffix');
     const parent = suffix && token(suffix, 'Identifier');
-    return {
-      ...base(node, 'function'),
-      kind: 'function',
-      name: token(node, 'Identifier')
-        ? name(token(node, 'Identifier'), node)
-        : undefined,
-      constructor: !!suffix,
-      parameters: parameters
-        ? children(parameters, 'functionParameter').map(
-            (entry): Parameter => ({
-              ...base(entry, 'parameter'),
-              name: name(token(entry, 'Identifier'), entry),
-              value: child(entry, 'assignmentRightHandSide')
-                ? expression(child(entry, 'assignmentRightHandSide')!)
-                : undefined,
-            }),
-          )
-        : [],
-      body: child(node, 'blockStatement')
-        ? statement(child(node, 'blockStatement')!)
-        : empty(node),
-      base: parent
-        ? {
-            name: name(parent, suffix!),
-            arguments: child(suffix!, 'functionArguments')
-              ? args(child(suffix!, 'functionArguments')!)
-              : [],
-          }
-        : undefined,
-      docs: annotation,
-    };
+    return functionScope(
+      node,
+      (): FunctionExpression => ({
+        ...base(node, 'function'),
+        kind: 'function',
+        name: token(node, 'Identifier')
+          ? name(token(node, 'Identifier'), node)
+          : undefined,
+        constructor: !!suffix,
+        parameters: parameters
+          ? children(parameters, 'functionParameter').map(
+              (entry): Parameter => ({
+                ...base(entry, 'parameter'),
+                name: name(token(entry, 'Identifier'), entry),
+                value: child(entry, 'assignmentRightHandSide')
+                  ? expression(child(entry, 'assignmentRightHandSide')!)
+                  : undefined,
+              }),
+            )
+          : [],
+        body: child(node, 'blockStatement')
+          ? statement(child(node, 'blockStatement')!)
+          : empty(node),
+        base: parent
+          ? {
+              name: name(parent, suffix!),
+              arguments: child(suffix!, 'functionArguments')
+                ? args(child(suffix!, 'functionArguments')!)
+                : [],
+            }
+          : undefined,
+        docs: annotation,
+      }),
+    );
   }
   function suffixes(
     target: Expression,
@@ -651,10 +697,25 @@ export function normalizeSyntax(input: SyntaxInput): SyntaxUnit {
       }
       case 'functionExpression':
         return functionExpression(node);
-      case 'structLiteral':
+      case 'structLiteral': {
+        const memberGaps = [];
+        const parts = ordered(node);
+        for (let index = 0; index + 1 < parts.length; index++) {
+          const part = parts[index];
+          if (
+            isNode(part) ||
+            !['{', ','].includes(part.image) ||
+            !Number.isFinite(part.endOffset)
+          )
+            continue;
+          const end = start(parts[index + 1]);
+          if (Number.isFinite(end))
+            memberGaps.push(input.origin(part.endOffset! + 1, end));
+        }
         return {
           ...metadata(),
           kind: 'struct',
+          memberGaps,
           entries: children(node, 'structLiteralEntry').map(
             (entry): StructEntry => {
               const keyString = child(entry, 'stringLiteral');
@@ -679,6 +740,7 @@ export function normalizeSyntax(input: SyntaxInput): SyntaxUnit {
             },
           ),
         };
+      }
       case 'arrayLiteral':
         return {
           ...metadata(),

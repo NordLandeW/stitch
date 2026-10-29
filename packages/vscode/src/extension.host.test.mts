@@ -102,6 +102,97 @@ test(
 );
 
 test(
+  'a queued close restore does not read the retired path after resource replacement',
+  { timeout: 30_000 },
+  async (t) => {
+    const f = await createHost();
+    t.after(() => f.dispose());
+    const workspace = f.newWorkspace();
+    const project = await f.project();
+    workspace.projects.push(project);
+    const previous = f.subject.addCode(project, 'Moving', 'var buffer = 1;');
+    const document = f.document(previous, previous.content);
+    f.documents.push(document);
+    previous.setBufferContent(document.getText());
+    await project.analysis.analyze();
+    let reads = 0;
+    previous.path.read = async () => {
+      reads++;
+      throw new Error('Retired path no longer exists');
+    };
+    const entered = deferred();
+    const release = deferred();
+    let replacement: any;
+    const replacing = project.withResourceUpdate(async () => {
+      entered.resolve();
+      await release.promise;
+      replacement = f.subject.replaceCode(previous, 'var moved = 2;');
+    });
+    await entered.promise;
+    document.isClosed = true;
+    f.documents.splice(f.documents.indexOf(document), 1);
+    const closing = workspace.onCloseDoc(document);
+    release.resolve();
+    await Promise.all([replacing, closing]);
+    assert.equal(reads, 0);
+    assert.equal(previous.analysisState.status, 'retired');
+    assert.equal(replacement.content, 'var moved = 2;');
+    assert.equal(project.resourcesPending, false);
+    assert.equal(project.analysis.isCurrent, true);
+  },
+);
+
+test(
+  'metadata buffer edits reconcile before a moved document close restores disk input',
+  { timeout: 30_000 },
+  async (t) => {
+    const f = await createHost();
+    t.after(() => f.dispose());
+    const workspace = f.newWorkspace();
+    const project = await f.project();
+    workspace.projects.push(project);
+    const previous = f.subject.addCode(project, 'Moving', 'var before = 1;');
+    const document = f.document(previous, previous.content);
+    const metadata = f.document(
+      { path: { absolute: project.yypPath.absolute } },
+      'before',
+    );
+    metadata.languageId = 'yy';
+    f.documents.push(document, metadata);
+    await project.analysis.analyze();
+    let reads = 0,
+      reloads = 0;
+    previous.path.read = async () => {
+      reads++;
+      throw new Error('Old working-copy path was moved');
+    };
+    let replacement: any;
+    // Metadata loading is the external port; actual replacement, resource
+    // barriers, analysis and the host event/close path remain production code.
+    project.reloadYyp = async () => {
+      reloads++;
+      assert.equal(metadata.getText(), 'restored');
+      await project.withResourceUpdate(async () => {
+        replacement = f.subject.replaceCode(previous, 'var restored = 2;');
+      });
+    };
+    metadata.setText('restored');
+    workspace.onChangeDoc({
+      document: metadata,
+      contentChanges: [{ text: 'restored' }],
+    });
+    document.isClosed = true;
+    f.documents.splice(f.documents.indexOf(document), 1);
+    await workspace.onCloseDoc(document);
+    assert.equal(reloads, 1);
+    assert.equal(reads, 0);
+    assert.equal(previous.analysisState.status, 'retired');
+    assert.equal(replacement.content, 'var restored = 2;');
+    assert.equal(project.analysis.isCurrent, true);
+  },
+);
+
+test(
   'a replacement Code reads an already-open buffer instead of stale disk input',
   { timeout: 30_000 },
   async (t) => {
@@ -204,13 +295,23 @@ test(
     newest.resolve(code);
     await updated;
     assert.equal(workspace.signatureHelpStatus.text, 'newer(VALUE)');
+    const selected = event(11);
+    selected.selections[0].isEmpty = false;
+    workspace.ensureDocumentCurrent = async () => code;
+    const selectedUpdate = f.waitForContext(
+      'stitch.selectionIsSound',
+      'new_sound',
+    );
+    f.events.selection.fire(selected);
+    await selectedUpdate;
+    assert.equal(workspace.signatureHelpStatus.text, 'newer(VALUE)');
     // Source-backed extension APIs use GML definition navigation rather than the docs shortcut.
     assert.equal(f.contexts.get('stitch.selectionIsNative'), false);
     old.resolve(code);
     // The handler registered its await before this continuation. Its stale guard
     // runs before this await resumes; no wall-clock sleeps or polling are used.
     await old.promise;
-    assert.deepEqual(reads, [11]);
+    assert.deepEqual(reads, [11, 11]);
     assert.equal(f.contexts.get('stitch.selectionIsSound'), 'new_sound');
     assert.equal(f.contexts.get('stitch.selectionIsSprite'), false);
     assert.equal(workspace.signatureHelpStatus.text, 'newer(VALUE)');

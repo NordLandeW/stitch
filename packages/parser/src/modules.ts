@@ -191,7 +191,7 @@ export async function importAssets(
   }
   await Promise.all(waits);
   await targetProject.saveYyp();
-  targetProject.initiallyParseAssetCode(newAssets);
+  await targetProject.initiallyParseAssetCode(newAssets);
   await logFile.write(summary);
   return summary;
 }
@@ -227,7 +227,9 @@ function updateMissingDeps(
       // Then we're already intending to import this, so it's not missing. BUT. It may create conflicts if it replaces something!
 
       // Is there a globalvar with the same name?
-      const targetVar = targetProject.self.getMember(dep.requirement.name);
+      const targetVar = targetProject.analysis.globalStorage.getMember(
+        dep.requirement.name,
+      );
       if (targetVar && !targetVar.asset) {
         // Then this is a variable that is being replaced by an asset. This is not allowed.
         conflictingDeps.add(dep);
@@ -249,7 +251,9 @@ function updateMissingDeps(
 
         for (const targetVar of varsDefinedByTarget) {
           // Do any intended imports include this?
-          const inSource = sourceProject.self.getMember(targetVar.name);
+          const inSource = sourceProject.analysis.globalStorage.getMember(
+            targetVar.name,
+          );
           const fromSourceAsset = inSource && inSource.def?.file?.asset;
           if (!fromSourceAsset || !intendedImports.has(fromSourceAsset.name)) {
             // Then we're losing a variable that is required by something else in the target project.
@@ -273,7 +277,7 @@ function updateMissingDeps(
       // For simplicity, just see if any global entity with the
       // same name exists (could check types in the future).
       const existsInTarget =
-        targetProject.self.getMember(dep.signifier) ||
+        targetProject.analysis.globalStorage.getMember(dep.signifier) ||
         targetProject.getAssetByName(dep.signifier);
       if (!existsInTarget) {
         addMissingDep(dep);

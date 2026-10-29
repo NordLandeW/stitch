@@ -8,8 +8,10 @@ import {
 import {
   globalKey,
   globalOwner,
+  implementationKey,
   memberKey,
   nativeGlobalOwner,
+  type FunctionImplementation,
   type MaterializationHost,
   type SymbolContribution,
   type UnitEvaluation,
@@ -18,33 +20,91 @@ import {
 export type Contribution = Pick<
   UnitEvaluation,
   'symbols' | 'types' | 'namedTypes'
->;
+> &
+  Partial<Pick<UnitEvaluation, 'implementations'>>;
 type Index<T> = Map<string, Map<string, T>>;
+// Keyed nodes have stable handles; anonymous nodes are inline value graphs.
+// Their direct lookup edges also record missing keys, so adding an owner can
+// replace an earlier detached value without leaving stale anonymous edges.
+type PublicationNode = string | Type;
+const typeNode = (key: string) => `type:${key}`;
+const symbolNode = (key: string) => `symbol:${key}`;
+const nameNode = (key: string) => `name:${key}`;
 
-/** Every fact has an owning unit. Replacement always removes that unit first. */
+/** Every fact has an owning unit. Installed contributions are immutable versions:
+ * replace them with new versions rather than mutating their maps or payloads. */
 export class ContributionIndex {
-  readonly units = new Map<string, Contribution>();
-  readonly symbols: Index<SymbolContribution> = new Map();
-  readonly types: Index<Type> = new Map();
-  readonly names: Index<string> = new Map();
+  readonly units: Map<string, Contribution>;
+  readonly symbols: Index<SymbolContribution>;
+  readonly types: Index<Type>;
+  readonly names: Index<string>;
+  private writeOwner: object = {};
+  private readonly sourceOwners: WeakMap<object, object>;
+  private readonly orderedSources: WeakMap<
+    object,
+    readonly (readonly [string, unknown])[]
+  >;
+
+  constructor(
+    parent?: ContributionIndex,
+    retainUnit?: (unit: string) => boolean,
+  ) {
+    this.units = new Map();
+    this.symbols = new Map(parent?.symbols);
+    this.types = new Map(parent?.types);
+    this.names = new Map(parent?.names);
+    this.sourceOwners = parent?.sourceOwners || new WeakMap();
+    this.orderedSources = parent?.orderedSources || new WeakMap();
+    if (parent) {
+      // Neither branch owns a shared source map after forking. Rotating the
+      // parent's token also isolates later writes to ancestors and siblings.
+      parent.writeOwner = {};
+      const retired: string[] = [];
+      for (const [unit, part] of parent.units) {
+        this.units.set(unit, part);
+        if (retainUnit && !retainUnit(unit)) retired.push(unit);
+      }
+      // Keep each old version until replace has withdrawn all of its facts.
+      for (const unit of retired) this.replace(unit);
+    }
+  }
+
+  /** Copies O(N) outer entries; source maps and their ordering caches stay shared
+   * until replace changes them. Optional retirement is selected during the unit
+   * copy pass and touches only the excluded units' contribution keys. */
+  fork(retainUnit?: (unit: string) => boolean): ContributionIndex {
+    return new ContributionIndex(this, retainUnit);
+  }
 
   replace(unit: string, part?: Contribution): void {
     const previous = this.units.get(unit);
+    if (previous === part) return;
     const update = <T>(
       index: Index<T>,
       before: ReadonlyMap<string, T> | undefined,
       after: ReadonlyMap<string, T> | undefined,
     ) => {
-      for (const key of before?.keys() || []) {
-        const sources = index.get(key)!;
-        sources.delete(unit);
-        if (!sources.size) index.delete(key);
-      }
-      for (const [key, source] of after || []) {
+      if (before === after) return;
+      const write = (key: string, present: boolean, source?: T) => {
         let sources = index.get(key);
-        if (!sources) index.set(key, (sources = new Map()));
-        sources.set(unit, source);
-      }
+        if (present && sources?.has(unit) && sources.get(unit) === source)
+          return;
+        if (!present && !sources?.has(unit)) return;
+        if (!sources || this.sourceOwners.get(sources) !== this.writeOwner) {
+          sources = new Map(sources);
+          this.sourceOwners.set(sources, this.writeOwner);
+          index.set(key, sources);
+        }
+        this.orderedSources.delete(sources);
+        if (present) sources.set(unit, source!);
+        else {
+          sources.delete(unit);
+          if (!sources.size) index.delete(key);
+        }
+      };
+      for (const key of before?.keys() || [])
+        if (!after?.has(key)) write(key, false);
+      for (const [key, source] of after || []) write(key, true, source);
     };
     update(this.symbols, previous?.symbols, part?.symbols);
     update(this.types, previous?.types, part?.types);
@@ -59,23 +119,147 @@ export class ContributionIndex {
     excluded?: string,
     replacement?: ReadonlyMap<string, T>,
   ): T[] {
-    const result = [...(index.get(key) || [])]
-      .filter(([unit]) => unit !== excluded)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([, source]) => source);
+    const result: T[] = [];
+    const sources = index.get(key);
+    if (sources) {
+      let ordered = this.orderedSources.get(sources) as
+        | readonly (readonly [string, T])[]
+        | undefined;
+      if (!ordered) {
+        ordered = [...sources].sort(([left], [right]) =>
+          left.localeCompare(right),
+        );
+        this.orderedSources.set(sources, ordered);
+      }
+      for (const [unit, source] of ordered)
+        if (unit !== excluded) result.push(source);
+    }
     const own = replacement?.get(key);
     if (own) result.push(own);
     return result;
   }
 }
 
-/** Lazily merged detached graph. It never reads old public members as inputs. */
+/** Lazily merged detached graph over one fixed index/overlay snapshot. A new
+ * graph is created after each index replacement; no old public view is input. */
 export class ContributionGraph implements MaterializationHost {
-  readonly symbols = new Map<string, Signifier>();
-  readonly types = new Map<string, Type>();
-  private readonly completeSymbols = new Set<string>();
-  private readonly completeTypes = new Set<string>();
-  private readonly anonymous = new WeakMap<Type, Type>();
+  private symbolHandles = new Map<string, Signifier>();
+  private typeHandles = new Map<string, Type>();
+  get symbols(): Map<string, Signifier> {
+    return this.symbolHandles;
+  }
+  get types(): Map<string, Type> {
+    return this.typeHandles;
+  }
+  private completeSymbols = new Set<string>();
+  private completeTypes = new Set<string>();
+  private anonymous = new WeakMap<Type, Type>();
+  private preparedAnonymous = new WeakSet<Type>();
+  private readonly symbolSourceCache = new Map<string, SymbolContribution[]>();
+  private readonly typeSourceCache = new Map<string, Type[]>();
+  private readonly namedTypeCache = new Map<string, string | undefined>();
+  readonly updatedTypes = new Set<string>();
+  readonly updatedSymbols = new Set<string>();
+  publicationReused = false;
+  private trackingPublication = false;
+  private publicationNode?: PublicationNode;
+  private publicationReads = new Map<PublicationNode, Set<PublicationNode>>();
+  private publicationReaders = new Map<PublicationNode, Set<PublicationNode>>();
+  private publicationGarbage = new Set<Type>();
+
+  /** Prepared anonymous values retain alias identity while their lookup edges
+   * stay valid. Public copies can share that identity without sharing objects. */
+  isPreparedValue(source: Type): boolean {
+    return this.preparedAnonymous.has(source);
+  }
+
+  private observePublication(node: PublicationNode): void {
+    const parent = this.publicationNode;
+    if (parent === undefined) return;
+    const inputs = this.publicationReads.get(parent)!;
+    if (inputs.has(node)) return;
+    inputs.add(node);
+    let readers = this.publicationReaders.get(node);
+    if (!readers) this.publicationReaders.set(node, (readers = new Set()));
+    readers.add(parent);
+  }
+
+  private forgetPublication(node: PublicationNode): void {
+    for (const input of this.publicationReads.get(node) || []) {
+      if (typeof input !== 'string') this.publicationGarbage.add(input);
+      const readers = this.publicationReaders.get(input)!;
+      readers.delete(node);
+      if (!readers.size) this.publicationReaders.delete(input);
+    }
+    this.publicationReads.delete(node);
+  }
+
+  private capturePublication(node: PublicationNode, install: () => void): void {
+    if (!this.trackingPublication) {
+      install();
+      return;
+    }
+    const parent = this.publicationNode;
+    // Queries can prepare detached values after complete(), outside any keyed
+    // root. Reconsider those values at the next publication boundary too.
+    if (parent === undefined && typeof node !== 'string')
+      this.publicationGarbage.add(node);
+    this.forgetPublication(node);
+    this.publicationReads.set(node, new Set());
+    this.publicationNode = node;
+    try {
+      install();
+    } finally {
+      this.publicationNode = parent;
+    }
+  }
+
+  private retainPublicationReads(): void {
+    // Only removed edges or detached query roots can make a previously live
+    // anonymous graph unreachable. Trial-delete their descendant region, then
+    // retain paths entering it from outside. This also collects isolated cycles
+    // without scanning every unchanged keyed root on each keystroke.
+    const candidates = new Set<Type>();
+    const visited = new Set<Type>();
+    const queue = [...this.publicationGarbage];
+    for (const node of queue) {
+      if (visited.has(node)) continue;
+      visited.add(node);
+      let rooted = false;
+      for (const parent of this.publicationReaders.get(node) || [])
+        if (typeof parent === 'string') {
+          rooted = true;
+          break;
+        }
+      if (rooted) continue;
+      candidates.add(node);
+      for (const child of this.publicationReads.get(node) || [])
+        if (typeof child !== 'string') queue.push(child);
+    }
+    const live = new Set<Type>();
+    const retained: Type[] = [];
+    for (const node of candidates)
+      for (const parent of this.publicationReaders.get(node) || [])
+        if (typeof parent === 'string' || !candidates.has(parent)) {
+          retained.push(node);
+          break;
+        }
+    for (const node of retained) {
+      if (live.has(node)) continue;
+      live.add(node);
+      for (const child of this.publicationReads.get(node) || [])
+        if (typeof child !== 'string' && candidates.has(child))
+          retained.push(child);
+    }
+    for (const node of candidates)
+      if (!live.has(node)) {
+        this.forgetPublication(node);
+        // A value hidden by a keyed owner must not return from an unobserved
+        // cache entry after that owner retires.
+        this.anonymous.delete(node);
+      }
+    this.publicationGarbage.clear();
+  }
 
   constructor(
     readonly index: ContributionIndex,
@@ -84,32 +268,253 @@ export class ContributionGraph implements MaterializationHost {
     readonly replacement?: Contribution,
   ) {}
 
+  /** Consume an exclusively owned publication buffer, then copy its updates
+   * into public handles. Analysis overlays always own independent graphs. */
+  static prepare(
+    index: ContributionIndex,
+    source: ContributionGraph['source'],
+    previous?: ContributionGraph,
+    changedSources: ReadonlySet<string> = new Set(),
+  ): ContributionGraph {
+    const graph = new ContributionGraph(index, source);
+    graph.trackingPublication = true;
+    if (previous) graph.reusePublication(previous, changedSources);
+    return graph.complete();
+  }
+
+  private reusePublication(
+    previous: ContributionGraph,
+    changedSources: ReadonlySet<string>,
+  ): void {
+    if (
+      previous.excluded ||
+      previous.replacement ||
+      !previous.trackingPublication
+    )
+      return;
+    // Incomplete owner domains and changes to union/handle identity use a full
+    // remap. Ordinary allocation/member additions and removals retain handles.
+    if (previous.types.size !== previous.index.types.size) return;
+    for (const [key, sources] of this.index.types) {
+      const before = previous.types.get(key);
+      if (!before) continue;
+      for (const source of sources.values()) {
+        if (source.kind !== before.kind) return;
+        if (
+          (source.kind === 'Enum' || source.kind === 'EnumMember') &&
+          source.signifier?.semanticKey !== before.signifier?.semanticKey
+        )
+          return;
+      }
+    }
+    for (const [key, sources] of this.index.symbols) {
+      const before = previous.symbols.get(key);
+      for (const source of sources.values()) {
+        if (!this.index.types.has(source.owner)) return;
+        if (
+          before &&
+          (source.owner !== before.parent.semanticKey ||
+            source.item.name !== before.name)
+        )
+          return;
+      }
+    }
+    const types = new Set<string>(),
+      symbols = new Set<string>();
+    const changed = (part: Contribution | undefined) => {
+      for (const key of part?.types.keys() || []) types.add(key);
+      for (const key of part?.symbols.keys() || []) symbols.add(key);
+    };
+    for (const unit of new Set([
+      ...previous.index.units.keys(),
+      ...this.index.units.keys(),
+    ])) {
+      const before = previous.index.units.get(unit),
+        after = this.index.units.get(unit);
+      if (before !== after) {
+        changed(before);
+        changed(after);
+      }
+    }
+    // Enum values resolve through the current declaration, even when an old
+    // consumer still contributes the previous type key. Retargeting that
+    // declaration changes value identity and requires remapping its readers.
+    const enumTargets = (graph: ContributionGraph, key: string) => {
+      const result: (string | undefined)[] = [undefined, undefined];
+      for (const source of graph.symbolSources(key))
+        for (const type of source.item.type.type) {
+          const slot =
+            type.kind === 'Enum' ? 0 : type.kind === 'EnumMember' ? 1 : -1;
+          if (
+            slot >= 0 &&
+            result[slot] === undefined &&
+            type.semanticKey &&
+            graph.index.types.has(type.semanticKey)
+          )
+            result[slot] = type.semanticKey;
+        }
+      return result;
+    };
+    for (const key of symbols)
+      if (previous.symbols.has(key) && this.index.symbols.has(key)) {
+        const before = enumTargets(previous, key),
+          after = enumTargets(this, key);
+        if (before.some((target, slot) => target !== after[slot])) return;
+      }
+    const domains = new Set<PublicationNode>();
+    const domain = (
+      before: ReadonlyMap<string, unknown>,
+      after: ReadonlyMap<string, unknown>,
+      prepared: ReadonlyMap<string, unknown>,
+      node: (key: string) => string,
+    ): boolean => {
+      if (before.size !== prepared.size) return false;
+      for (const key of before.keys()) {
+        // Named redirection and detached queries can produce a different key
+        // set with the same size. Such buffers require a fresh full remap.
+        if (!prepared.has(key)) return false;
+        if (!after.has(key)) domains.add(node(key));
+      }
+      for (const key of after.keys())
+        if (!before.has(key)) domains.add(node(key));
+      return true;
+    };
+    if (
+      !domain(previous.index.types, this.index.types, previous.types, typeNode)
+    )
+      return;
+    if (
+      !domain(
+        previous.index.symbols,
+        this.index.symbols,
+        previous.symbols,
+        symbolNode,
+      )
+    )
+      return;
+    for (const name of new Set([
+      ...previous.index.names.keys(),
+      ...this.index.names.keys(),
+    ]))
+      if (previous.namedType(name) !== this.namedType(name))
+        domains.add(nameNode(name));
+    if (domains.size) {
+      const readers = previous.publicationReaders;
+      const queue = [...domains];
+      for (const input of queue)
+        for (const parent of readers.get(input) || []) {
+          if (typeof parent === 'string') {
+            if (parent.startsWith('type:')) types.add(parent.slice(5));
+            else if (parent.startsWith('symbol:')) symbols.add(parent.slice(7));
+          } else if (!domains.has(parent)) {
+            // Inline cycles propagate to every keyed owner. Stable keyed
+            // children update through their handles and stop propagation.
+            domains.add(parent);
+            queue.push(parent);
+          }
+        }
+    }
+    for (const [key, sources] of this.index.symbols)
+      for (const source of sources.values()) {
+        const uri = source.origin?.spelling.uri;
+        const declaration = source.declaration?.declaration.spelling.uri;
+        if (
+          (uri && changedSources.has(uri)) ||
+          (declaration && changedSources.has(declaration))
+        )
+          symbols.add(key);
+      }
+    this.anonymous = previous.anonymous;
+    this.preparedAnonymous = previous.preparedAnonymous;
+    for (const node of domains)
+      if (typeof node !== 'string') this.anonymous.delete(node);
+    // The buffer is exclusively consumed. Retain both directions rather than
+    // reconstructing every unchanged lookup edge for each small domain edit.
+    this.publicationReads = previous.publicationReads;
+    this.publicationReaders = previous.publicationReaders;
+    this.publicationGarbage = previous.publicationGarbage;
+    // The same exclusive transfer also preserves handle order and completion
+    // state without copying every unchanged map/set entry. Input/source caches
+    // remain private to this new graph and its index version.
+    this.typeHandles = previous.typeHandles;
+    this.symbolHandles = previous.symbolHandles;
+    this.completeTypes = previous.completeTypes;
+    this.completeSymbols = previous.completeSymbols;
+    for (const key of types) this.completeTypes.delete(key);
+    for (const key of symbols) this.completeSymbols.delete(key);
+    for (const node of domains) {
+      if (typeof node !== 'string') continue;
+      if (node.startsWith('type:') && !this.index.types.has(node.slice(5))) {
+        this.types.delete(node.slice(5));
+        this.completeTypes.delete(node.slice(5));
+        this.forgetPublication(node);
+      } else if (
+        node.startsWith('symbol:') &&
+        !this.index.symbols.has(node.slice(7))
+      ) {
+        this.symbols.delete(node.slice(7));
+        this.completeSymbols.delete(node.slice(7));
+        this.forgetPublication(node);
+      }
+    }
+    this.publicationReused = true;
+  }
+
   symbolSources(key: string): SymbolContribution[] {
-    return this.index.sources(
-      this.index.symbols,
-      key,
-      this.excluded,
-      this.replacement?.symbols,
-    );
+    if (this.trackingPublication) this.observePublication(symbolNode(key));
+    let sources = this.symbolSourceCache.get(key);
+    if (!sources) {
+      sources = this.index.sources(
+        this.index.symbols,
+        key,
+        this.excluded,
+        this.replacement?.symbols,
+      );
+      this.symbolSourceCache.set(key, sources);
+    }
+    return sources;
   }
   hasSymbol(key: string): boolean {
     return this.symbolSources(key).length > 0;
   }
   typeSources(key: string): Type[] {
-    return this.index.sources(
-      this.index.types,
-      key,
-      this.excluded,
-      this.replacement?.types,
-    );
+    if (this.trackingPublication) this.observePublication(typeNode(key));
+    let sources = this.typeSourceCache.get(key);
+    if (!sources) {
+      sources = this.index.sources(
+        this.index.types,
+        key,
+        this.excluded,
+        this.replacement?.types,
+      );
+      this.typeSourceCache.set(key, sources);
+    }
+    return sources;
   }
   namedType(key: string): string | undefined {
-    return this.index.sources(
-      this.index.names,
-      key,
-      this.excluded,
-      this.replacement?.namedTypes,
-    )[0];
+    if (this.trackingPublication) this.observePublication(nameNode(key));
+    if (!this.namedTypeCache.has(key)) {
+      this.namedTypeCache.set(
+        key,
+        this.index.sources(
+          this.index.names,
+          key,
+          this.excluded,
+          this.replacement?.namedTypes,
+        )[0],
+      );
+    }
+    return this.namedTypeCache.get(key);
+  }
+  implementation(
+    unitId: string,
+    functionId: string,
+  ): FunctionImplementation | undefined {
+    const source =
+      unitId === this.excluded
+        ? this.replacement
+        : this.index.units.get(unitId);
+    return source?.implementations?.get(implementationKey(unitId, functionId));
   }
   private allocateType(key: string, source?: Type): Type {
     let type = this.types.get(key);
@@ -124,15 +529,21 @@ export class ContributionGraph implements MaterializationHost {
   }
   type(key: string): Type {
     const actual = this.namedType(key) || key;
+    if (this.trackingPublication) this.observePublication(typeNode(actual));
     const type = this.allocateType(actual);
     if (!this.completeTypes.has(actual)) {
       this.completeTypes.add(actual);
-      installTypeContributions(this.typeSources(actual), type, this);
+      if (this.trackingPublication) this.updatedTypes.add(actual);
+      this.capturePublication(typeNode(actual), () =>
+        installTypeContributions(this.typeSources(actual), type, this),
+      );
     }
     return type;
   }
   symbol(key: string): Signifier {
+    if (this.trackingPublication) this.observePublication(symbolNode(key));
     let item = this.symbols.get(key);
+    if (item && this.completeSymbols.has(key)) return item;
     const sources = this.symbolSources(key);
     if (!item) {
       const source = sources[0];
@@ -143,7 +554,11 @@ export class ContributionGraph implements MaterializationHost {
     }
     if (!this.completeSymbols.has(key)) {
       this.completeSymbols.add(key);
-      installSymbolContributions(sources, item, this);
+      if (this.trackingPublication) this.updatedSymbols.add(key);
+      const target = item;
+      this.capturePublication(symbolNode(key), () =>
+        installSymbolContributions(sources, target, this),
+      );
     }
     return item;
   }
@@ -183,11 +598,16 @@ export class ContributionGraph implements MaterializationHost {
     }
     if (source.semanticKey && this.typeSources(source.semanticKey).length)
       return this.type(source.semanticKey);
+    if (this.trackingPublication) this.observePublication(source);
     let target = this.anonymous.get(source);
     if (target) return target;
     target = new Type(source.kind);
     this.anonymous.set(source, target);
-    installTypeContributions([source], target, this);
+    if (this.trackingPublication) this.preparedAnonymous.add(target);
+    const current = target;
+    this.capturePublication(source, () =>
+      installTypeContributions([source], current, this),
+    );
     return target;
   }
   lookup(
@@ -237,8 +657,11 @@ export class ContributionGraph implements MaterializationHost {
 
   /** Fully prepare and validate before the host changes any public handle. */
   complete(): this {
-    for (const key of this.index.types.keys()) this.type(key);
-    for (const key of this.index.symbols.keys()) this.symbol(key);
+    for (const key of this.index.types.keys())
+      if (!this.completeTypes.has(key)) this.type(key);
+    for (const key of this.index.symbols.keys())
+      if (!this.completeSymbols.has(key)) this.symbol(key);
+    if (this.trackingPublication) this.retainPublicationReads();
     return this;
   }
 }

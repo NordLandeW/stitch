@@ -240,7 +240,10 @@ function typeDisplayName(type: Type): string | undefined {
  * recursive paths or an exhausted display budget. Shared DAGs can otherwise
  * produce exponentially large text from a small finite graph. The budget only
  * limits presentation; semantic types and inference retain the complete graph. */
-export function typeToFeatherString(type: Type): string {
+export function typeToFeatherString(
+  type: Type,
+  options?: { complete?: boolean },
+): string {
   const output: string[] = [];
   const active = new Set<Type>();
   let remainingNodes = 8192;
@@ -252,6 +255,10 @@ export function typeToFeatherString(type: Type): string {
     const current = frame.type;
     if (frame.next < 0) {
       if (remainingNodes-- === 0) {
+        if (options?.complete)
+          throw new Error(
+            'The complete type exceeds the annotation size budget.',
+          );
         output.push('...');
         stack.pop();
         // Preserve balanced container delimiters while omitting pending siblings.
@@ -265,6 +272,10 @@ export function typeToFeatherString(type: Type): string {
         output.push(name);
         stack.pop();
       } else if (active.has(current)) {
+        if (options?.complete)
+          throw new Error(
+            'The type is recursive and has no finite named annotation.',
+          );
         output.push('...');
         stack.pop();
       } else {
@@ -275,7 +286,18 @@ export function typeToFeatherString(type: Type): string {
         } else {
           active.add(current);
           output.push(current.kind, '<');
-          frame.items = items;
+          // Distinct storage instances can have the same named type. Collapse
+          // their identical spelling without merging the semantic type graph.
+          const displayedNames = new Set<string>();
+          frame.items = items.filter((item) => {
+            const name =
+              typeDisplayName(item) ??
+              (!item.items?.type.length ? item.kind : undefined);
+            if (name === undefined) return true;
+            if (displayedNames.has(name)) return false;
+            displayedNames.add(name);
+            return true;
+          });
           frame.next = 0;
         }
       }

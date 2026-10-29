@@ -156,6 +156,10 @@ export class Project {
   readonly types = new Map<string, Type>();
 
   languageProfile?: LanguageProfile;
+  private legacyOtherSetting: boolean | undefined;
+  get legacyOtherBehaviour(): boolean | undefined {
+    return this.legacyOtherSetting;
+  }
   get analysis() {
     return getProjectAnalysis(this);
   }
@@ -449,6 +453,52 @@ export class Project {
     return this.options?.documentText?.(path.absolute) ?? disk;
   }
 
+  private async readMainOptions(): Promise<void> {
+    const path = this.dir.join('options/main/options_main.yy');
+    const diagnostics: Diagnostic[] = [];
+    const location = {
+      start: { line: 1, column: 1, offset: 0 },
+      end: { line: 1, column: 1, offset: 0 },
+    };
+    this.legacyOtherSetting = undefined;
+    try {
+      const text = await this.readDocumentText(path);
+      const options = Yy.parse(text) as {
+        option_legacy_other_behaviour?: unknown;
+      };
+      const setting = options.option_legacy_other_behaviour;
+      if (setting === undefined)
+        diagnostics.push(
+          new Diagnostic(
+            'The legacy other behaviour option is unspecified. Invocation-dependent other types remain conservative.',
+            location,
+            'info',
+          ),
+        );
+      else if (typeof setting !== 'boolean')
+        diagnostics.push(
+          new Diagnostic(
+            'The legacy other behaviour option must be a boolean. Its effective mode is unknown until the option is corrected.',
+            location,
+            'error',
+          ),
+        );
+      else this.legacyOtherSetting = setting;
+    } catch (error) {
+      const missing = (error as NodeJS.ErrnoException).code === 'ENOENT';
+      diagnostics.push(
+        new Diagnostic(
+          missing
+            ? 'Main game options are unavailable. Invocation-dependent other types remain conservative.'
+            : `Main game options could not be read: ${error instanceof Error ? error.message : String(error)}. The other mode is unknown.`,
+          location,
+          missing ? 'info' : 'error',
+        ),
+      );
+    }
+    this.setResourceDiagnostics(path.absolute, 'other-mode', diagnostics);
+  }
+
   sourceOwners(path: Pathy): Asset[] {
     const key = path.absolute.toLocaleLowerCase();
     return [...this.assets.values()].filter(
@@ -504,6 +554,11 @@ export class Project {
 
   /** Reconcile listed metadata or a source URI, including paths outside its resource directory. */
   async reloadResource(path: Pathy): Promise<void> {
+    if (
+      path.absolute.toLocaleLowerCase() ===
+      this.dir.join('options/main/options_main.yy').absolute.toLocaleLowerCase()
+    )
+      return this.withResourceUpdate(() => this.readMainOptions());
     const names = new Set(
       this.sourceOwners(path).map((asset) => asset.name.toLocaleLowerCase()),
     );
@@ -1944,6 +1999,7 @@ export class Project {
    */
   async reloadYyp(): Promise<void> {
     return this.withResourceUpdate(async () => {
+      await this.readMainOptions();
       assert(this.yypPath, 'Cannot reload YYP without a path');
       const oldIde = this.yyp.MetaData.IDEVersion;
       const next = Yy.parse(
@@ -1991,6 +2047,7 @@ export class Project {
    * @internal
    * Initialize a collection of new assets by parsing their GML */
   async initiallyParseAssetCode(assets: Asset[]): Promise<void> {
+    await this.readMainOptions();
     await this.reconcileSourceOwnership();
     for (const asset of this.assets.values()) asset.refreshParent();
     for (const asset of assets) {
@@ -2034,10 +2091,8 @@ export class Project {
     );
 
     t = Date.now();
-    // Discover all globals
-    // Sort assets by type, with objects 2nd to last and scripts last
-    // to minimize the number of things that need to be updated after
-    // loading.
+    // Collect declarations for all source contexts before evaluation. The
+    // analysis service prioritizes script/extension sources in its cold queue.
     options?.onLoadProgress?.(1, 'Parsing resource code...');
 
     await this.initiallyParseAssetCode(assets);

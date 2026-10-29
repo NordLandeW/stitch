@@ -142,9 +142,15 @@ export class Type<T extends PrimitiveName = PrimitiveName> {
   returns: TypeStore | undefined = undefined;
   /** Stable semantic identity; absent for legacy/native construction helpers. */
   semanticKey: string | undefined;
+  /** Stable expression site that allocated this runtime storage view. */
+  allocationSource: string | undefined;
   /** The function's static environment, separate from locals and constructed self. */
   statics: StructType | undefined;
   callKind: 'native' | 'user' | 'legacy' | undefined;
+  /** Direct or transitive dependence on the invocation's other scope. */
+  usesOther = false;
+  /** May dispatch a local/parameter callable and require actual callable inputs. */
+  callsLocalCallable = false;
   /** Immutable syntax/binding provenance for self-specialized method evaluation. */
   functionSource:
     | {
@@ -271,8 +277,8 @@ export class Type<T extends PrimitiveName = PrimitiveName> {
   }
 
   /** Get this type as a Feather-compatible string */
-  toFeatherString(): string {
-    return typeToFeatherString(this);
+  toFeatherString(options?: { complete?: boolean }): string {
+    return typeToFeatherString(this, options);
   }
 
   get code() {
@@ -578,7 +584,10 @@ export class Type<T extends PrimitiveName = PrimitiveName> {
     derived.statics = this.statics;
     derived.returns = this.returns;
     derived.items = this.items;
+    derived.allocationSource = this.allocationSource;
     derived.callKind = this.callKind;
+    derived.usesOther = this.usesOther;
+    derived.callsLocalCallable = this.callsLocalCallable;
     derived.functionSource = this.functionSource;
     derived.methodSource = this.methodSource;
     derived.literalValue = this.literalValue;

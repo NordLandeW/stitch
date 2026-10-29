@@ -16,9 +16,17 @@ import {
 import { typeFromParsedJsdocs } from '../types.feather.js';
 import type { JsdocSummary } from '../jsdoc.js';
 import {
+  allocationContextKey,
+  hasContextualCallable,
+  inputAliases,
+  InvocationGraph,
+  selectCallable,
+} from './invocation.js';
+import {
   AnalysisCancelled,
   globalKey,
   globalOwner,
+  implementationKey,
   memberKey,
   nativeGlobalKey,
   nativeGlobalOwner,
@@ -29,6 +37,7 @@ import {
   type Declaration,
   type Expression,
   type FunctionExpression,
+  type FunctionImplementation,
   type Name,
   type ReferenceRole,
   type RenameRecipe,
@@ -49,9 +58,11 @@ import {
 import {
   copyFlow,
   flowKey,
+  FlowHistory,
   initialFlow,
   mergeFlow,
   normal,
+  replaceFlow,
   type Completion,
   type FlowState,
 } from './flow.js';
@@ -80,13 +91,38 @@ interface Frame {
   function?: BoundFunction;
   self?: Type;
   other?: Type;
+  /** Query receiver before a with unknown is replaced by writable storage. */
+  querySelf?: Type;
 }
 interface LocatedValue {
   type: Value;
   symbols: SymbolView[];
+  callables?: { type: FunctionType; receiver: Type }[];
+}
+interface InvocationInput {
+  readonly self?: Type;
+  readonly other?: Type;
+  readonly arguments: readonly Value[];
+  readonly state: FlowState;
+}
+interface InvocationAnalysis {
+  active: boolean;
+  recursive: boolean;
+  inputsChanged: boolean;
+  arguments: Value[];
+  state: FlowState;
+  inputItems: Map<string, Type>;
+  initializedStatics: Set<string>;
+  value: Value;
+  effects: Map<
+    string,
+    { source: SymbolContribution; current: Value; written: Value }
+  >;
+  items: Map<string, { source: Type; written: Value }>;
 }
 interface PreparedAccess {
   readonly target: Value;
+  readonly indices?: readonly Value[];
   readonly key?: string;
   readonly keyNode: SyntaxNode;
   readonly rename: RenameRecipe;
@@ -107,7 +143,7 @@ interface MethodAnalysis {
   effects?: {
     readonly self: Type;
     readonly symbols: readonly SymbolContribution[];
-    readonly itemsWritten: boolean;
+    readonly itemWrites?: Value;
   };
 }
 
@@ -132,25 +168,31 @@ export function evaluateUnit(
           callableKeys.has(key)
             ? previous?.types.get(key) || environment.type(key)
             : environment.type(key),
+        implementation:
+          environment.implementation &&
+          ((unitId, functionId) =>
+            environment.implementation!(unitId, functionId)),
         observe: () => {},
         cancelled: () => environment.cancelled(),
       },
       undefined,
       previous?.types,
     ).run();
-    const key = JSON.stringify([
-      result.summary,
-      fingerprints(
-        [...callableKeys].map((typeKey) => result.types.get(typeKey)!),
-      ),
-    ]);
     const recursive = result.dependencies.some(
       (dependency) =>
         dependency.kind === 'type' &&
         dependency.facet === 'returns' &&
         callableKeys.has(dependency.owner),
     );
-    if (key === previousKey || !recursive) {
+    const key = recursive
+      ? JSON.stringify([
+          result.summary,
+          fingerprints(
+            [...callableKeys].map((typeKey) => result.types.get(typeKey)!),
+          ),
+        ])
+      : undefined;
+    if (key === undefined || key === previousKey) {
       result.dependencies.forEach((dependency) =>
         environment.observe(dependency),
       );
@@ -183,7 +225,10 @@ export function evaluateUnit(
 /** Declaration-only callable/shape skeletons for project-wide forward lookup. */
 export function createDeclarationSummary(
   bound: BoundUnit,
-): Pick<UnitEvaluation, 'symbols' | 'types' | 'namedTypes'> {
+): Pick<
+  UnitEvaluation,
+  'symbols' | 'types' | 'namedTypes' | 'implementations'
+> {
   const declarations = new Evaluator(bound, {
     lookup: () => undefined,
     type: () => undefined,
@@ -194,6 +239,7 @@ export function createDeclarationSummary(
     symbols: declarations.symbols,
     types: declarations.types,
     namedTypes: declarations.namedTypes,
+    implementations: declarations.implementations,
   };
 }
 
@@ -201,13 +247,21 @@ class Evaluator {
   readonly symbols = new Map<string, SymbolContribution>();
   readonly types = new Map<string, Type>();
   readonly namedTypes = new Map<string, string>();
+  readonly implementations = new Map<string, FunctionImplementation>();
   readonly references = new Map<string, SemanticReference>();
   readonly scopes = new Map<string, SemanticScope>();
   readonly calls = new Map<string, SemanticCall>();
   readonly structRanges: { origin: SourceOrigin; type: string }[] = [];
   readonly diagnostics: SemanticDiagnostic[] = [];
   readonly dependencies = new Map<string, SemanticDependency>();
+  readonly valueReads = new Set<string>();
+  readonly valueWrites = new Set<string>();
+  readonly valueReadOwners = new Map<string, string>();
+  readonly localValueOwners = new Set<string>();
   readonly annotated = new Set<string>();
+  readonly annotationTypes = new WeakMap<JsdocSummary, Type[]>();
+  readonly anonymousTypeKeys = new WeakMap<Type, string>();
+  readonly anonymousTypeCounts = new Map<string, number>();
   readonly functionStatus = new Map<string, 'running' | 'done'>();
   readonly functionByKey = new Map<string, BoundFunction>();
   readonly functionByType = new Map<string, BoundFunction>();
@@ -220,7 +274,12 @@ class Evaluator {
   readonly dynamicSelf = new Map<string, Type>();
   readonly knownTypes = new Map<string, Type>();
   readonly writtenTypes = new Set<string>();
+  readonly writtenItems = new Map<string, Value>();
+  readonly borrowedItemTypes = new Set<string>();
   readonly reboundSelf = new Map<string, Type>();
+  readonly invocations = new Map<string, InvocationInput>();
+  readonly functionExits = new Map<string, FlowState>();
+  readonly writtenSymbols = new Map<string, Value>();
   readonly extensionViews = new Map<string, FunctionType[]>();
   readonly extensionImplementations = new Map<string, string>();
   readonly recursiveAllocations = new Set<string>();
@@ -232,6 +291,8 @@ class Evaluator {
     readonly environment: SemanticEnvironment,
     readonly methodAnalyses = new Map<string, MethodAnalysis>(),
     readonly priorTypes?: ReadonlyMap<string, Type>,
+    readonly invocationAnalyses = new Map<string, InvocationAnalysis>(),
+    readonly activeMethodAnalyses = new Map<string, MethodAnalysis>(),
   ) {
     this.diagnostics.push(...bound.diagnostics);
     for (const declaration of bound.declarations)
@@ -243,6 +304,7 @@ class Evaluator {
       if (scope.staticOwner) this.ensureType(scope.staticOwner);
     }
     for (const fn of bound.functions.values()) {
+      this.localValueOwners.add(fn.localOwner);
       if (
         fn.declaration?.role === 'function' ||
         fn.declaration?.role === 'legacy-script' ||
@@ -259,6 +321,8 @@ class Evaluator {
           ? 'legacy'
           : 'user';
       type.isConstructor = fn.node.constructor;
+      type.usesOther = !!fn.usesOther;
+      type.callsLocalCallable = !!fn.callsLocalCallable;
       type.local = this.ensureType(fn.localOwner) as StructType;
       type.statics = this.ensureType(fn.staticOwner) as StructType;
       type.self = this.ensureType(fn.selfOwner) as WithableType;
@@ -298,6 +362,10 @@ class Evaluator {
           .update(bound.syntax.input.text.slice(fn.node.start, fn.node.end + 1))
           .digest('hex'),
       };
+      this.implementations.set(
+        implementationKey(bound.unitId, fn.node.id),
+        type.functionSource,
+      );
       if (fn.declaration?.exported && type.name) {
         this.namedTypes.set(`Function.${type.name}`, fn.typeKey);
         if (type.isConstructor)
@@ -377,7 +445,11 @@ class Evaluator {
       const documented = this.annotation(declaration.docs);
       if (
         documented.length &&
+        // Signature documentation belongs to the executable callable. Replacing
+        // its stored value with the annotation discards provenance and inferred returns.
+        declaration.docs.kind !== 'function' &&
         declaration.docs.kind !== 'self' &&
+        declaration.role !== 'local' &&
         declaration.role !== 'function' &&
         declaration.role !== 'legacy-script' &&
         declaration.role !== 'extension-function'
@@ -394,9 +466,15 @@ class Evaluator {
   run(): UnitEvaluation {
     this.checkCancellation();
     const rootScope = this.bound.scopes.get(`${this.bound.unitId}:root`)!;
+    const rootSelf = this.types.get(rootScope.selfOwner);
     const root: Frame = {
       scope: rootScope,
-      self: this.types.get(rootScope.selfOwner),
+      self: rootSelf,
+      other:
+        this.bound.context.kind === 'object-event' &&
+        this.bound.context.eventName?.startsWith('Collision_')
+          ? undefined
+          : rootSelf,
     };
     if (
       this.bound.context.kind !== 'script' ||
@@ -404,6 +482,27 @@ class Evaluator {
     )
       this.execute(this.bound.syntax.root, initialFlow(), root);
     for (const fn of this.bound.functions.values()) this.evaluateFunction(fn);
+    // Type spellings also occur inside struct entries and call arguments, which
+    // are not executable doc statements. Publish every parsed spelling once.
+    for (const docs of this.bound.syntax.jsdocs) {
+      for (const range of docs.typeRanges) {
+        const type = this.knownTypes.get(range.content);
+        if (!type?.signifier) continue;
+        const start = range.start.offset,
+          end = range.end.offset;
+        this.record(
+          {
+            id: `${this.bound.unitId}:type:${start}`,
+            start,
+            end,
+            origin: this.bound.syntax.input.origin(start, end),
+          },
+          { key: this.keyOf(type.signifier), item: type.signifier },
+          value(type),
+          'type',
+        );
+      }
+    }
     for (const [id, reference] of this.references) {
       const symbol = this.resolveAlias(reference.symbol);
       if (symbol !== reference.symbol)
@@ -423,22 +522,44 @@ class Evaluator {
       }
       this.scopes.set(id, { ...scope, memberTypes });
     }
+    for (const fn of this.bound.functions.values())
+      this.valueWrites.add(`returns:${fn.typeKey}`);
     const exported = [...this.symbols.values()].filter(
       (symbol) => symbol.exported,
     );
+    const types = this.contributionTypes();
     const summaryTypes = [
       ...exported.map((symbol) => symbol.item.type),
-      ...[...this.namedTypes.values()].map((key) => this.types.get(key)!),
-      ...[...this.writtenTypes].map((key) => this.types.get(key)!),
+      ...[...this.namedTypes.values()].map((key) => types.get(key)!),
+      ...[...this.writtenTypes].map((key) => types.get(key)!),
     ];
-    const summaries = fingerprints(summaryTypes);
+    const semanticSummaries = new Map<string, string>();
+    const summaries = fingerprints(
+      summaryTypes,
+      (type, summary) => {
+        if (!type.semanticKey) return;
+        if (types.get(type.semanticKey) === type)
+          semanticSummaries.set(type.semanticKey, summary);
+        else {
+          // Exported aliases embed borrowed shapes even when execution never
+          // reads their members or items. Keep those summary inputs current.
+          this.observe({ kind: 'type', owner: type.semanticKey });
+        }
+      },
+      undefined,
+      'export-shape',
+    );
+    for (const [key, implementation] of this.implementations)
+      semanticSummaries.set(key, implementation.fingerprint);
     const summaryOf = new Map(
       summaryTypes.map((type, index) => [type, summaries[index]]),
     );
-    const summary = JSON.stringify([
-      exported
-        .map((symbol) => [
+    const ownerSummaries = new Map<string, string[]>();
+    const exportedDescriptions = exported
+      .map((symbol) => {
+        const description = [
           symbol.key,
+          symbol.canonicalKey,
           symbol.item.readable,
           symbol.item.writable,
           symbol.item.static,
@@ -450,23 +571,47 @@ class Evaluator {
             symbol.item.resourceDefinition.name,
           ],
           summaryOf.get(symbol.item.type)!,
-        ])
-        .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+        ];
+        const summary = JSON.stringify(description);
+        semanticSummaries.set(symbol.key, summary);
+        semanticSummaries.set(
+          `${symbol.owner}/lookup:${symbol.item.name}`,
+          summary,
+        );
+        let members = ownerSummaries.get(symbol.owner);
+        if (!members) ownerSummaries.set(symbol.owner, (members = []));
+        members.push(summary);
+        return description;
+      })
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+    for (const [owner, members] of ownerSummaries)
+      semanticSummaries.set(
+        owner,
+        JSON.stringify([semanticSummaries.get(owner), members.sort()]),
+      );
+    for (const [name, key] of this.namedTypes)
+      semanticSummaries.set(name, summaryOf.get(types.get(key)!)!);
+    const summary = JSON.stringify([
+      exportedDescriptions,
       [...this.namedTypes]
-        .map(([name, key]) => [name, summaryOf.get(this.types.get(key)!)!])
+        .map(([name, key]) => [name, summaryOf.get(types.get(key)!)!])
         .sort((a, b) => a[0].localeCompare(b[0])),
       this.callsSuper,
       [...this.writtenTypes]
         .sort()
-        .map((key) => [key, summaryOf.get(this.types.get(key)!)!]),
+        .map((key) => [key, summaryOf.get(types.get(key)!)!]),
+      [...this.implementations]
+        .map(([key, input]) => [key, input.fingerprint])
+        .sort(([a], [b]) => a.localeCompare(b)),
     ]);
     return {
       unitId: this.bound.unitId,
       bound: this.bound,
       status: this.degraded ? 'degraded' : 'complete',
       symbols: this.symbols,
-      types: this.types,
+      types,
       namedTypes: this.namedTypes,
+      implementations: this.implementations,
       references: [...this.references.values()],
       scopes: [...this.scopes.values()],
       calls: [...this.calls.values()],
@@ -474,8 +619,94 @@ class Evaluator {
       callsSuper: this.callsSuper,
       diagnostics: this.uniqueDiagnostics(),
       dependencies: [...this.dependencies.values()],
+      valueReads: this.valuePorts(this.valueReads),
+      valueWrites: this.valuePorts(this.valueWrites),
+      semanticSummaries,
       summary,
     };
+  }
+
+  valuePorts(ports: ReadonlySet<string>): string[] {
+    return [
+      ...new Set(
+        [...ports].map((port) =>
+          port.startsWith('symbol:')
+            ? `symbol:${this.resolveAlias(port.slice(7))}`
+            : port,
+        ),
+      ),
+    ];
+  }
+  readValue(
+    kind: 'items' | 'symbol' | 'returns',
+    key: string,
+    owner = key,
+  ): void {
+    const port = `${kind}:${key}`;
+    this.valueReads.add(port);
+    this.valueReadOwners.set(port, owner);
+  }
+  valueSymbolKey(symbol: SymbolView): string | undefined {
+    if (
+      symbol.item.native ||
+      this.localValueOwners.has(this.keyOfType(symbol.item.parent))
+    )
+      return;
+    return this.resolveAlias(symbol.canonicalKey || symbol.key);
+  }
+  readSymbolValue(symbol: SymbolView): void {
+    const key = this.valueSymbolKey(symbol);
+    if (key) this.readValue('symbol', key, this.keyOfType(symbol.item.parent));
+  }
+  writeSymbolValue(symbol: SymbolView): void {
+    const key = this.valueSymbolKey(symbol);
+    if (key) this.valueWrites.add(`symbol:${key}`);
+  }
+  inheritValueReads(
+    child: Evaluator,
+    external?: (owner: string) => boolean,
+  ): void {
+    for (const port of child.valueReads) {
+      const separator = port.indexOf(':');
+      const kind = port.slice(0, separator) as 'items' | 'symbol' | 'returns';
+      const key = port.slice(separator + 1);
+      const owner = child.valueReadOwners.get(port) || key;
+      if (kind === 'returns') {
+        // Inline analysis already computes its own local function results.
+        if (child.functionByType.has(key)) continue;
+      } else if (external) {
+        if (!external(owner)) continue;
+      } else {
+        const type = child.types.get(owner);
+        if (
+          !child.borrowedItemTypes.has(owner) &&
+          type?.allocationSource &&
+          child.bound.nodeScopes.has(type.allocationSource)
+        )
+          continue;
+      }
+      this.readValue(
+        kind,
+        kind === 'symbol' ? child.resolveAlias(key) : key,
+        owner,
+      );
+    }
+  }
+
+  usesGenericResult(current: TypeStore | undefined): boolean {
+    if (!current) return false;
+    if (current.type.some((type) => type.isGeneric)) return true;
+    if (!current.type.some((type) => type.items)) return false;
+    const pending = [...current.type];
+    const visited = new Set<Type>();
+    while (pending.length) {
+      const type = pending.pop()!;
+      if (visited.has(type)) continue;
+      visited.add(type);
+      if (type.isGeneric) return true;
+      if (type.items) pending.push(...type.items.type);
+    }
+    return false;
   }
 
   checkCancellation() {
@@ -487,6 +718,18 @@ class Evaluator {
       this.dependencies.set(key, dependency);
       this.environment.observe(dependency);
     }
+  }
+  implementation(source: FunctionType): FunctionImplementation | undefined {
+    const provenance = source.functionSource;
+    if (!provenance) return;
+    const unitId = provenance.bound.unitId;
+    const key = implementationKey(unitId, provenance.functionId);
+    this.observe({ kind: 'implementation', owner: key });
+    // Service transactions own current bodies, including authoritative absence.
+    // Standalone evaluators use the immutable provenance supplied in their input.
+    return this.environment.implementation
+      ? this.environment.implementation(unitId, provenance.functionId)
+      : this.implementations.get(key) || provenance;
   }
   diagnostic(
     origin: SourceOrigin,
@@ -519,8 +762,26 @@ class Evaluator {
     }
     return type;
   }
+  anonymousStorage(type: Type): boolean {
+    return (
+      !type.name &&
+      (type.kind === 'Struct' ||
+        type.kind === 'Array' ||
+        type.kind === 'Function' ||
+        type.kind.startsWith('Id.'))
+    );
+  }
   keyOfType(type: Type): string {
-    return type.semanticKey || `${type.kind}.${type.name || ''}`;
+    if (type.semanticKey) return type.semanticKey;
+    if (!this.anonymousStorage(type)) return `${type.kind}.${type.name || ''}`;
+    let key = this.anonymousTypeKeys.get(type);
+    if (!key) {
+      const occurrence = this.anonymousTypeCounts.get(type.kind) || 0;
+      this.anonymousTypeCounts.set(type.kind, occurrence + 1);
+      key = `anonymous:${this.bound.unitId}:${type.kind}:${occurrence}`;
+      this.anonymousTypeKeys.set(type, key);
+    }
+    return key;
   }
   keyOf(item: Signifier): string {
     return (
@@ -704,9 +965,10 @@ class Evaluator {
     item.enumMember = declaration.role === 'enum-member';
     item.writable =
       !item.enum && !item.enumMember && !declaration.extensionModule;
-    item.definitive =
-      this.bound.context.definitiveSelf ||
-      this.bound.scopes.get(declaration.scope)?.functionId !== undefined;
+    item.definitive = this.definitive(
+      declaration.owner,
+      this.bound.scopes.get(declaration.scope)!,
+    );
     const contribution: SymbolContribution = {
       key: declaration.key,
       item,
@@ -742,7 +1004,97 @@ class Evaluator {
     return contribution;
   }
   annotation(docs: JsdocSummary): Type[] {
-    return typeFromParsedJsdocs(docs, this.knownTypes, false);
+    let types = this.annotationTypes.get(docs);
+    if (!types) {
+      types = typeFromParsedJsdocs(docs, this.knownTypes, false);
+      this.annotationTypes.set(docs, types);
+      // Anonymous annotation shapes are storage identities of this declaration,
+      // not global types named "Struct." or "Array.". Positions are excluded so
+      // comment-only shifts keep their identities and dependent summaries.
+      const declarations = this.bound.declarations
+        .filter((declaration) => declaration.docs === docs)
+        .map((declaration) => declaration.key);
+      const functions = [...this.bound.functions.values()]
+        .filter((fn) => fn.node.docs === docs || fn.declaration?.docs === docs)
+        .map((fn) => fn.typeKey);
+      const site =
+        declarations.length || functions.length
+          ? [...new Set([...declarations, ...functions])].sort()
+          : ['doc', this.bound.syntax.jsdocs.indexOf(docs)];
+      const description = JSON.stringify([
+        site,
+        docs.kind,
+        docs.type?.content,
+        docs.params?.map((param) => [
+          param.name?.content,
+          param.type?.content,
+          param.optional,
+        ]),
+        docs.returns?.type?.content,
+        docs.self?.content,
+      ]);
+      const owner = `annotation:${this.bound.unitId}:${createHash('sha256').update(description).digest('hex')}`;
+      const queue = types.map((type, index) => ({
+        type,
+        path: `type:${index}`,
+      }));
+      const seen = new Set<Type>();
+      for (let index = 0; index < queue.length; index++) {
+        const { type, path } = queue[index];
+        if (seen.has(type) || type.semanticKey || !this.anonymousStorage(type))
+          continue;
+        seen.add(type);
+        type.semanticKey = `${owner}/${path}`;
+        this.types.set(type.semanticKey, type);
+        const add = (child: Type | undefined, suffix: string) => {
+          if (child) queue.push({ type: child, path: `${path}/${suffix}` });
+        };
+        for (const [offset, child] of (type.items?.type || []).entries())
+          add(child, `items:${offset}`);
+        for (const [offset, child] of (type.returns?.type || []).entries())
+          add(child, `returns:${offset}`);
+        add(type.local, 'locals');
+        add(type.self, 'self');
+        add(type.statics, 'statics');
+        add(type.extends, 'base');
+        for (const member of type.listMembers(true))
+          for (const [offset, child] of member.type.type.entries())
+            add(child, `member:${encodeURIComponent(member.name)}:${offset}`);
+      }
+    }
+    return types;
+  }
+  constrainWrite(
+    symbol: SymbolView,
+    docs: JsdocSummary | undefined,
+    state: FlowState,
+  ): void {
+    if (!docs || symbol.intrinsic || symbol.item.native) return;
+    if (['type', 'localvar', 'instancevar', 'globalvar'].includes(docs.kind)) {
+      const type = this.annotation(docs);
+      if (type.length)
+        state.constraints.set(symbol.key, {
+          type: value(...type),
+          conditional: false,
+        });
+    }
+    if (docs.description) symbol.item.description = docs.description;
+    if (docs.deprecated) symbol.item.deprecated = true;
+    if (docs.mixin) symbol.item.mixin = true;
+  }
+  definitive(owner: string, scope: BindingScope): boolean {
+    const fn = scope.functionId && this.bound.functions.get(scope.functionId);
+    if (fn) {
+      const docs = fn.node.docs || fn.declaration?.docs;
+      return (
+        !!(fn.node.constructor || docs?.mixin) &&
+        (owner === fn.selfOwner || owner === fn.staticOwner)
+      );
+    }
+    return (
+      !!this.bound.context.definitiveSelf &&
+      owner === this.bound.context.selfOwner
+    );
   }
   frameFor(node: SyntaxNode, fallback: Frame): Frame {
     const scopeKey = this.bound.nodeScopes.get(node.id);
@@ -763,11 +1115,14 @@ class Evaluator {
     const selfKey = this.keyOfType(
       frame.self || this.ensureType(frame.scope.selfOwner),
     );
+    // Preserve each runtime receiver at this lexical range. Query consumers
+    // aggregate these alternatives while retaining their binding precedence.
     this.scopes.set(`${node.id}:false:${selfKey}`, {
       origin: node.origin,
       local: frame.scope.localOwner,
       self: selfKey,
       dot: false,
+      receivers: frame.querySelf && value(frame.querySelf),
     });
   }
   dotScope(
@@ -800,11 +1155,12 @@ class Evaluator {
         cursor = cursor.extends
       ) {
         visited.add(cursor);
-        this.observe({
-          kind: 'type',
-          owner: this.keyOfType(cursor),
-          facet: 'members',
-        });
+        // Global completion enumerates the live committed namespace. Actual
+        // reads retain their lookup/negative keys; presentation alone does not
+        // depend on every unrelated exported value.
+        const owner = this.keyOfType(cursor);
+        if (owner !== globalOwner)
+          this.observe({ kind: 'type', owner, facet: 'members' });
       }
       const names = new Set<string>();
       for (const member of type.listMembers()) {
@@ -860,11 +1216,12 @@ class Evaluator {
       if (role === 'declaration') role = 'write';
       rename = { kind: 'none' };
     }
-    const id = `${node.id}:${symbol.key}:${role}`;
+    const referenceKey = symbol.canonicalKey || symbol.key;
+    const id = `${node.id}:${referenceKey}:${role}`;
     const previous = this.references.get(id);
     this.references.set(id, {
       unitId: this.bound.unitId,
-      symbol: symbol.key,
+      symbol: referenceKey,
       origin: node.origin,
       role,
       isDefinition,
@@ -875,7 +1232,11 @@ class Evaluator {
           : { kind: 'none' },
     });
     if (!isDefinition)
-      this.observe({ kind: 'usage', owner: symbol.key, target: symbol.key });
+      this.observe({
+        kind: 'usage',
+        owner: referenceKey,
+        target: referenceKey,
+      });
   }
   local(name: string, frame: Frame): SymbolView | undefined {
     let scope: BindingScope | undefined = frame.scope;
@@ -1059,7 +1420,8 @@ class Evaluator {
     }
     return this.importedLookup(statics ? 'static' : 'member', owner, name);
   }
-  symbolType(symbol: SymbolView, state: FlowState): Value {
+  symbolType(symbol: SymbolView, state: FlowState, read = true): Value {
+    if (read && state.reachable) this.readSymbolValue(symbol);
     const fn = this.functionByKey.get(symbol.key);
     if (fn && this.functionStatus.get(fn.node.id) !== 'running')
       this.evaluateFunction(fn);
@@ -1082,8 +1444,13 @@ class Evaluator {
     return this.inputInstanceViews(current, `symbol:${symbol.key}`);
   }
   unresolved(name: Name, frame: Frame): SymbolView {
+    const auto = this.bound.context.autoDeclareGlobalsPrefixes?.find((prefix) =>
+      name.text.startsWith(prefix),
+    );
     const self = this.storageType(
-      frame.self || this.ensureType(frame.scope.selfOwner),
+      auto !== undefined
+        ? this.ensureType(globalOwner)
+        : frame.self || this.ensureType(frame.scope.selfOwner),
     );
     const owner = this.keyOfType(self);
     const key =
@@ -1095,20 +1462,29 @@ class Evaluator {
       const shape = this.types.get(owner) || this.copyShape(self);
       const item = new Signifier(shape, name.text, Type.Any);
       item.semanticKey = key;
-      item.placeholder = true;
-      symbol = { key, item, owner, unitId: this.bound.unitId, exported: false };
+      item.placeholder = auto === undefined;
+      if (auto !== undefined) {
+        item.global = true;
+        item.replaceDefinition({});
+        item.description = `Auto-declared by global prefix \`${auto}\``;
+      }
+      symbol = {
+        key,
+        item,
+        owner,
+        unitId: this.bound.unitId,
+        exported: auto !== undefined,
+        bare: auto !== undefined,
+      };
       this.symbols.set(key, symbol);
-      shape.setOwnMember(item);
+      if (auto !== undefined) shape.setOwnMember(item);
     }
-    const auto = this.bound.context.autoDeclareGlobalsPrefixes?.some((prefix) =>
-      name.text.startsWith(prefix),
-    );
     const dynamicCaller =
       this.bound.context.dynamicSelf &&
       owner !== globalOwner &&
       (owner === this.bound.context.selfOwner ||
         owner.endsWith(':caller-self'));
-    if (!auto && !dynamicCaller)
+    if (auto === undefined && !dynamicCaller)
       this.diagnostic(
         name.origin,
         owner === globalOwner
@@ -1123,23 +1499,34 @@ class Evaluator {
 
   evaluateFunction(fn: BoundFunction): Type<'Function'> {
     const type = this.types.get(fn.typeKey)! as FunctionType;
+    this.observe({
+      kind: 'implementation',
+      owner: implementationKey(this.bound.unitId, fn.node.id),
+    });
     if (this.functionStatus.has(fn.node.id)) return type;
     this.functionStatus.set(fn.node.id, 'running');
     this.checkCancellation();
     const scope = this.bound.scopes.get(fn.scope)!;
+    const invocation = this.invocations.get(fn.node.id);
     const frame: Frame = {
       scope,
       function: fn,
       self:
+        invocation?.self ||
         this.reboundSelf.get(fn.node.id) ||
         this.dynamicSelf.get(fn.selfOwner) ||
         type.self,
+      other: invocation?.other,
     };
     const docs = fn.node.docs || fn.declaration?.docs;
     const documented = docs
       ? this.annotation(docs).find((entry) => entry.kind === 'Function')
       : undefined;
-    if (docs?.self && !this.reboundSelf.has(fn.node.id)) {
+    if (
+      !fn.node.constructor &&
+      docs?.self &&
+      !this.reboundSelf.has(fn.node.id)
+    ) {
       const self = this.knownTypes.get(docs.self.content);
       if (self)
         frame.self =
@@ -1152,18 +1539,75 @@ class Evaluator {
       ).type[0];
       type.self = frame.self as WithableType;
     }
-    const state = initialFlow();
+    const state = invocation ? copyFlow(invocation.state) : initialFlow();
+    if (invocation) {
+      for (const key of state.values.keys())
+        if (key.startsWith(`${fn.localOwner}/member:`))
+          state.values.delete(key);
+      for (const key of state.constraints.keys())
+        if (key.startsWith(`${fn.localOwner}/member:`))
+          state.constraints.delete(key);
+    }
     this.scope(fn.node.body, frame);
     for (let index = 0; index < fn.node.parameters.length; index++) {
       const parameter = fn.node.parameters[index];
       const declaration = this.bound.declarationSites.get(parameter.name.id)!;
       const symbol = this.symbols.get(declaration.key)!;
       const annotation = documented?.getParameter(parameter.name.text);
-      let current = annotation?.isTyped
-        ? value(annotation.type)
-        : parameter.value
-          ? this.expression(parameter.value, state, frame)
-          : unknown();
+      this.scope(parameter, frame);
+      // Defaults are source expressions even when a parameter has an explicit
+      // type contract. Keep their references, calls and diagnostics available.
+      const actual = invocation?.arguments[index];
+      const needsDefault =
+        !actual ||
+        !actual.hasTypes ||
+        actual.type.some((entry) =>
+          ['Undefined', 'Any', 'Unknown', 'Mixed'].includes(entry.kind),
+        );
+      let defaultValue = invocation ? primitive('Undefined') : unknown();
+      if (parameter.value && (!invocation || needsDefault)) {
+        const skipped =
+          invocation &&
+          actual &&
+          actual.type.some((entry) => entry.kind !== 'Undefined')
+            ? copyFlow(state)
+            : undefined;
+        defaultValue = this.expression(
+          parameter.value,
+          state,
+          frame,
+          annotation?.type,
+        );
+        if (skipped) replaceFlow(state, mergeFlow([state, skipped]));
+      }
+      const inferred =
+        invocation && actual
+          ? needsDefault && parameter.value
+            ? join(withoutUndefined(actual), defaultValue)
+            : actual
+          : defaultValue;
+      // A generic callable contract must not erase the actual callback's source.
+      const callableInput =
+        inferred.type.some(
+          (entry) => entry.kind === 'Function' && !!entry.functionSource,
+        ) &&
+        annotation?.type.type.every(
+          (entry) => entry.kind === 'Function' && !entry.name,
+        );
+      const storageInput =
+        invocation &&
+        annotation?.isTyped &&
+        inferred.narrows(annotation.type) &&
+        inferred.type.some(
+          (entry) =>
+            !!entry.semanticKey &&
+            (['Struct', 'Array', 'Function'].includes(entry.kind) ||
+              entry.kind.startsWith('Id.')),
+        );
+      let current =
+        annotation?.isTyped && !callableInput && !storageInput
+          ? value(annotation.type)
+          : inferred;
       if (annotation) {
         symbol.item.description = annotation.description;
         this.annotated.add(symbol.key);
@@ -1263,17 +1707,49 @@ class Evaluator {
       )
         continue;
       const initializer = (declaration.node as VariableDeclaration).value;
-      const current = initializer
-        ? this.expression(initializer, state, frame)
-        : primitive('Undefined');
+      const established =
+        invocation &&
+        this.environment.lookup({
+          namespace: 'static',
+          owner: declaration.owner,
+          name: declaration.name,
+        });
+      const knownInitialized =
+        invocation && state.initializedStatics.has(declaration.key);
+      // Source summaries establish a type, not proof that a runtime call already
+      // executed the initializer. Unknown history retains both first/skip paths.
+      const skipped =
+        invocation && established && !knownInitialized
+          ? copyFlow(state)
+          : undefined;
+      const current = knownInitialized
+        ? value(state.values.get(declaration.key) || established?.item.type)
+        : initializer
+          ? this.expression(initializer, state, frame)
+          : primitive('Undefined');
       const symbol = this.symbols.get(declaration.key)!;
       const initialized = this.annotated.has(symbol.key)
         ? value(symbol.item.type)
         : current;
       symbol.item.setType(initialized);
       state.values.set(symbol.key, initialized);
+      if (!knownInitialized && state.reachable) this.writeSymbolValue(symbol);
+      if (invocation) {
+        state.initializedStatics.add(symbol.key);
+        if (!knownInitialized) this.recordSymbolWrite(symbol.key, initialized);
+        if (skipped && established) {
+          skipped.values.set(symbol.key, value(established.item.type));
+          skipped.initializedStatics.add(symbol.key);
+          replaceFlow(state, mergeFlow([state, skipped]));
+        }
+      }
     }
     const completions = this.execute(fn.node.body, state, frame);
+    if (invocation)
+      this.functionExits.set(
+        fn.node.id,
+        mergeFlow(completions.map((completion) => completion.state)),
+      );
     const returns: Value[] = [];
     for (const completion of completions) {
       if (!completion.state.reachable) continue;
@@ -1295,8 +1771,11 @@ class Evaluator {
         if (!type.self.getMember(member.name, true))
           type.self.setOwnMember(member);
     }
-    for (const view of this.extensionViews.get(fn.typeKey) || [])
+    for (const view of this.extensionViews.get(fn.typeKey) || []) {
       view.setReturnType(value(type.returns));
+      view.usesOther = type.usesOther;
+      view.callsLocalCallable = type.callsLocalCallable;
+    }
     this.functionStatus.set(fn.node.id, 'done');
     return type;
   }
@@ -1309,6 +1788,8 @@ class Evaluator {
         const key = type.semanticKey;
         if (!key || this.priorTypes?.get(key) !== type) return type;
         let current = this.types.get(key);
+        if (!current && key.startsWith('narrow:'))
+          current = this.ensureType(key, type.kind);
         if (
           !current &&
           (key.startsWith('array:') || key.startsWith('allocation:'))
@@ -1339,13 +1820,31 @@ class Evaluator {
     return false;
   }
 
-  expression(node: Expression, state: FlowState, frame: Frame): Value {
-    const current = this.evaluateExpression(node, state, frame);
+  expression(
+    node: Expression,
+    state: FlowState,
+    frame: Frame,
+    expected?: TypeStore,
+    valueUsed = true,
+  ): Value {
+    const current = this.evaluateExpression(
+      node,
+      state,
+      frame,
+      expected,
+      valueUsed,
+    );
     this.expressionValues.set(node.id, current);
     return current;
   }
 
-  evaluateExpression(node: Expression, state: FlowState, frame: Frame): Value {
+  evaluateExpression(
+    node: Expression,
+    state: FlowState,
+    frame: Frame,
+    expected?: TypeStore,
+    valueUsed = true,
+  ): Value {
     this.checkCancellation();
     frame = this.frameFor(node, frame);
     switch (node.kind) {
@@ -1356,14 +1855,27 @@ class Evaluator {
         return value(type);
       }
       case 'name': {
-        if (['self', 'other', 'global'].includes(node.name.text))
-          return value(
+        if (['self', 'other', 'global'].includes(node.name.text)) {
+          const type =
             node.name.text === 'global'
               ? this.ensureType(globalOwner)
               : node.name.text === 'other'
-                ? frame.other || this.ensureType(globalOwner)
-                : frame.self || this.ensureType(frame.scope.selfOwner),
-          );
+                ? frame.other
+                : frame.self || this.ensureType(frame.scope.selfOwner);
+          if (!type) return unknown();
+          const current = value(type);
+          const item = type.signifier || type.extends?.signifier;
+          if (item)
+            this.record(
+              node.name,
+              { key: this.keyOf(item), item },
+              current,
+              'read',
+              false,
+              { kind: 'implicit' },
+            );
+          return current;
+        }
         if (node.name.text === 'noone' || node.name.text === 'all') {
           // These reserved scope values need distinct facts through aliases:
           // native schemas otherwise describe both simply as Id.Instance.
@@ -1385,18 +1897,46 @@ class Evaluator {
           if (symbol) this.record(node.name, symbol, value(type));
           return value(type);
         }
-        if (node.name.text === 'argument_count') return primitive('Real');
+        if (node.name.text === 'argument_count') {
+          const current = primitive('Real');
+          const symbol = this.importedLookup(
+            'native',
+            nativeGlobalOwner,
+            node.name.text,
+          );
+          if (symbol) this.record(node.name, symbol, current);
+          return current;
+        }
         if (/^argument(?:\d+)?$/.test(node.name.text) && frame.function) {
           const index = /^argument(\d+)$/.exec(node.name.text);
           const fn = this.types.get(frame.function.typeKey)!;
-          if (index)
-            return value(fn.getParameter(Number(index[1]))?.type || unknown());
+          const symbol = this.importedLookup(
+            'native',
+            nativeGlobalOwner,
+            node.name.text,
+          );
+          if (index) {
+            const current = value(
+              this.invocations.get(frame.function.node.id)?.arguments[
+                Number(index[1])
+              ] ||
+                fn.getParameter(Number(index[1]))?.type ||
+                unknown(),
+            );
+            if (symbol) this.record(node.name, symbol, current);
+            return current;
+          }
           const array = this.ensureType(
             `${frame.function.typeKey}:arguments`,
             'Array',
           );
-          array.items = unknown();
-          return value(array);
+          const actual = this.invocations.get(
+            frame.function.node.id,
+          )?.arguments;
+          array.items = actual ? join(...actual) : unknown();
+          const current = value(array);
+          if (symbol) this.record(node.name, symbol, current);
+          return current;
         }
         const symbol =
           this.lookupName(node.name.text, frame) ||
@@ -1407,12 +1947,43 @@ class Evaluator {
       }
       case 'function': {
         const fn = this.bound.functions.get(node.id);
-        return fn ? value(this.types.get(fn.typeKey)) : unknown();
+        if (!fn) return unknown();
+        const source = this.types.get(fn.typeKey)! as FunctionType;
+        return value(
+          frame.self &&
+            frame.function &&
+            this.invocations.has(frame.function.node.id)
+            ? this.bindMethod(source, frame.self, false, node.id)
+            : source,
+        );
       }
       case 'struct': {
         const owner = `struct:${node.id}`;
         const type = this.ensureType(owner) as StructType;
-        this.structRanges.push({ origin: node.origin, type: owner });
+        type.allocationSource = node.id;
+        const shapes =
+          expected?.type.filter((entry) => entry.kind === 'Struct') || [];
+        let completionShape = type;
+        if (shapes.length === 1) completionShape = shapes[0] as StructType;
+        else if (shapes.length > 1) {
+          completionShape = this.ensureType(
+            `completion:${node.id}`,
+          ) as StructType;
+          for (const shape of shapes)
+            for (const member of shape.listMembers()) {
+              const previous = completionShape.getMember(member.name, true);
+              if (previous) previous.setType(join(previous.type, member.type));
+              else
+                completionShape.setOwnMember(
+                  new Signifier(completionShape, member.name, member.type.type),
+                );
+            }
+        }
+        for (const origin of node.memberGaps)
+          this.structRanges.push({
+            origin,
+            type: this.keyOfType(completionShape),
+          });
         for (const entry of node.entries) {
           const declaration = this.bound.declarationSites.get(entry.name.id)!;
           const property = this.symbols.get(declaration.key)!;
@@ -1455,6 +2026,7 @@ class Evaluator {
               true,
               'write',
               rename,
+              entry.docs,
             );
           }
         }
@@ -1462,6 +2034,7 @@ class Evaluator {
       }
       case 'array': {
         const type = this.ensureType(`array:${node.id}`, 'Array');
+        type.allocationSource = node.id;
         type.items = join(
           ...node.values.map((entry) => this.expression(entry, state, frame)),
         );
@@ -1474,15 +2047,37 @@ class Evaluator {
       case 'index':
         return this.access(node, state, frame, false).type;
       case 'call': {
-        const target = this.expression(node.target, state, frame);
+        const located =
+          node.target.kind === 'member' || node.target.kind === 'index'
+            ? this.access(node.target, state, frame, false)
+            : ({
+                type: this.expression(node.target, state, frame),
+                symbols: [],
+              } as LocatedValue);
+        const target = located.type;
+        this.expressionValues.set(node.target.id, target);
         const results: Value[] = [];
-        const callables = target.type.filter(
-          (type): type is FunctionType => type.kind === 'Function',
+        const dispatch = located.callables?.length
+          ? located.callables
+          : target.type
+              .filter((type): type is FunctionType => type.kind === 'Function')
+              .map((type) => ({ type, receiver: undefined }));
+        const callables = dispatch.map(({ type }) => this.callable(type));
+        const argumentValues = node.arguments.map((argument, index) =>
+          argument.value
+            ? this.expression(
+                argument.value,
+                state,
+                frame,
+                join(
+                  ...callables.map(
+                    (fn) => fn.getParameter(index)?.type || pending(),
+                  ),
+                ),
+              )
+            : primitive('Undefined'),
         );
         if (!callables.length) {
-          node.arguments.forEach((argument) => {
-            if (argument.value) this.expression(argument.value, state, frame);
-          });
           if (state.reachable && !dynamic(target))
             this.diagnostic(
               node.origin,
@@ -1496,26 +2091,47 @@ class Evaluator {
           node.target.kind === 'name'
             ? this.lookupName(node.target.name.text, frame)
             : undefined;
-        for (const fn of callables)
+        const branches = callables.map(() => copyFlow(state));
+        callables.forEach((fn, index) => {
           results.push(
             this.call(
               fn,
               callee,
               node.arguments,
               node,
-              state,
+              branches[index],
               frame,
               node.usesNew ? 'new' : 'call',
+              argumentValues,
+              dispatch[index].receiver,
+              valueUsed,
             ),
           );
+        });
+        replaceFlow(state, mergeFlow(branches));
         return join(...results);
       }
       case 'assign': {
+        const expected = node.docs
+          ? value(...this.annotation(node.docs))
+          : undefined;
         if (node.operator === '??=') {
-          const target = this.captureTarget(node.target, state, frame);
-          return this.coalesce(target.value, node.value, state, frame, target);
+          const target = this.captureTarget(
+            node.target,
+            state,
+            frame,
+            node.docs,
+          );
+          return this.coalesce(
+            target.value,
+            node.value,
+            state,
+            frame,
+            target,
+            expected,
+          );
         }
-        let current = this.expression(node.value, state, frame);
+        let current = this.expression(node.value, state, frame, expected);
         if (node.operator !== '=') {
           const previous = this.readTarget(node.target, state, frame);
           current = this.binary(
@@ -1531,6 +2147,7 @@ class Evaluator {
           state,
           frame,
           node.operator === '=' ? 'write' : 'read-write',
+          node.docs,
         );
       }
       case 'binary': {
@@ -1546,14 +2163,9 @@ class Evaluator {
           const skipped = copyFlow(state);
           this.narrow(node.left, skipped, !requiresTrue, frame);
           const merged = mergeFlow([skipped, rightState]);
-          state.values.clear();
-          merged.values.forEach((entry, key) => state.values.set(key, entry));
-          state.reachable = merged.reachable;
+          replaceFlow(state, merged);
         } else {
-          state.values.clear();
-          rightState.values.forEach((entry, key) =>
-            state.values.set(key, entry),
-          );
+          replaceFlow(state, rightState);
         }
         const evaluated = this.binary(node.operator, left, right, node.origin);
         if (!node.uncertainGrouping) return evaluated;
@@ -1591,8 +2203,7 @@ class Evaluator {
           this.expression(node.no, no, frame),
         );
         const merged = mergeFlow([yes, no]);
-        state.values.clear();
-        merged.values.forEach((entry, key) => state.values.set(key, entry));
+        replaceFlow(state, merged);
         return current;
       }
       case 'unary': {
@@ -1861,34 +2472,45 @@ class Evaluator {
   /** method creates a new bound value, retaining the original function and statics.
    * https://manual.gamemaker.io/monthly/en/GameMaker_Language/GML_Reference/Variable_Functions/method.htm
    */
-  bindMethod(source: FunctionType, self: Type): FunctionType {
+  bindMethod(
+    source: FunctionType,
+    self: Type,
+    evaluate = true,
+    allocationSource?: string,
+  ): FunctionType {
     source = source.methodSource || source;
     const key = `method:${this.keyOfType(source)}:${this.keyOfType(self)}`;
     const existing = this.methodAnalyses.get(key);
-    if (existing) return this.evaluateMethod(existing.type);
+    if (existing)
+      return evaluate ? this.evaluateMethod(existing.type) : existing.type;
     const method = source.deriveDetached() as FunctionType;
     method.semanticKey = key;
+    method.allocationSource = allocationSource;
     method.self = self as WithableType;
     method.methodSource = source;
-    method.returns = source.functionSource
-      ? pending()
-      : source.returns && value(source.returns);
+    method.returns =
+      evaluate && source.functionSource
+        ? pending()
+        : source.returns && value(source.returns);
     this.types.set(key, method);
     this.methodAnalyses.set(key, {
       type: method,
       active: false,
       complete: false,
     });
-    return this.evaluateMethod(method);
+    return evaluate ? this.evaluateMethod(method) : method;
   }
 
   evaluateMethod(method: FunctionType): FunctionType {
     const source = method.methodSource;
     const self = method.self;
     if (!source || !self) return method;
+    const implementation = this.implementation(source);
     const key =
       method.semanticKey ||
       `method:${this.keyOfType(source)}:${this.keyOfType(self)}`;
+    const active = this.activeMethodAnalyses.get(key);
+    if (active) return active.type;
     let record = this.methodAnalyses.get(key);
     if (!record) {
       const copy = method.deriveDetached() as FunctionType;
@@ -1908,48 +2530,13 @@ class Evaluator {
       facet: 'members',
     });
     if (record.active || record.complete) return record.type;
-    const provenance = source.functionSource;
-    const fn = provenance?.bound.functions.get(provenance.functionId);
-    if (!provenance || !fn) {
+    const selected = selectCallable(implementation);
+    if (!selected) {
+      if (source.functionSource) record.type.returns = unknown();
       record.complete = true;
       return record.type;
     }
-    // Evaluate just this callable and its nested declarations. Other files and
-    // the source function's published storage are read-only environment inputs.
-    const functions = new Map(
-      [...provenance.bound.functions].filter(([, candidate]) => {
-        for (
-          let scope: BindingScope | undefined = provenance.bound.scopes.get(
-            candidate.scope,
-          );
-          scope;
-          scope = scope.parent
-            ? provenance.bound.scopes.get(scope.parent)
-            : undefined
-        )
-          if (scope.key === fn.scope) return true;
-        return false;
-      }),
-    );
-    const declarations = provenance.bound.declarations.filter(
-      (declaration) =>
-        declaration === fn.declaration ||
-        functions.has(
-          provenance.bound.scopes.get(declaration.scope)?.functionId || '',
-        ),
-    );
-    const selected = new Set(declarations.map((declaration) => declaration.id));
-    const bound: BoundUnit = {
-      ...provenance.bound,
-      functions,
-      declarations,
-      diagnostics: [],
-      declarationSites: new Map(
-        [...provenance.bound.declarationSites].filter(([, declaration]) =>
-          selected.has(declaration.id),
-        ),
-      ),
-    };
+    const { bound, fn } = selected;
     const previous = record.type;
     const environment: SemanticEnvironment = {
       lookup: (request) => {
@@ -1974,12 +2561,17 @@ class Evaluator {
           : this.types.get(typeKey) ||
             this.types.get(this.namedTypes.get(typeKey) || '') ||
             this.environment.type(typeKey),
+      implementation:
+        this.environment.implementation &&
+        ((unitId, functionId) =>
+          this.environment.implementation!(unitId, functionId)),
       observe: (dependency) => this.observe(dependency),
       cancelled: () => this.environment.cancelled(),
     };
     const seen = new Set<string>();
     let priorTypes: ReadonlyMap<string, Type> | undefined;
     record.active = true;
+    this.activeMethodAnalyses.set(key, record);
     try {
       for (;;) {
         this.checkCancellation();
@@ -1988,6 +2580,8 @@ class Evaluator {
           environment,
           this.methodAnalyses,
           priorTypes,
+          this.invocationAnalyses,
+          this.activeMethodAnalyses,
         );
         const target = self.deriveDetached();
         target.semanticKey = this.keyOfType(self);
@@ -2000,6 +2594,7 @@ class Evaluator {
           }
         }
         child.types.set(target.semanticKey, target);
+        child.borrowedItemTypes.add(target.semanticKey);
         child.dynamicSelf.set(fn.selfOwner, target);
         child.reboundSelf.set(fn.node.id, target);
         const result = child.evaluateFunction(fn);
@@ -2009,15 +2604,18 @@ class Evaluator {
           .filter((diagnostic) => diagnostic.severity === 'error');
         this.degraded ||= child.degraded;
         child.dependencies.forEach((dependency) => this.observe(dependency));
+        this.inheritValueReads(child);
         const before = fingerprint(previous.returns || pending());
         previous.returns = value(result.returns || pending());
+        previous.usesOther = result.usesOther;
+        previous.callsLocalCallable = result.callsLocalCallable;
         const after = fingerprint(previous.returns);
         record.effects = {
           self: child.types.get(target.semanticKey) || target,
           symbols: [...child.symbols.values()].filter(
             (symbol) => symbol.owner === target.semanticKey && symbol.exported,
           ),
-          itemsWritten: child.writtenTypes.has(target.semanticKey),
+          itemWrites: child.writtenItems.get(target.semanticKey),
         };
         if (before === after) break;
         if (seen.has(after)) {
@@ -2037,6 +2635,7 @@ class Evaluator {
       return previous;
     } finally {
       record.active = false;
+      this.activeMethodAnalyses.delete(key);
     }
   }
 
@@ -2067,14 +2666,687 @@ class Evaluator {
         );
       owner.setOwnMember(contribution.item);
       state.values.set(source.key, value(source.item.type));
+      this.writeSymbolValue(contribution);
     }
-    if (effects.itemsWritten)
+    if (effects.itemWrites) {
       owner.items = join(
         owner.items || pending(),
         effects.self.items || pending(),
       );
-    if (effects.symbols.length || effects.itemsWritten)
-      this.writtenTypes.add(ownerKey);
+      this.recordItemWrite(ownerKey, effects.itemWrites);
+    }
+    if (effects.symbols.length) this.writtenTypes.add(ownerKey);
+  }
+
+  /** A constructor call owns instance storage; the named shape and source statics remain shared. */
+  constructedSelf(fn: FunctionType, node: SyntaxNode): Type {
+    const source = fn.methodSource?.isConstructor
+      ? fn.methodSource.self!
+      : fn.self!;
+    const key = allocationContextKey(
+      `allocation:${node.id}:constructed:${this.keyOfType(fn.methodSource || fn)}`,
+      // The source already identifies the constructor; its bound receiver is
+      // the varying construction context, rather than the enclosing method key.
+      this.keyOfType(fn.methodSource && fn.self ? fn.self : fn),
+    );
+    const existing = this.types.get(key);
+    if (existing) return existing;
+    const target = source.deriveDetached();
+    target.semanticKey = key;
+    target.allocationSource = node.id;
+    target.replaceOwnMembers([]);
+    this.types.set(key, target);
+    const names = new Set<string>();
+    for (const original of source.listMembers()) {
+      if (names.has(original.name)) continue;
+      names.add(original.name);
+      if (original.static || original.native) {
+        target.setOwnMember(original);
+        continue;
+      }
+      const item = new Signifier(target, original.name);
+      item.semanticKey = memberKey(key, original.name);
+      item.replaceMetadata(original, value(original.type));
+      item.replaceDefinition(original.def, original.declaration);
+      target.setOwnMember(item);
+      const declaration =
+        this.symbols.get(this.keyOf(original)) ||
+        this.environment.lookup({
+          namespace: 'member',
+          owner: this.keyOfType(original.parent),
+          name: original.name,
+        });
+      this.symbols.set(item.semanticKey, {
+        key: item.semanticKey,
+        owner: key,
+        item,
+        canonicalKey: declaration?.canonicalKey || declaration?.key,
+        unitId: this.bound.unitId,
+        exported: true,
+        origin: declaration?.origin,
+      });
+    }
+    const selected = selectCallable(this.implementation(fn.methodSource || fn));
+    if (selected) {
+      const roots: Type[] = [];
+      const constructors: (typeof selected)[] = [];
+      const seen = new Set<Type>();
+      for (
+        let cursor: Type | undefined = source;
+        cursor && !seen.has(cursor);
+        cursor = cursor.extends
+      ) {
+        seen.add(cursor);
+        roots.push(cursor);
+        const callable =
+          cursor === source
+            ? fn.methodSource || fn
+            : cursor.signifier?.getTypeByKind('Function');
+        const entry = callable && selectCallable(this.implementation(callable));
+        if (entry) constructors.push(entry);
+      }
+      const shared = inputAliases(
+        source
+          .listMembers()
+          .filter((member) => member.static || member.native)
+          .map((member) => value(member.type)),
+        false,
+      );
+      const rootKeys = new Set(roots.map((type) => type.semanticKey));
+      const graph = new InvocationGraph(
+        key,
+        this.bound.unitId,
+        selected.bound,
+        selected.fn,
+        shared,
+        this.types,
+        this.symbols,
+        (key) => this.types.get(key) || this.environment.type(key),
+        node.id,
+        (type) =>
+          type.kind === 'Function'
+            ? !!type.methodSource && rootKeys.has(type.self?.semanticKey)
+            : !!type.allocationSource &&
+              constructors.some(({ bound }) => {
+                const scope = bound.nodeScopes.get(type.allocationSource!);
+                return (
+                  !!scope &&
+                  bound.functions.has(bound.scopes.get(scope)?.functionId || '')
+                );
+              }),
+      );
+      roots.forEach((root) => graph.seed(root, target));
+      for (const member of target.listMembers(true))
+        if (!member.static && !member.native)
+          member.setType(graph.value(value(member.type)));
+      this.mergeInvocationGraph(graph);
+    }
+    for (const member of target.listMembers(true)) {
+      if (member.static || member.native) continue;
+      member.setType(
+        valueFrom(
+          member.type.type.map((candidate) => {
+            if (
+              candidate.kind !== 'Function' ||
+              !candidate.self ||
+              !candidate.functionSource
+            )
+              return candidate;
+            const implementation = this.implementation(
+              candidate as FunctionType,
+            );
+            const declaration = implementation?.bound.functions.get(
+              implementation.functionId,
+            )?.declaration;
+            return declaration?.role !== 'function' &&
+              (candidate.self === source ||
+                this.hasBase(source, candidate.self))
+              ? this.bindMethod(
+                  candidate as FunctionType,
+                  target,
+                  false,
+                  node.id,
+                )
+              : candidate;
+          }),
+        ),
+      );
+    }
+    return target;
+  }
+
+  /** Only active recursion is shared. Completed calls are re-evaluated at the
+   * next flow point, so writes cannot reuse a result computed for older inputs. */
+  invoke(
+    callable: FunctionType,
+    arguments_: readonly Value[],
+    node: SyntaxNode,
+    state: FlowState,
+    frame: Frame,
+    kind: SemanticCall['kind'],
+    receiver?: Type,
+  ): Value | undefined {
+    if (!state.reachable) return;
+    const source = callable.methodSource || callable;
+    const implementation = this.implementation(source);
+    const declaration = implementation?.bound.functions.get(
+      implementation.functionId,
+    );
+    if (source.functionSource && !declaration) return unknown();
+    const detachedCallable =
+      source.allocationSource &&
+      implementation &&
+      source.semanticKey !== declaration?.typeKey;
+    if (
+      !(
+        callable.methodSource ||
+        detachedCallable ||
+        callable.usesOther ||
+        source.usesOther ||
+        ((callable.callsLocalCallable || source.callsLocalCallable) &&
+          hasContextualCallable(arguments_))
+      )
+    )
+      return;
+    const selected = selectCallable(implementation);
+    if (!selected) return;
+    const { fn } = selected;
+    // A GML extension entry retains its selected public signature. Compatible
+    // runtime storage preserves aliases; an incompatible argument is diagnosed
+    // against the contract rather than replacing the entry's declared type.
+    if (fn.declaration?.extensionModule && callable.callKind === 'native') {
+      arguments_ = arguments_.map((argument, index) => {
+        const contract = callable.getParameter(index)?.type;
+        return contract?.hasTypes && !argument.narrows(contract)
+          ? value(contract)
+          : argument;
+      });
+    }
+    const bound: BoundUnit = {
+      ...selected.bound,
+      context: {
+        ...selected.bound.context,
+        legacyOtherBehaviour: this.bound.context.legacyOtherBehaviour,
+      },
+    };
+    const boundMethod =
+      !!callable.methodSource ||
+      !['function', 'legacy-script', 'extension-function'].includes(
+        fn.declaration?.role || '',
+      );
+    const legacy = bound.context.legacyOtherBehaviour;
+    const before = receiver || frame.self;
+    const self =
+      kind === 'new' && callable.isConstructor && callable.self
+        ? this.constructedSelf(callable, node)
+        : kind === 'base-constructor'
+          ? frame.self
+          : boundMethod
+            ? callable.self
+            : before;
+    const other =
+      kind === 'base-constructor'
+        ? frame.other
+        : kind === 'new'
+          ? boundMethod && legacy === false
+            ? callable.self
+            : boundMethod && legacy === undefined && callable.self !== before
+              ? undefined
+              : before
+          : boundMethod
+            ? legacy === false
+              ? before
+              : legacy === true
+                ? frame.other
+                : undefined
+            : receiver
+              ? legacy === false
+                ? frame.self
+                : legacy === true
+                  ? frame.other
+                  : undefined
+              : frame.other;
+    const identity = (type: Type | undefined) =>
+      type ? this.keyOfType(type) : '?';
+    // Scalar argument content is deliberately not a recursion identity: recursive
+    // arithmetic must converge at a source/context site, not generate new calls forever.
+    const key = JSON.stringify([
+      this.keyOfType(source),
+      identity(self),
+      identity(other),
+      legacy,
+      arguments_.map((argument) =>
+        argument.type.filter((type) => type.kind === 'Function').map(identity),
+      ),
+    ]);
+    const inputState = copyFlow(state);
+    for (const key of inputState.values.keys())
+      if (key.startsWith(`${fn.localOwner}/member:`))
+        inputState.values.delete(key);
+    for (const key of inputState.constraints.keys())
+      if (key.startsWith(`${fn.localOwner}/member:`))
+        inputState.constraints.delete(key);
+    const widen = (previous: Value, incoming: Value): Value => {
+      const changed = fingerprint(previous) !== fingerprint(incoming);
+      return valueFrom(
+        join(previous, incoming).type.map((type) => {
+          if (
+            changed &&
+            !type.semanticKey &&
+            ['Real', 'String', 'Bool'].includes(type.kind)
+          ) {
+            const widened = type.deriveDetached();
+            widened.literalValue = undefined;
+            return widened;
+          }
+          return type;
+        }),
+      );
+    };
+    const inputItems = new Map<string, Type>();
+    for (const owner of new Set([
+      ...inputAliases([value(self), value(other), ...arguments_]),
+      ...this.writtenTypes,
+    ])) {
+      const type = this.types.get(owner) || this.environment.type(owner);
+      if (type?.items) {
+        const snapshot = type.deriveDetached();
+        snapshot.semanticKey = owner;
+        snapshot.items = value(type.items);
+        inputItems.set(owner, snapshot);
+      }
+    }
+    const active = this.invocationAnalyses.get(key);
+    if (active?.active) {
+      active.recursive = true;
+      for (
+        let index = 0;
+        index < Math.max(active.arguments.length, arguments_.length);
+        index++
+      ) {
+        const previous = active.arguments[index] || primitive('Undefined');
+        const incoming = arguments_[index] || primitive('Undefined');
+        const merged = widen(previous, incoming);
+        if (fingerprint(previous) !== fingerprint(merged))
+          active.inputsChanged = true;
+        active.arguments[index] = merged;
+      }
+      const mergedState = mergeFlow([active.state, inputState]);
+      for (const [key, incoming] of inputState.values) {
+        const previous = active.state.values.get(key);
+        if (previous) mergedState.values.set(key, widen(previous, incoming));
+      }
+      if (flowKey(active.state) !== flowKey(mergedState))
+        active.inputsChanged = true;
+      active.state = mergedState;
+      for (const [owner, incoming] of inputItems) {
+        const previous = active.inputItems.get(owner);
+        const merged = previous
+          ? join(previous.items || pending(), incoming.items || pending())
+          : value(incoming.items);
+        if (
+          !previous ||
+          fingerprint(previous.items || pending()) !== fingerprint(merged)
+        )
+          active.inputsChanged = true;
+        const snapshot = incoming.deriveDetached();
+        snapshot.semanticKey = owner;
+        snapshot.items = merged;
+        active.inputItems.set(owner, snapshot);
+      }
+      this.applyInvocationEffects(active.effects, active.items, state, frame);
+      active.initializedStatics.forEach((key) =>
+        state.initializedStatics.add(key),
+      );
+      return valueFrom(
+        active.value.type.map(
+          (type) =>
+            (type.semanticKey && this.types.get(type.semanticKey)) || type,
+        ),
+      );
+    }
+    const record: InvocationAnalysis = {
+      active: true,
+      recursive: false,
+      inputsChanged: false,
+      arguments: arguments_.map((argument) => value(argument)),
+      state: inputState,
+      inputItems,
+      initializedStatics: new Set(),
+      value: pending(),
+      effects: new Map(),
+      items: new Map(),
+    };
+    this.invocationAnalyses.set(key, record);
+    const borrowed = inputAliases([value(self), value(other), ...arguments_]);
+    const locals = new Set(
+      [...bound.functions.values()].map((candidate) => candidate.localOwner),
+    );
+    const statics = new Set(
+      [...bound.functions.values()].map((candidate) => candidate.staticOwner),
+    );
+    const isExternal = (owner: string) =>
+      borrowed.has(owner) || owner === globalOwner || statics.has(owner);
+    const recursive = source.deriveDetached() as FunctionType;
+    recursive.semanticKey = source.semanticKey;
+    const borrow = (type: Type | undefined, allowLocal = false) => {
+      const scope =
+        type?.allocationSource && bound.nodeScopes.get(type.allocationSource);
+      const localAllocation =
+        scope && bound.functions.has(bound.scopes.get(scope)?.functionId || '');
+      if (type?.semanticKey && (allowLocal || !localAllocation))
+        borrowed.add(type.semanticKey);
+      return type;
+    };
+    const environment: SemanticEnvironment = {
+      lookup: (request) => {
+        const own = this.symbols.get(memberKey(request.owner, request.name));
+        const member = this.types.get(request.owner)?.getMember(request.name);
+        const result =
+          own?.item.def || own?.item.native
+            ? own
+            : member && (member.def || member.native)
+              ? { key: this.keyOf(member), item: member }
+              : this.environment.lookup(request);
+        if (result) {
+          const sharedStatic = statics.has(request.owner);
+          borrow(result.item.parent, sharedStatic);
+          result.item.type.type.forEach((type) => borrow(type, sharedStatic));
+        }
+        return result;
+      },
+      type: (typeKey) =>
+        typeKey === fn.typeKey
+          ? recursive
+          : this.types.get(typeKey) ||
+            this.types.get(this.namedTypes.get(typeKey) || '') ||
+            this.environment.type(typeKey),
+      implementation:
+        this.environment.implementation &&
+        ((unitId, functionId) =>
+          this.environment.implementation!(unitId, functionId)),
+      observe: (dependency) => this.observe(dependency),
+      cancelled: () => this.environment.cancelled(),
+    };
+    let child: Evaluator | undefined;
+    let exits = initialFlow();
+    let priorTypes: ReadonlyMap<string, Type> | undefined;
+    let previous: string | undefined;
+    const seen = new Set<string>();
+    try {
+      for (;;) {
+        this.checkCancellation();
+        record.inputsChanged = false;
+        for (const alias of inputAliases(record.arguments)) borrowed.add(alias);
+        child = new Evaluator(
+          bound,
+          environment,
+          new Map(),
+          priorTypes,
+          this.invocationAnalyses,
+          this.activeMethodAnalyses,
+        );
+        // The same self/other alias maps to one detached storage. Member writes
+        // and container writes continue through the evaluator's copy-on-write path.
+        const detached = new Map<string, Type>();
+        const input = (type: Type | undefined): Type | undefined => {
+          if (!type) return;
+          const key = this.keyOfType(type);
+          let target = detached.get(key);
+          if (!target) {
+            target = type.deriveDetached();
+            target.semanticKey = key;
+            detached.set(key, target);
+            child!.types.set(key, target);
+            child!.borrowedItemTypes.add(key);
+          }
+          return target;
+        };
+        const target = input(self),
+          caller = input(other);
+        for (const [owner, snapshot] of record.inputItems) {
+          const current = child.types.get(owner) || snapshot.deriveDetached();
+          current.semanticKey = owner;
+          current.items = value(snapshot.items);
+          child.types.set(owner, current);
+          child.borrowedItemTypes.add(owner);
+        }
+        if (target) {
+          child.dynamicSelf.set(fn.selfOwner, target);
+          child.reboundSelf.set(fn.node.id, target);
+        }
+        child.invocations.set(fn.node.id, {
+          self: target,
+          other: caller,
+          arguments: record.arguments,
+          state: record.state,
+        });
+        const result = child.evaluateFunction(fn);
+        exits = child.functionExits.get(fn.node.id) || initialFlow();
+        record.initializedStatics = new Set(exits.initializedStatics);
+        record.value =
+          kind === 'new' && target
+            ? value(child.types.get(this.keyOfType(target)) || target)
+            : value(result.returns || pending());
+        record.effects = new Map();
+        for (const [key, written] of child.writtenSymbols) {
+          const contribution = child.symbols.get(key);
+          if (
+            contribution &&
+            !locals.has(contribution.owner) &&
+            isExternal(contribution.owner)
+          )
+            record.effects.set(key, {
+              source: contribution,
+              current: value(exits.values.get(key) || contribution.item.type),
+              written,
+            });
+        }
+        record.items = new Map(
+          [...child.writtenItems]
+            .filter(([key]) => isExternal(key))
+            .flatMap(([key, written]) => {
+              const source = child!.types.get(key);
+              return source ? [[key, { source, written }] as const] : [];
+            }),
+        );
+        child.dependencies.forEach((dependency) => this.observe(dependency));
+        this.inheritValueReads(child, isExternal);
+        this.degraded ||= child.degraded;
+        if (!record.recursive) break;
+        const digest = JSON.stringify([
+          fingerprint(record.value),
+          [...record.initializedStatics].sort(),
+          [...record.effects]
+            .map(([key, effect]) => [
+              key,
+              fingerprint(effect.current),
+              fingerprint(effect.written),
+            ])
+            .sort(),
+          [...record.items]
+            .map(([key, effect]) => [
+              key,
+              fingerprint(value(effect.source)),
+              fingerprint(effect.written),
+            ])
+            .sort(),
+        ]);
+        if (digest === previous && !record.inputsChanged) break;
+        const iteration = JSON.stringify([
+          digest,
+          fingerprints(record.arguments),
+          flowKey(record.state),
+          [...record.inputItems]
+            .map(([owner, type]) => [
+              owner,
+              fingerprint(type.items || pending()),
+            ])
+            .sort(),
+        ]);
+        if (seen.has(iteration)) {
+          this.degraded = true;
+          break;
+        }
+        seen.add(iteration);
+        previous = digest;
+        priorTypes = child.types;
+        recursive.returns = record.value;
+      }
+      const namespace = `invocation:${createHash('sha256')
+        .update(JSON.stringify([node.id, key]))
+        .digest('hex')}`;
+      const graph = new InvocationGraph(
+        namespace,
+        this.bound.unitId,
+        bound,
+        fn,
+        borrowed,
+        child.types,
+        child.symbols,
+        (key) => this.types.get(key) || this.environment.type(key),
+        node.id,
+        undefined,
+        exits.values,
+      );
+      const output = graph.value(record.value);
+      const effects = new Map(
+        [...record.effects].map(
+          ([key, effect]) =>
+            [
+              key,
+              {
+                source: effect.source,
+                current: graph.value(effect.current),
+                written: graph.value(effect.written),
+              },
+            ] as const,
+        ),
+      );
+      const items = new Map(
+        [...record.items].map(([key, effect]) => {
+          const source = effect.source.deriveDetached();
+          source.semanticKey = key;
+          source.items =
+            effect.source.items && graph.value(effect.source.items);
+          return [
+            key,
+            { source, written: graph.value(effect.written) },
+          ] as const;
+        }),
+      );
+      this.mergeInvocationGraph(graph);
+      this.applyInvocationEffects(effects, items, state, frame);
+      record.initializedStatics.forEach((key) =>
+        state.initializedStatics.add(key),
+      );
+      for (const diagnostic of child
+        .uniqueDiagnostics()
+        .filter((entry) => entry.severity === 'error'))
+        this.diagnostics.push({
+          ...diagnostic,
+          origin: node.origin,
+          message: `Invocation: ${diagnostic.message}`,
+        });
+      return output;
+    } finally {
+      record.active = false;
+      this.invocationAnalyses.delete(key);
+    }
+  }
+
+  mergeInvocationGraph(graph: InvocationGraph): void {
+    for (const [key, type] of graph.types) this.types.set(key, type);
+    for (const [key, contribution] of graph.symbols) {
+      const existing = this.symbols.get(key);
+      if (existing)
+        existing.item.setType(join(existing.item.type, contribution.item.type));
+      else this.symbols.set(key, contribution);
+    }
+  }
+
+  /** Export only writes performed here, not values retained on a skipped path. */
+  recordSymbolWrite(key: string, current: Value): void {
+    const symbol = this.symbols.get(key);
+    if (symbol) this.writeSymbolValue(symbol);
+    this.writtenSymbols.set(
+      key,
+      join(this.writtenSymbols.get(key) || pending(), current),
+    );
+  }
+
+  recordItemWrite(key: string, current: Value): void {
+    this.valueWrites.add(`items:${key}`);
+    this.writtenItems.set(
+      key,
+      join(this.writtenItems.get(key) || pending(), current),
+    );
+    this.writtenTypes.add(key);
+  }
+
+  /** Flow views retain incoming items; a unit publishes only its own writes. */
+  contributionTypes(): Map<string, Type> {
+    if (!this.borrowedItemTypes.size) return this.types;
+    const types = new Map(this.types);
+    for (const key of this.borrowedItemTypes) {
+      const source = this.types.get(key);
+      const written = this.writtenItems.get(key);
+      if (!source || (!source.items && !written)) continue;
+      const copy = source.deriveDetached();
+      copy.semanticKey = key;
+      copy.items = written && value(written);
+      types.set(key, copy);
+    }
+    return types;
+  }
+
+  applyInvocationEffects(
+    effects: InvocationAnalysis['effects'],
+    items: InvocationAnalysis['items'],
+    state: FlowState,
+    frame: Frame,
+  ): void {
+    if (!state.reachable) return;
+    for (const [key, { source, current, written }] of effects) {
+      if (source.item.native || !source.item.writable) continue;
+      let contribution = this.symbols.get(key);
+      const owner =
+        this.types.get(source.owner) || this.copyShape(source.item.parent);
+      if (!contribution) {
+        const item = new Signifier(owner, source.item.name);
+        item.semanticKey = key;
+        item.replaceMetadata(source.item, value(written));
+        item.replaceDefinition(source.item.def, source.item.declaration);
+        contribution = {
+          ...source,
+          item,
+          unitId: this.bound.unitId,
+          exported: true,
+          origin:
+            source.origin &&
+            (source.canonicalKey
+              ? source.origin
+              : { ...source.origin, editable: false }),
+        };
+        this.symbols.set(key, contribution);
+      } else contribution.item.setType(join(contribution.item.type, written));
+      // A borrowed static is lexically private in its declaring unit, but this
+      // invocation writes shared storage. Its value changes must schedule readers.
+      if (!contribution.exported) {
+        contribution = { ...contribution, exported: true };
+        this.symbols.set(key, contribution);
+      }
+      owner.setOwnMember(contribution.item);
+      state.values.set(key, value(current));
+      this.writeSymbolValue(contribution);
+      if (frame.function && this.invocations.has(frame.function.node.id))
+        this.recordSymbolWrite(key, written);
+    }
+    for (const [key, { source, written }] of items) {
+      const owner = this.types.get(key) || this.copyShape(source);
+      owner.items = source.items && value(source.items);
+      this.recordItemWrite(key, written);
+    }
   }
 
   call(
@@ -2085,25 +3357,68 @@ class Evaluator {
     state: FlowState,
     frame: Frame,
     kind: SemanticCall['kind'],
+    evaluatedArguments?: readonly Value[],
+    receiver?: Type,
+    valueUsed = true,
   ): Value {
-    fn = this.callable(fn);
+    if (state.reachable) fn = this.callable(fn);
     const generics = new Map<string, TypeStore>();
-    const argumentValues: Value[] = [];
+    const argumentValues =
+      evaluatedArguments ||
+      arguments_.map((argument, index) =>
+        argument.value
+          ? this.expression(
+              argument.value,
+              state,
+              frame,
+              fn.getParameter(index)?.type,
+            )
+          : primitive('Undefined'),
+      );
+    const caller = frame.function && this.types.get(frame.function.typeKey);
+    if (caller) {
+      caller.usesOther ||= fn.usesOther || !!fn.methodSource?.usesOther;
+      caller.callsLocalCallable ||=
+        fn.callsLocalCallable || !!fn.methodSource?.callsLocalCallable;
+    }
     const callName = symbol?.item.native
       ? symbol.item.name
       : fn.signifier?.native
         ? fn.signifier.name
         : undefined;
-    arguments_.forEach((argument, index) => {
-      const current = argument.value
-        ? this.expression(argument.value, state, frame)
-        : primitive('Undefined');
-      argumentValues.push(current);
+    const observeItems =
+      state.reachable && valueUsed && this.usesGenericResult(fn.returns)
+        ? (type: Type) => this.readValue('items', this.keyOfType(type))
+        : undefined;
+    argumentValues.forEach((current, index) => {
       const expected = fn.getParameter(index);
       if (expected)
-        updateGenericsMap(expected.type, current, this.knownTypes, generics);
+        updateGenericsMap(
+          expected.type,
+          current,
+          this.knownTypes,
+          generics,
+          observeItems,
+        );
     });
-    if (fn.methodSource) {
+    const invoked = this.invoke(
+      fn,
+      argumentValues,
+      node,
+      state,
+      frame,
+      kind,
+      receiver,
+    );
+    if (state.reachable && valueUsed && !invoked && fn.functionSource) {
+      const source = fn.methodSource || fn;
+      const implementation = source.functionSource;
+      const key =
+        implementation?.bound.functions.get(implementation.functionId)
+          ?.typeKey || this.keyOfType(source);
+      this.readValue('returns', key);
+    }
+    if (fn.methodSource && !invoked && kind !== 'new') {
       this.applyMethodEffects(fn, state);
       for (const diagnostic of this.methodAnalyses.get(fn.semanticKey || '')
         ?.diagnostics || [])
@@ -2113,7 +3428,7 @@ class Evaluator {
           message: `Bound method: ${diagnostic.message}`,
         });
     }
-    this.calls.set(node.id, {
+    this.calls.set(`${node.id}:${this.keyOfType(fn)}`, {
       origin: node.origin,
       type: fn,
       arguments: arguments_.map((argument, index) => ({
@@ -2191,12 +3506,18 @@ class Evaluator {
       return targets.length && methods.length
         ? value(
             ...methods.flatMap((source) =>
-              targets.map((target) => this.bindMethod(source, target)),
+              targets.map((target) =>
+                this.bindMethod(source, target, state.reachable, node.id),
+              ),
             ),
           )
         : unknown();
     }
-    if (state.reachable && symbol?.item.mixin && fn.self) {
+    if (
+      state.reachable &&
+      (symbol?.item.mixin || fn.signifier?.mixin) &&
+      fn.self
+    ) {
       const self = frame.self;
       this.observe({
         kind: 'type',
@@ -2209,8 +3530,11 @@ class Evaluator {
         this.writtenTypes.add(this.keyOfType(self));
       }
     }
+    if (invoked) return invoked;
     if (kind === 'new')
-      return fn.isConstructor && fn.self ? value(fn.self) : unknown();
+      return fn.isConstructor && fn.self
+        ? value(this.constructedSelf(fn, node))
+        : unknown();
     let returns = fn.returns || pending();
     if (
       !returns.hasTypes &&
@@ -2241,7 +3565,11 @@ class Evaluator {
       argumentValues,
       resolved,
     );
-    if (instance) return this.callInstanceViews(instance, node);
+    if (instance)
+      return this.callInstanceViews(
+        this.callResultStorage(instance, fn, node, argumentValues),
+        node,
+      );
     // These native calls allocate fresh mutable containers. Their shared
     // specification return type is a contract, not storage owned by every call.
     // https://manual.gamemaker.io/monthly/en/GameMaker_Language/GML_Reference/Data_Structures/DS_Maps/ds_map_create.htm
@@ -2259,17 +3587,182 @@ class Evaluator {
           if (!owned || this.recursiveAllocations.delete(key)) {
             owned ||= type.deriveDetached();
             owned.semanticKey = key;
+            owned.allocationSource = node.id;
             owned.items =
               callName === 'array_create'
                 ? value(argumentValues[1] || primitive('Real'))
-                : undefined;
+                : // No observed item facts yet. A presentation fallback must not
+                  // become an Any seed that a read-back cycle can sustain.
+                  pending();
             this.types.set(key, owned);
           }
           return owned;
         }),
       );
     }
-    return this.callInstanceViews(resolved, node);
+    return this.callInstanceViews(
+      this.callResultStorage(resolved, fn, node, argumentValues),
+      node,
+    );
+  }
+
+  /** A type parameter describes a type, not an alias to its input storage.
+   * Give otherwise unidentified mutable results one finite graph per call site.
+   * Existing keyed inputs retain their identity and are never traversed/mutated. */
+  callResultStorage(
+    input: Value,
+    fn: FunctionType,
+    node: SyntaxNode,
+    arguments_: readonly Value[] = [],
+  ): Value {
+    const selected = selectCallable(this.implementation(fn.methodSource || fn));
+    // Active recursive feedback points at a graph still being filled by this
+    // pass. Copying it now would freeze an incomplete member/item frontier.
+    if (
+      selected &&
+      this.functionStatus.get(selected.fn.node.id) !== 'running'
+    ) {
+      const owns = (type: Type): boolean => {
+        const scope =
+          type.allocationSource &&
+          selected.bound.nodeScopes.get(type.allocationSource);
+        if (
+          scope &&
+          selected.bound.functions.has(
+            selected.bound.scopes.get(scope)?.functionId || '',
+          )
+        )
+          return true;
+        const callable =
+          type.functionSource &&
+          selected.bound.functions.get(type.functionSource.functionId);
+        return !!callable && callable !== selected.fn;
+      };
+      if (input.type.some(owns)) {
+        const shared = inputAliases(
+          [
+            ...arguments_,
+            ...(fn.statics
+              ?.listMembers(true)
+              .map((member) => value(member.type)) || []),
+          ],
+          false,
+        );
+        // Alias reachability controls whether a result keeps shared storage or
+        // receives a call-site identity, even when its visible shape is equal.
+        for (const owner of shared) this.observe({ kind: 'type', owner });
+        const graph = new InvocationGraph(
+          `allocation:summary:${node.id}:${this.keyOfType(fn)}`,
+          this.bound.unitId,
+          selected.bound,
+          selected.fn,
+          shared,
+          this.types,
+          this.symbols,
+          (key) => this.types.get(key) || this.environment.type(key),
+          node.id,
+          owns,
+        );
+        input = graph.value(input);
+        this.mergeInvocationGraph(graph);
+      }
+    }
+    const mutable = (type: Type) =>
+      !type.semanticKey &&
+      (type.kind === 'Struct' ||
+        type.kind === 'Array' ||
+        type.kind === 'Function' ||
+        type.kind.startsWith('Id.'));
+    if (!input.type.some(mutable)) return input;
+    const namespace = `allocation:call-result:${this.bound.unitId}:${node.id}:${this.keyOfType(fn)}`;
+    const copies = new Map<Type, Type>();
+    const queue: { source: Type; target: Type; path: string }[] = [];
+    const map = (source: Type, path: string): Type => {
+      if (!mutable(source)) return source;
+      const prior = copies.get(source);
+      if (prior) return prior;
+      const key = `${namespace}/${path}:${source.kind}`;
+      let target = this.types.get(key);
+      if (!target) {
+        target = source.deriveDetached();
+        target.semanticKey = key;
+        target.allocationSource = node.id;
+        target.replaceOwnMembers([]);
+        target.items = undefined;
+        target.returns = undefined;
+        this.types.set(key, target);
+      }
+      copies.set(source, target);
+      queue.push({ source, target, path });
+      return target;
+    };
+    const store = (source: Value | undefined, path: string) =>
+      source &&
+      valueFrom(
+        source.type.map((type, index) => map(type, `${path}:${index}`)),
+      );
+    const result = store(input, 'return')!;
+    for (let index = 0; index < queue.length; index++) {
+      const { source, target, path } = queue[index];
+      const items = store(source.items, `${path}/items`);
+      const returns = store(source.returns, `${path}/returns`);
+      if (items) target.items = join(target.items || pending(), items);
+      if (returns) target.returns = join(target.returns || pending(), returns);
+      target.local =
+        source.local && (map(source.local, `${path}/locals`) as StructType);
+      target.self =
+        source.self && (map(source.self, `${path}/self`) as WithableType);
+      target.statics =
+        source.statics &&
+        (map(source.statics, `${path}/statics`) as StructType);
+      target.methodSource =
+        source.methodSource &&
+        (map(source.methodSource, `${path}/method-source`) as FunctionType);
+      target.setBaseView(source.extends && map(source.extends, `${path}/base`));
+      for (const original of source
+        .listMembers(true)
+        .sort((a, b) => a.name.localeCompare(b.name))) {
+        if (original.static || original.native) {
+          target.setOwnMember(original);
+          continue;
+        }
+        const key = memberKey(target.semanticKey!, original.name);
+        const current = store(
+          original.type,
+          `${path}/member:${encodeURIComponent(original.name)}`,
+        )!;
+        let contribution = this.symbols.get(key);
+        if (!contribution) {
+          const item = new Signifier(target, original.name);
+          item.semanticKey = key;
+          item.replaceMetadata(original, current);
+          item.replaceDefinition(original.def, original.declaration);
+          const declaration = original.semanticKey
+            ? this.symbols.get(original.semanticKey) ||
+              this.environment.lookup({
+                namespace: 'member',
+                owner: this.keyOfType(original.parent),
+                name: original.name,
+              })
+            : undefined;
+          contribution = {
+            key,
+            item,
+            owner: target.semanticKey!,
+            unitId: this.bound.unitId,
+            exported: true,
+            canonicalKey:
+              declaration?.canonicalKey ||
+              declaration?.key ||
+              original.canonicalKey,
+            origin: declaration?.origin,
+          };
+          this.symbols.set(key, contribution);
+        } else contribution.item.setType(join(contribution.item.type, current));
+        target.setOwnMember(contribution.item);
+      }
+    }
+    return result;
   }
 
   /** Create has completed before these calls return. Keep the selected resource
@@ -2333,6 +3826,7 @@ class Evaluator {
     state: FlowState,
     frame: Frame,
     target?: CapturedTarget,
+    expected?: TypeStore,
   ): Value {
     const paths = nullishPaths(previous);
     const skipped = copyFlow(state),
@@ -2346,13 +3840,14 @@ class Evaluator {
           nullishPaths(this.symbolType(symbol, state)).present,
         );
       }
-    const replacement = this.expression(right, executed, frame);
-    if (target && executed.reachable) target.write(replacement, executed);
+    const replacement = this.expression(right, executed, frame, expected);
+    const assigned =
+      target && executed.reachable
+        ? target.write(replacement, executed)
+        : replacement;
     const merged = mergeFlow([skipped, executed]);
-    state.values.clear();
-    merged.values.forEach((entry, key) => state.values.set(key, entry));
-    state.reachable = merged.reachable;
-    return nullishResult(previous, replacement);
+    replaceFlow(state, merged);
+    return nullishResult(previous, assigned);
   }
 
   /** Capture receiver and indices before RHS effects; write never re-evaluates them. */
@@ -2360,6 +3855,7 @@ class Evaluator {
     target: Expression,
     state: FlowState,
     frame: Frame,
+    docs?: JsdocSummary,
   ): CapturedTarget {
     if (target.kind === 'member' || target.kind === 'index') {
       const prepared = this.prepareAccess(target, state, frame);
@@ -2373,10 +3869,16 @@ class Evaluator {
       return {
         value: located.type,
         symbols: located.symbols,
-        write: (current, branch) => {
-          this.accessPrepared(target, prepared, branch, frame, true, current);
-          return current;
-        },
+        write: (current, branch) =>
+          this.accessPrepared(
+            target,
+            prepared,
+            branch,
+            frame,
+            true,
+            current,
+            docs,
+          ).type,
       };
     }
     const previous = this.readTarget(target, state, frame);
@@ -2388,7 +3890,7 @@ class Evaluator {
       value: previous,
       symbols: symbol ? [symbol] : [],
       write: (current, branch) =>
-        this.assignTarget(target, current, branch, frame, 'read-write'),
+        this.assignTarget(target, current, branch, frame, 'read-write', docs),
     };
   }
   resolveAlias(key: string): string {
@@ -2419,6 +3921,7 @@ class Evaluator {
     state: FlowState,
     frame: Frame,
     role: ReferenceRole = 'write',
+    docs?: JsdocSummary,
   ): Value {
     if (target.kind === 'name') {
       const declaration = this.bound.declarationSites.get(target.name.id);
@@ -2451,7 +3954,10 @@ class Evaluator {
           this.redirectSymbol(declaration.key, actual.key);
           symbol = actual;
         }
+        // Declaration templates share inherited navigation. A rebound receiver
+        // already has its own storage slot with a separate canonical key.
         if (
+          actualOwner === declaration.owner &&
           storage.extends &&
           current.type.every((type) => type.kind !== 'Function')
         ) {
@@ -2479,10 +3985,12 @@ class Evaluator {
           this.symbols.get(symbol.key)?.declaration?.origin ===
             declaration.origin,
         role,
+        { kind: 'identifier' },
+        docs,
       );
     }
     if (target.kind === 'member' || target.kind === 'index') {
-      const located = this.access(target, state, frame, true, current);
+      const located = this.access(target, state, frame, true, current, docs);
       for (const symbol of located.symbols)
         this.write(
           symbol,
@@ -2524,9 +4032,10 @@ class Evaluator {
     item.semanticKey = symbol.key;
     item.replaceMetadata(symbol.item, pending());
     item.replaceDefinition({});
-    item.definitive = this.bound.context.definitiveSelf || !!frame.function;
+    item.definitive = this.definitive(ownerKey, frame.scope);
     owned = {
       key: symbol.key,
+      canonicalKey: symbol.canonicalKey,
       item,
       owner: ownerKey,
       unitId: this.bound.unitId,
@@ -2547,7 +4056,12 @@ class Evaluator {
     definition = false,
     role: ReferenceRole = 'write',
     rename: RenameRecipe = { kind: 'identifier' },
+    docs?: JsdocSummary,
   ): Value {
+    if (docs && state.reachable && symbol.item.writable) {
+      symbol = this.ownWrite(symbol, node, frame) || symbol;
+      this.constrainWrite(symbol, docs, state);
+    }
     if (!symbol.item.writable)
       this.diagnostic(
         node.origin,
@@ -2556,12 +4070,14 @@ class Evaluator {
         'error',
       );
     let constrained = current;
+    const constraint = state.constraints.get(symbol.key);
     if (
+      constraint ||
       this.annotated.has(symbol.key) ||
       symbol.intrinsic ||
       symbol.item.native
     ) {
-      const contract = value(symbol.item.type);
+      const contract = value(constraint?.type || symbol.item.type);
       const instanceAssignment =
         contract.hasTypes &&
         contract.type.every(
@@ -2577,13 +4093,27 @@ class Evaluator {
       constrained = instanceAssignment
         ? current
         : this.inputInstanceViews(contract, `assignment:${node.id}`);
+      if (constraint?.conditional) constrained = join(constrained, current);
     }
     let owned = this.symbols.get(symbol.key);
     if (state.reachable && symbol.item.writable) {
+      // The function prepass already ran (or skipped) static initialization.
+      // Visiting its declaration records the point type, not another write.
+      const preparedStatic =
+        definition &&
+        this.bound.declarationSites.get(node.id)?.role === 'static' &&
+        state.initializedStatics.has(symbol.key);
+      if (!preparedStatic) this.writeSymbolValue(symbol);
+      if (
+        frame.function &&
+        this.invocations.has(frame.function.node.id) &&
+        !preparedStatic
+      )
+        this.recordSymbolWrite(symbol.key, constrained);
       state.values.set(symbol.key, constrained);
       owned = this.ownWrite(symbol, node, frame);
-      if (owned && !this.annotated.has(symbol.key))
-        owned.item.setType(join(owned.item.type, current));
+      if (owned && (!this.annotated.has(symbol.key) || constraint))
+        owned.item.setType(join(owned.item.type, constrained));
     }
     const candidate = owned?.origin?.spelling;
     definition =
@@ -2615,6 +4145,7 @@ class Evaluator {
     frame: Frame,
     write: boolean,
     assigned?: Value,
+    docs?: JsdocSummary,
   ): LocatedValue {
     return this.accessPrepared(
       node,
@@ -2623,6 +4154,7 @@ class Evaluator {
       frame,
       write,
       assigned,
+      docs,
     );
   }
 
@@ -2635,12 +4167,13 @@ class Evaluator {
     let key: string | undefined;
     let keyNode: SyntaxNode = node;
     let rename: RenameRecipe = { kind: 'identifier' };
+    let indices: Value[] | undefined;
     if (node.kind === 'member') {
       key = node.name.text;
       keyNode = node.name;
       rename = { kind: 'identifier', property: true };
     } else {
-      const indices = node.indices.map((index) =>
+      indices = node.indices.map((index) =>
         this.expression(index, state, frame),
       );
       if (node.accessor === 'struct') {
@@ -2655,7 +4188,7 @@ class Evaluator {
         }
       }
     }
-    return { target, key, keyNode, rename };
+    return { target, key, keyNode, rename, indices };
   }
 
   accessPrepared(
@@ -2665,10 +4198,32 @@ class Evaluator {
     frame: Frame,
     write: boolean,
     assigned?: Value,
+    docs?: JsdocSummary,
   ): LocatedValue {
     const { target, key, keyNode, rename } = prepared;
+    if (
+      !write &&
+      node.kind === 'index' &&
+      node.target.kind === 'name' &&
+      node.target.name.text === 'argument' &&
+      frame.function
+    ) {
+      const actual = this.invocations.get(frame.function.node.id)?.arguments;
+      if (actual) {
+        const index =
+          prepared.indices?.[0] && knownConstant(prepared.indices[0]);
+        return {
+          type:
+            typeof index === 'number' && Number.isInteger(index) && index >= 0
+              ? actual[index] || primitive('Undefined')
+              : join(...actual),
+          symbols: [],
+        };
+      }
+    }
     const result: Value[] = [];
     const symbols: SymbolView[] = [];
+    const callables: { type: FunctionType; receiver: Type }[] = [];
     const receivers: Type[] = [];
     let accessible = false;
     for (let type of target.type) {
@@ -2741,8 +4296,7 @@ class Evaluator {
           item.global = owner === globalOwner;
           item.instance = owner !== globalOwner;
           item.def = {};
-          item.definitive =
-            this.bound.context.definitiveSelf || !!frame.function;
+          item.definitive = this.definitive(owner, frame.scope);
           const contribution: SymbolContribution = {
             key: item.semanticKey,
             item,
@@ -2757,8 +4311,14 @@ class Evaluator {
           member = contribution;
         }
         if (member) {
-          const current = this.symbolType(member, state);
+          const current = this.symbolType(member, state, !write);
           result.push(current);
+          for (const candidate of current.type)
+            if (candidate.kind === 'Function')
+              callables.push({
+                type: candidate as FunctionType,
+                receiver: type,
+              });
           if (write && assigned) {
             const definition =
               member.origin?.spelling.uri === keyNode.origin.spelling.uri &&
@@ -2772,6 +4332,7 @@ class Evaluator {
               definition,
               'write',
               rename,
+              docs,
             );
           } else {
             symbols.push(member);
@@ -2807,9 +4368,11 @@ class Evaluator {
                 unitId: this.bound.unitId,
                 exported: false,
               };
+              // Keep reference/diagnostic storage without declaring a member
+              // merely because an incomplete or invalid read mentioned it.
               this.symbols.set(missingKey, missing);
-              if (type.kind !== 'Enum') shape.setOwnMember(item);
             }
+            if (state.reachable) this.readSymbolValue(missing);
             this.record(keyNode, missing, unknown(), 'read', false, rename);
           } else if (type.kind === 'Enum' || type.isReadonly)
             this.diagnostic(
@@ -2823,6 +4386,8 @@ class Evaluator {
             owner: this.keyOfType(type),
             facet: 'items',
           });
+          if (!write && state.reachable)
+            this.readValue('items', this.keyOfType(type));
           result.push(type.items || unknown());
         }
       } else {
@@ -2831,13 +4396,15 @@ class Evaluator {
           owner: this.keyOfType(type),
           facet: 'items',
         });
+        if (!write && state.reachable)
+          this.readValue('items', this.keyOfType(type));
         if (write && assigned && !type.isReadonly && state.reachable) {
           const owned =
             this.types.get(this.keyOfType(type)) === type
               ? type
               : this.copyShape(type);
           owned.items = join(owned.items || pending(), assigned);
-          this.writtenTypes.add(this.keyOfType(owned));
+          this.recordItemWrite(this.keyOfType(owned), assigned);
           result.push(assigned);
         } else result.push(type.items || unknown());
       }
@@ -2859,7 +4426,11 @@ class Evaluator {
           ? 'Type does not allow dot accessors.'
           : 'Type does not allow this indexed accessor.',
       );
-    return { type: result.length ? join(...result) : unknown(), symbols };
+    return {
+      type: result.length ? join(...result) : unknown(),
+      symbols,
+      callables,
+    };
   }
   copyShape(type: Type): Type {
     const key = this.keyOfType(type);
@@ -2867,6 +4438,7 @@ class Evaluator {
     if (existing) return existing;
     const copy = new Type(type.kind);
     copy.semanticKey = key;
+    copy.allocationSource = type.allocationSource;
     copy.name = type.name;
     copy.setBaseView(type.extends);
     copy.items = type.items && value(type.items);
@@ -2877,6 +4449,7 @@ class Evaluator {
     copy.isConstructor = type.isConstructor;
     for (const member of type.listMembers(true)) copy.setOwnMember(member);
     this.types.set(key, copy);
+    this.borrowedItemTypes.add(key);
     return copy;
   }
 
@@ -2904,9 +4477,7 @@ class Evaluator {
         this.narrow(condition.left, evaluatedRight, !truthy, frame);
         this.narrow(condition.right, evaluatedRight, truthy, frame);
         const merged = mergeFlow([skipped, evaluatedRight]);
-        state.values.clear();
-        merged.values.forEach((value, key) => state.values.set(key, value));
-        state.reachable = merged.reachable;
+        replaceFlow(state, merged);
       }
       return;
     }
@@ -2966,7 +4537,14 @@ class Evaluator {
     const previous = this.symbolType(symbol, state);
     if (dynamic(previous)) {
       if (keep) {
-        const type = new Type(kind);
+        // Repeated visits to one guard refine the same storage site. A fresh
+        // anonymous owner per visit would prevent loop flow from converging.
+        const type = ['Struct', 'Array', 'Function'].includes(kind)
+          ? this.ensureType(
+              `narrow:${condition.id}:${symbol.key}:${kind}`,
+              kind,
+            )
+          : new Type(kind);
         if (kind === 'Function') {
           type.addParameter(0, '...', { type: Type.Any, optional: true });
           type.returns = unknown();
@@ -2988,7 +4566,10 @@ class Evaluator {
     this.scope(node, frame);
     switch (node.kind) {
       case 'block': {
-        let completions = normal(state);
+        // The block owns its incoming maps; branch/abrupt paths are separated
+        // by their control-flow constructs. Straight-line statements can keep
+        // their single continuation instead of joining every stored value.
+        let completions = normal(copyFlow(state));
         for (const child of node.statements) {
           const live = completions.filter(
             (completion) => completion.kind === 'normal',
@@ -3006,7 +4587,9 @@ class Evaluator {
             ...abrupt,
             ...this.execute(
               child,
-              mergeFlow(live.map((completion) => completion.state)),
+              live.length === 1 && live[0].state.reachable
+                ? live[0].state
+                : mergeFlow(live.map((completion) => completion.state)),
               frame,
             ),
           ];
@@ -3028,11 +4611,17 @@ class Evaluator {
             );
             continue;
           }
+          this.constrainWrite(symbol, declaration.docs, state);
+          const expected =
+            state.constraints.get(symbol.key)?.type ||
+            (this.annotated.has(symbol.key)
+              ? value(symbol.item.type)
+              : undefined);
           const current =
             node.storage === 'static' && state.values.has(symbol.key)
               ? state.values.get(symbol.key)!
               : declaration.value
-                ? this.expression(declaration.value, state, frame)
+                ? this.expression(declaration.value, state, frame, expected)
                 : primitive('Undefined');
           this.write(symbol, current, state, declaration.name, frame, true);
         }
@@ -3055,7 +4644,7 @@ class Evaluator {
         return normal(state);
       }
       case 'expression':
-        this.expression(node.expression, state, frame);
+        this.expression(node.expression, state, frame, undefined, false);
         return normal(state);
       case 'enum': {
         let next: number | undefined = 0;
@@ -3155,97 +4744,114 @@ class Evaluator {
         // or struct; break/continue belong here, while return/throw/exit escape.
         // https://manual.gamemaker.io/monthly/en/GameMaker_Language/GML_Overview/Language_Features/with.htm
         const target = this.expression(node.expression, state, frame);
-        const counts = target.type.map(
-          (type): 'zero' | 'one' | 'many' | 'never' => {
-            if (type.kind === 'Never') return 'never';
-            if (type.literalValue === -4) return 'zero';
-            if (type.literalValue === -3) return 'many';
-            if (
-              type.literalValue === -1 ||
-              type.literalValue === -2 ||
-              ['Struct', 'Id.Instance'].includes(type.kind)
-            )
-              return 'one';
-            return 'many';
-          },
-        );
-        const maySkip =
-          !counts.length ||
-          counts.some((count) => count === 'zero' || count === 'many');
-        const mayRepeat = !counts.length || counts.includes('many');
-        const canRun =
-          !counts.length ||
-          counts.some((count) => count === 'one' || count === 'many');
-        const annotated =
+        const documentedSelf =
           node.docs?.self && this.knownTypes.get(node.docs.self.content);
-        const legacy = knownConstant(target);
-        const receiver = target.type.find(
-          (type) =>
-            type.literalValue !== -4 &&
-            (type.literalValue !== -3 || !!type.extends) &&
-            ['Struct', 'Id.Instance', 'Asset.GMObject'].includes(type.kind),
-        );
-        const selectedSelf =
-          annotated ||
-          receiver ||
-          (legacy === -1
-            ? frame.self
-            : legacy === -2
-              ? frame.other
-              : undefined) ||
-          this.ensureType(`with:${node.id}`);
+        const annotated =
+          documentedSelf &&
+          (documentedSelf.kind === 'Function'
+            ? documentedSelf.self
+            : documentedSelf);
         const innerScope =
           this.bound.scopes.get(`${node.id}:with`) || frame.scope;
-        const self = this.inputInstanceViews(
-          value(selectedSelf),
-          `receiver:${innerScope.key}`,
-        ).type[0];
-        const inner: Frame = {
-          ...frame,
-          scope: innerScope,
-          self,
-          other: frame.self,
-        };
-        this.dynamicSelf.set(innerScope.selfOwner, self);
+        const alternatives: readonly (Type | undefined)[] = target.type.length
+          ? target.type
+          : [undefined];
+        const branches = alternatives.map((type) => {
+          const count =
+            type?.kind === 'Never'
+              ? 'never'
+              : type?.literalValue === -4
+                ? 'zero'
+                : type?.literalValue === -3
+                  ? 'many'
+                  : type &&
+                      (type.literalValue === -1 ||
+                        type.literalValue === -2 ||
+                        ['Struct', 'Id.Instance'].includes(type.kind))
+                    ? 'one'
+                    : 'many';
+          const receiver =
+            type &&
+            type.literalValue !== -4 &&
+            (type.literalValue !== -3 || !!type.extends) &&
+            ['Struct', 'Id.Instance', 'Asset.GMObject'].includes(type.kind)
+              ? type
+              : undefined;
+          const knownSelf =
+            annotated ||
+            receiver ||
+            (type?.literalValue === -1
+              ? frame.self
+              : type?.literalValue === -2
+                ? frame.other
+                : undefined);
+          const selectedSelf = knownSelf || this.ensureType(`with:${node.id}`);
+          const self = this.inputInstanceViews(
+            value(selectedSelf),
+            `receiver:${innerScope.key}`,
+          ).type[0];
+          return { count, self, querySelf: knownSelf || Type.Any };
+        });
         const entry = copyFlow(state);
-        const results: Completion[] = maySkip ? normal(copyFlow(entry)) : [];
-        if (!canRun) {
-          const unreachable = copyFlow(entry);
-          unreachable.reachable = false;
-          this.execute(node.body, unreachable, inner);
-          return results;
-        }
-        let head = copyFlow(entry);
-        const seen = new Set<string>();
-        for (;;) {
-          const key = flowKey(head);
-          if (seen.has(key)) break;
-          seen.add(key);
-          const body = this.execute(node.body, copyFlow(head), inner);
-          results.push(
-            ...body
-              .filter(
-                (completion) =>
-                  !['normal', 'continue'].includes(completion.kind),
+        const results: Completion[] = branches.some(
+          ({ count }) => count === 'zero' || count === 'many',
+        )
+          ? normal(copyFlow(entry))
+          : [];
+        const runnable = branches.filter(
+          ({ count }) => count === 'one' || count === 'many',
+        );
+        // Keep source queries available for a wholly unreachable body, but a
+        // noone branch does not participate in a reachable body's coverage.
+        const active = runnable.length ? runnable : branches.slice(0, 1);
+        for (const { count, self, querySelf } of active) {
+          const inner: Frame = {
+            ...frame,
+            scope: innerScope,
+            self,
+            other: frame.self,
+            querySelf,
+          };
+          this.dynamicSelf.set(innerScope.selfOwner, self);
+          if (!runnable.length) {
+            const unreachable = copyFlow(entry);
+            unreachable.reachable = false;
+            this.execute(node.body, unreachable, inner);
+            continue;
+          }
+          // Alternative targets are mutually exclusive paths. Only an object
+          // set or unknown target repeats; a struct branch still executes once.
+          let head = copyFlow(entry);
+          // A single target has no back edge and needs no fixed-point snapshot.
+          const history =
+            count === 'many' ? new FlowHistory(node.id) : undefined;
+          for (;;) {
+            if (history?.repeats(head)) break;
+            const body = this.execute(node.body, copyFlow(head), inner);
+            results.push(
+              ...body
+                .filter(
+                  (completion) =>
+                    !['normal', 'continue'].includes(completion.kind),
+                )
+                .map((completion) =>
+                  completion.kind === 'break'
+                    ? { ...completion, kind: 'normal' as const }
+                    : completion,
+                ),
+            );
+            const back = body
+              .filter((completion) =>
+                ['normal', 'continue'].includes(completion.kind),
               )
-              .map((completion) =>
-                completion.kind === 'break'
-                  ? { ...completion, kind: 'normal' as const }
-                  : completion,
-              ),
-          );
-          const back = body
-            .filter((completion) =>
-              ['normal', 'continue'].includes(completion.kind),
-            )
-            .map((completion) => completion.state);
-          if (!back.length) break;
-          const advanced = mergeFlow(back);
-          results.push(...normal(copyFlow(advanced)));
-          if (!mayRepeat) break;
-          const next = mergeFlow([entry, head, advanced]);
-          if (flowKey(next) === key) break;
-          head = next;
+              .map((completion) => completion.state);
+            if (!back.length) break;
+            const advanced = mergeFlow(back);
+            results.push(...normal(copyFlow(advanced)));
+            if (count !== 'many') break;
+            // No semantic work occurs before the next history observation.
+            head = mergeFlow([entry, head, advanced]);
+          }
         }
         return results;
       }
@@ -3316,6 +4922,7 @@ class Evaluator {
           const scope =
             this.bound.scopes.get(`${node.id}:catch`) || frame.scope;
           if (node.catchName) {
+            this.scope(node.catchName, { ...frame, scope });
             const declaration = this.bound.declarationSites.get(
               node.catchName.id,
             );
@@ -3371,11 +4978,9 @@ class Evaluator {
         if (node.loop === 'repeat' && (count === undefined || count <= 0))
           results.push(...normal(copyFlow(entry)));
         let head = copyFlow(entry);
-        const seen = new Set<string>();
+        const history = new FlowHistory(node.id);
         for (;;) {
-          const key = flowKey(head);
-          if (seen.has(key)) break;
-          seen.add(key);
+          if (history.repeats(head)) break;
           const current = copyFlow(head);
           if (node.loop === 'repeat' && count !== undefined && count <= 0) {
             current.reachable = false;
@@ -3441,9 +5046,8 @@ class Evaluator {
             if (count === 1) break;
           }
           if (node.update) this.expression(node.update, advanced, frame);
-          const next = mergeFlow([entry, head, advanced]);
-          if (flowKey(next) === key) break;
-          head = next;
+          // No semantic work occurs before the next history observation.
+          head = mergeFlow([entry, head, advanced]);
         }
         return results;
       }
@@ -3453,7 +5057,13 @@ class Evaluator {
           declaration &&
           (this.nativeDeclarations.get(declaration.id) ||
             this.symbols.get(declaration.key));
-        if (symbol && declaration)
+        if (symbol && declaration) {
+          this.constrainWrite(symbol, node.docs, state);
+          const constraint = state.constraints.get(symbol.key);
+          if (constraint) {
+            state.values.set(symbol.key, value(constraint.type));
+            symbol.item.setType(join(symbol.item.type, constraint.type));
+          }
           this.record(
             {
               ...node,
@@ -3465,25 +5075,6 @@ class Evaluator {
             'declaration',
             !symbol.item.native,
           );
-        for (const range of node.docs.typeRanges) {
-          const type = this.knownTypes.get(range.content);
-          if (type?.signifier) {
-            const origin = this.bound.syntax.input.origin(
-              range.start.offset,
-              range.end.offset,
-            );
-            const source = {
-              ...node,
-              id: `${node.id}:${range.start.offset}`,
-              origin,
-            };
-            this.record(
-              source,
-              { key: this.keyOf(type.signifier), item: type.signifier },
-              value(type),
-              'type',
-            );
-          }
         }
         return normal(state);
       }

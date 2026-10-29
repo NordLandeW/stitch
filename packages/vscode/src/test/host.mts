@@ -129,7 +129,8 @@ async function compileSubjects(
     export { Code } from ${JSON.stringify(parserSource('project.code.ts'))};
     export { Asset, isAssetOfKind } from ${JSON.stringify(parserSource('project.asset.ts'))};
     export { Reference, planReferenceRename } from ${JSON.stringify(parserSource('project.location.ts'))};
-    export { primitiveNames } from ${JSON.stringify(parserSource('types.primitives.ts'))};`,
+    export { primitiveNames } from ${JSON.stringify(parserSource('types.primitives.ts'))};
+    export { renamedPath } from ${JSON.stringify(parserSource('project.edits.ts'))};`,
   );
   if (realAdapters)
     for (const module of [
@@ -141,6 +142,7 @@ async function compileSubjects(
       'extension.typeDefs',
       'extension.completions',
       'extension.symbols',
+      'extension.copyType',
     ])
       stubs.delete(module);
   if (realTrees) {
@@ -206,6 +208,7 @@ async function compileSubjects(
       export { StitchCompletionProvider } from ${JSON.stringify(source('extension.completions.mts'))};
       export { StitchWorkspaceSymbolProvider } from ${JSON.stringify(source('extension.symbols.mts'))};
       export { GameMakerSemanticTokenProvider, semanticTokensLegend } from ${JSON.stringify(source('extension.highlighting.mts'))};
+      export { createCopyAsTypeCallback, createCopyAsJsdocTypeCallback, createCopyAsJsdocSelfCallback } from ${JSON.stringify(source('extension.copyType.mts'))};
     `
         : ''
     }
@@ -334,6 +337,9 @@ class Position {
     readonly line: number,
     readonly character: number,
   ) {}
+  isEqual(other: Position) {
+    return this.line === other.line && this.character === other.character;
+  }
   translate(lineDelta = 0, characterDelta = 0) {
     return new Position(this.line + lineDelta, this.character + characterDelta);
   }
@@ -681,9 +687,35 @@ export async function createHost(
       Constant: 13,
       EnumMember: 21,
     },
+    SignatureInformation: class {
+      parameters: unknown[] = [];
+      activeParameter?: number;
+      constructor(
+        public label: string,
+        public documentation?: string,
+      ) {}
+    },
+    ParameterInformation: class {
+      constructor(
+        public label: string,
+        public documentation?: string,
+      ) {}
+    },
+    SignatureHelp: class {
+      signatures: unknown[] = [];
+      activeSignature = 0;
+      activeParameter = 0;
+    },
     ExtensionMode: { Development: 2, Production: 1 },
     DiagnosticSeverity: { Error: 0, Warning: 1, Information: 2 },
     ProgressLocation: { Notification: 15 },
+    env: {
+      clipboard: {
+        writeText: async (text: string) => {
+          logs.push(['clipboard', text]);
+        },
+      },
+    },
     workspace: {
       textDocuments: documents,
       workspaceFolders: undefined,
@@ -758,6 +790,9 @@ export async function createHost(
       ) => task({ report() {} }),
       showErrorMessage: async (message: unknown) => {
         logs.push(['message', message]);
+      },
+      showInformationMessage: async (message: unknown) => {
+        logs.push(['information', message]);
       },
     },
     languages: {

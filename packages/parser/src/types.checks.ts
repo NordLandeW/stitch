@@ -265,6 +265,8 @@ export function updateGenericsMap(
   knownTypes: KnownTypesMap,
   /** Map of generics by name to their *inferred type* */
   generics: Map<string, TypeStore> = new Map(),
+  /** Observe item values consulted while inferring dependent results. */
+  onItems?: (container: Type) => void,
 ) {
   const frame = (left: Typeable, right: Typeable) => ({
     expected: getTypes(left).flatMap(
@@ -304,8 +306,13 @@ export function updateGenericsMap(
     if (!narrowsType(inferredType, expectedType)) continue;
     if (generic) generic.addType(inferredType);
     // Resume the parent after its child, preserving generic alternative order.
-    if (inferredType.items?.hasTypes && expectedType.items?.hasTypes)
-      pending.push(frame(expectedType.items, inferredType.items));
+    if (expectedType.items?.hasTypes) {
+      onItems?.(inferredType);
+      // An observed empty item store is inference-bottom, not an unbound
+      // generic. Preserve it so dependent results can grow with later inputs.
+      if (inferredType.items)
+        pending.push(frame(expectedType.items, inferredType.items));
+    }
   }
   return generics;
 }

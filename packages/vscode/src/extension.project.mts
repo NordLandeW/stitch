@@ -168,7 +168,17 @@ export class GameMakerProject extends Project {
       this,
     );
     const config = options?.config || this.defaultAnalysisConfiguration;
-    await this.setAnalysisConfiguration(config);
+    try {
+      await this.setAnalysisConfiguration(config);
+    } catch (error) {
+      // Invalid target selection still rejects the command. An internal language
+      // failure is already published and must not disable the external compiler.
+      if (error !== this.analysis.error) throw error;
+      logger.error(
+        'Language analysis failed; continuing the requested GameMaker command.',
+        error,
+      );
+    }
     let compiler = options?.compiler ?? stitchConfig.runCompilerDefault;
     if (['yyc', 'vm'].indexOf(compiler) === -1) {
       compiler = stitchConfig.runCompilerDefault;

@@ -92,6 +92,29 @@ describe('Project', function () {
     await Project.fallbackGmlSpecPath.exists({ assert: true });
   });
 
+  it('explicit diagnostic refresh republishes a current view without duplicating analysis publication', async function () {
+    const project = await Project.initialize('samples/project');
+    const file = project.getAssetByName('Script1')!.gmlFile;
+    const other = project.getAssetByName('Recovery')!.gmlFile;
+    const observed: unknown[][] = [];
+    const unsubscribe = project.onDiagnostics((event) => {
+      if (event.code === file) observed.push(event.diagnostics);
+    });
+    try {
+      for (const changed of [undefined, file, other]) {
+        if (changed) changed.content += '\n// refresh diagnostic compatibility';
+        observed.length = 0;
+        const returned = file.updateDiagnostics();
+        expect(observed).to.have.lengthOf(1);
+        expect(observed[0]).to.deep.equal(returned);
+        expect(project.analysis.isCurrent).to.equal(true);
+      }
+    } finally {
+      unsubscribe();
+      project.dispose();
+    }
+  });
+
   for (const readsFirst of [false, true]) {
     it(`preserves derived member definitions with base reads ${readsFirst ? 'before' : 'after'} constructors`, async function () {
       const project = await Project.initialize('samples/project');
@@ -639,19 +662,23 @@ function BaseSettings() constructor { ${baseDefines ? 'sharedValue' : 'baseValue
       code + `\n\nfunction Tmp () constructor {ab}`,
       { reloadDirty: true },
     );
-    // A should no longer exist!
-    assert(complexScriptFile.refs.find((r) => r.item.name === 'ab'));
+    // Retain the current unresolved spelling for navigation and diagnostics,
+    // without turning an unfinished read into a declared constructor member.
+    const unresolved = complexScriptFile.refs.find((r) => r.item.name === 'ab');
+    assert(unresolved);
     assert(!complexScriptFile.refs.find((r) => r.item.name === 'a'));
-    assert(
-      complexScriptFile.refs
-        .find((r) => r.item.name === 'Tmp')!
-        .item.type.type[0].self!.getMember('ab'),
-    );
-    assert(
-      !complexScriptFile.refs
-        .find((r) => r.item.name === 'Tmp')!
-        .item.type.type[0].self!.getMember('a'),
-    );
+    const receiver = complexScriptFile.refs.find((r) => r.item.name === 'Tmp')!
+      .item.type.type[0].self!;
+    expect(receiver.getMember('ab')).to.equal(undefined);
+    expect(receiver.getMember('a')).to.equal(undefined);
+    expect(
+      complexScriptFile
+        .getDiagnostics()
+        .UNDECLARED_VARIABLE_REFERENCE.some(
+          (diagnostic) =>
+            diagnostic.location.start.offset === unresolved.start.offset,
+        ),
+    ).to.equal(true);
   });
 
   it('can sync datafiles', async function () {
@@ -1111,7 +1138,13 @@ function validateBschemaConstructor(project: Project) {
   const roles = bschemaStructType.getMember('roles')!;
   expect(roles.type.kind).to.equal('Struct');
   expect(roles.type.items[0]).to.exist;
-  expect(roles.type.items[0].kind).to.equal('Struct');
-  ok(roles.type.items[0].type[0] === bschemaRoleType);
+  for (const alternative of roles.type.items[0].type) {
+    expect(alternative.kind).to.equal('Struct');
+    expect(alternative.name).to.equal(bschemaRoleType.name);
+    // Instances keep independent storage, but navigation retains the declaration.
+    expect(alternative.signifier).to.equal(bschemaRoleType.signifier);
+    for (const member of bschemaRoleType.listMembers(true))
+      expect(alternative.getMember(member.name), member.name).to.exist;
+  }
   //#endregion Bschema.roles
 }

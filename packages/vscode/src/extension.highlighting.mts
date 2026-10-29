@@ -78,7 +78,16 @@ export class GameMakerSemanticTokenProvider
       const cached = this.cache.get(file);
       if (cached?.key === key) return cached.tokens;
       const builder = new vscode.SemanticTokensBuilder(semanticTokensLegend);
-      const emitted = new Set<string>();
+      const emitted = new Map<
+        string,
+        {
+          range: vscode.Range;
+          role: Reference['role'];
+          types: Set<SemanticTokenType>;
+          instance: boolean;
+          modifiers: Set<SemanticTokenModifier>;
+        }
+      >();
       const references = [
         ...file.refs,
         ...file.project.analysis.spellingReferences(file.path.absolute),
@@ -105,8 +114,14 @@ export class GameMakerSemanticTokenProvider
         )
           continue;
         const span = `${source.start.offset}:${source.end.offset}`;
-        if (emitted.has(span)) continue;
-        emitted.add(span);
+        const previous = emitted.get(span);
+        // Keep the existing physical-role priority for macro anchors and
+        // shorthand values; combine alternative bindings of that same role.
+        if (
+          previous &&
+          (previous.role !== ref.role || previous.types.has('macro'))
+        )
+          continue;
         let type = inferSemanticToken(ref);
         if (type === 'variable' && signifier.instance) type = 'property';
         const modifiers = inferSemanticModifiers(ref);
@@ -118,7 +133,32 @@ export class GameMakerSemanticTokenProvider
           )
         )
           modifiers.add('asset');
-        builder.push(range, type, [...modifiers]);
+        if (previous) {
+          previous.types.add(type);
+          previous.instance &&= !!signifier.instance;
+          for (const modifier of previous.modifiers)
+            if (!modifiers.has(modifier)) previous.modifiers.delete(modifier);
+        } else {
+          emitted.set(span, {
+            range,
+            role: ref.role,
+            types: new Set([type]),
+            instance: !!signifier.instance,
+            modifiers,
+          });
+        }
+      }
+      for (const entry of emitted.values()) {
+        const types = [...entry.types];
+        const type =
+          types.length === 1
+            ? types[0]
+            : types.every((type) => type === 'function' || type === 'class')
+              ? 'function'
+              : entry.instance
+                ? 'property'
+                : 'variable';
+        builder.push(entry.range, type, [...entry.modifiers]);
       }
       const tokens = builder.build();
       this.cache.set(file, { key, tokens });
@@ -141,9 +181,13 @@ export class GameMakerSemanticTokenProvider
 
 function inferSemanticToken(ref: Reference): SemanticTokenType {
   const signifier = ref.item;
-  const functionType = (ref.evaluatedType || signifier.type).type.find(
-    (type) => type.kind === 'Function',
-  );
+  // Type annotations name the declaration, not a runtime instance value.
+  // Ordinary expressions still use their point-specific evaluated type.
+  const type =
+    ref.role === 'type' ? signifier.type : ref.evaluatedType || signifier.type;
+  const functions = type.type.filter((type) => type.kind === 'Function');
+  const callable =
+    functions.length > 0 && functions.length === type.type.length;
 
   if (signifier.enum) {
     return 'enum';
@@ -151,10 +195,10 @@ function inferSemanticToken(ref: Reference): SemanticTokenType {
   if (signifier.enumMember) {
     return 'enumMember';
   }
-  if (functionType?.isConstructor) {
+  if (callable && functions.every((type) => type.isConstructor)) {
     return 'class';
   }
-  if (functionType) {
+  if (callable) {
     return 'function';
   }
   if (signifier.macro) {
