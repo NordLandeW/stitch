@@ -38,24 +38,20 @@ async function uriToType(provider: StitchWorkspace, file: vscode.Uri) {
   const document = vscode.workspace.textDocuments.find(
     (doc) => doc.uri.toString() === file.toString(),
   );
-  const editor = vscode.window.activeTextEditor;
-  const position = editor?.selection.active;
-  if (!document || !editor || editor.document !== document || !position) return;
-  const code = await provider.ensureDocumentCurrent(document);
+  const position = vscode.window.activeTextEditor?.selection.active;
   if (
-    !code ||
-    vscode.window.activeTextEditor !== editor ||
-    !editor.selection.active.isEqual(position)
+    !document ||
+    !position ||
+    !(await provider.ensureDocumentCurrent(document))
   )
     return;
-  const ref = code.getReferenceAt(document.offsetAt(position));
+  const ref = provider.getReference(file, position);
   if (!ref) {
     return;
   }
-  const type = ref.evaluatedType || ref.item.type;
-  const isConstructor = type.constructs.length > 0;
+  const isConstructor = ref.item.type.constructs.length > 0;
   if (isConstructor) {
     return `Struct.${ref.item.name}`;
   }
-  return type.toFeatherString();
+  return ref.item.type.toFeatherString();
 }

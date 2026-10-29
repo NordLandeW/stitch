@@ -1,12 +1,4 @@
 import { Pathy, pathy } from '@bscotch/pathy';
-import { readdir } from 'node:fs/promises';
-import { pathExists } from './project.edits.js';
-import {
-  resourceSources,
-  roomInstanceLayers,
-  type GmlSourceContext,
-  type ResourceSource,
-} from './project.sources.js';
 import { sequential } from '@bscotch/utility';
 import {
   Yy,
@@ -16,6 +8,7 @@ import {
   YyResourceType,
   YyRoom,
   YyRoomInstanceLayer,
+  YySchemas,
   YySound,
   YySprite,
   YypResource,
@@ -54,19 +47,14 @@ export class Asset<T extends YyResourceType = YyResourceType> {
   readonly $tag = 'Asset';
   readonly assetKind: T;
   readonly gmlFiles: Map<string, Code> = new Map();
-  /** Undefined until metadata discovery; explicit Code-only hosts own their registration. */
-  sourceCandidates?: readonly ResourceSource[];
-  sourcePaths: readonly Pathy[] = [];
   yy!: YyData<T>;
-  yyPath: Pathy<YyData<T>>;
+  readonly yyPath: Pathy<YySchemas[T]>;
   readonly signifier: Signifier;
   /** For objects, their instance type. */
   instanceType: Type<'Id.Instance'> | undefined;
   assetType: Type<Asset['assetTypeKind']>;
   variables: StructType | undefined;
   nativeVariables: StructType | undefined;
-  readonly extensionSymbols = new Map<string, Signifier>();
-  readonly extensionTypes = new Map<string, Type>();
 
   /** For objects, their parent */
   protected _parent: Asset<'objects'> | undefined = undefined;
@@ -83,9 +71,7 @@ export class Asset<T extends YyResourceType = YyResourceType> {
   ) {
     assert(yyPath, 'Must provide a YY path');
     this.assetKind = resource.id.path.split(/[/\\]/)[0] as T;
-    this.yyPath = yyPath.withValidator(yySchemas[this.assetKind]) as Pathy<
-      YyData<T>
-    >;
+    this.yyPath = yyPath.withValidator(yySchemas[this.assetKind]) as any;
 
     // Create the symbol
     this.signifier = new Signifier(this.project.self, this.name);
@@ -98,9 +84,24 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     this.signifier.setType(this.assetType);
     this.assetType.signifier = this.signifier;
 
+    // Add this asset to the project lookup, unless it is a script.
+    if (!['scripts', 'extensions'].includes(this.assetKind)) {
+      this.project.self.addMember(this.signifier);
+      if (this.assetType.kind !== 'Any') {
+        this.project.types.set(this.typeName, this.assetType);
+      }
+    }
+
     // If this is an object, also create the instance type
     if (this.assetKind === 'objects') {
-      this.refreshNativeVariables();
+      this.nativeVariables = Type.Struct;
+      // Create the base struct-type to store all of the variables.
+      for (const member of this.project.native.objectInstanceBase.listMembers()) {
+        if (member.name === 'id') continue; // This is added later
+        const copy = member.copy();
+        copy.override = true; // Guarantee we keep this as a copy
+        this.nativeVariables.addMember(copy);
+      }
 
       this.variables = new Type('Struct');
       this.variables.extends = this.nativeVariables;
@@ -119,20 +120,9 @@ export class Asset<T extends YyResourceType = YyResourceType> {
       id.override = true; // We are guaranteeing that we're using
 
       this.variables.addMember(id)!;
-    }
-  }
 
-  /** Refresh schema-owned instance members without retaining user contributions. */
-  refreshNativeVariables(): void {
-    if (!this.isObject) return;
-    const native = new Type('Struct');
-    for (const member of this.project.native.objectInstanceBase.listMembers()) {
-      if (member.name === 'id') continue;
-      const copy = member.copy();
-      copy.override = true;
-      native.addMember(copy);
+      this.project.types.set(this.instanceTypeName, this.instanceType);
     }
-    this.nativeVariables = native;
   }
 
   get typeName() {
@@ -208,7 +198,7 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     const yy = this.yy as YyObject;
     yy.spriteId = sprite ? sprite.resource.id : null;
     // Fire off async to avoid blocking
-    void this.saveYy().catch((error) => logger.error(error));
+    void this.saveYy();
   }
 
   get children(): Asset<'objects'>[] {
@@ -231,10 +221,15 @@ export class Asset<T extends YyResourceType = YyResourceType> {
       // No change!
       return;
     }
-    if (parent === this || parent?.parents.includes(this as Asset<'objects'>))
-      throw new Error('Object inheritance cannot contain a cycle');
     this._parent = parent;
-    this.project.analysis.invalidate();
+    if (parent) {
+      // The instanceType parent is a struct that holds all of this
+      // object's instance variables. We need to set ITS parent to
+      // the parent's instanceType.
+      this.variables!.extends = parent.variables;
+    } else {
+      this.variables!.extends = this.nativeVariables;
+    }
     // Do we need to change the yy file?
     const yy = this.yy as YyObject;
     const parentFromYy = this.project.getAssetByName(yy.parentObjectId?.name);
@@ -246,9 +241,9 @@ export class Asset<T extends YyResourceType = YyResourceType> {
       } else {
         yy.parentObjectId = parent.resource.id;
       }
-      void this.saveYy()
-        .then(() => this.project.analysis.analyze())
-        .catch((error) => logger.error(error));
+      // TODO: Maybe reprocess?
+      this.updateDiagnostics();
+      void this.saveYy();
     }
   }
 
@@ -257,15 +252,10 @@ export class Asset<T extends YyResourceType = YyResourceType> {
    * and most-distant last
    */
   get parents(): Asset<'objects'>[] {
-    const parents: Asset<'objects'>[] = [];
-    const seen = new Set<Asset>([this]);
-    for (let parent = this.parent; parent; parent = parent.parent) {
-      if (seen.has(parent))
-        throw new Error('Object inheritance contains a cycle');
-      seen.add(parent);
-      parents.push(parent);
+    if (!this.parent) {
+      return [];
     }
-    return parents;
+    return [this.parent, ...this.parent.parents];
   }
 
   /**
@@ -308,7 +298,10 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     const instances = new Map<string, Asset<'objects'>>();
     // Loop through each instance layer's instances to get IDs and objects
     const yy = this.yy as YyRoom;
-    for (const layer of roomInstanceLayers(yy.layers)) {
+    for (const layer of (yy as YyRoom).layers) {
+      if (layer.resourceType !== 'GMRInstanceLayer') {
+        continue;
+      }
       for (const instance of (layer as YyRoomInstanceLayer).instances || []) {
         const obj = this.project.getAssetByName(instance.objectId.name);
         if (isAssetOfKind(obj, 'objects')) {
@@ -372,7 +365,10 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     assert(this.isRoom, 'Can only rename object instances in rooms'); // Iterate through each instance layer and remove any instances with the given ID
     const yy = this.yy as YyRoom;
     let didUpdate = false;
-    for (const layer of roomInstanceLayers(yy.layers)) {
+    for (const layer of yy.layers) {
+      if (layer.resourceType !== 'GMRInstanceLayer') {
+        continue;
+      }
       layer.instances.forEach((instance) => {
         if (
           instance.objectId.name.toLowerCase() === oldObjectName.toLowerCase()
@@ -393,7 +389,10 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     assert(this.isRoom, 'Can only add object instances to rooms');
     const yy = this.yy as YyRoom;
     // Iterate through each instance layer and remove any instances with the given ID
-    for (const layer of roomInstanceLayers(yy.layers)) {
+    for (const layer of yy.layers) {
+      if (layer.resourceType !== 'GMRInstanceLayer') {
+        continue;
+      }
       layer.instances = (layer.instances || []).filter(
         (x) => x.name !== instanceId,
       );
@@ -403,7 +402,6 @@ export class Asset<T extends YyResourceType = YyResourceType> {
       (x) => x.name !== instanceId,
     );
     await this.saveYy();
-    await this.project.reloadResource(this.yyPath);
   }
 
   @sequential
@@ -621,33 +619,15 @@ export class Asset<T extends YyResourceType = YyResourceType> {
   }
 
   async readYy(): Promise<YyData<T>> {
-    const resolved = await Asset.resolveYyPath(this.project, this.resource);
-    if (!resolved)
-      throw Object.assign(
-        new Error(`Listed resource file is missing: ${this.resource.id.path}`),
-        { code: 'ENOENT' },
-      );
-    if (resolved.absolute !== this.yyPath.absolute) {
-      this.project.clearResourceDiagnostics(this.yyPath.absolute);
-      this.yyPath = resolved.withValidator(yySchemas[this.assetKind]) as Pathy<
-        YyData<T>
-      >;
+    let asPath: Pathy | undefined = pathy(this.yyPath);
+    if (!(await asPath.exists())) {
+      const filePattern = new RegExp(`${this.name}\\.yy$`, 'i');
+      const paths = await pathy(this.dir).listChildren();
+      asPath = paths.find((x) => filePattern.test(x.basename));
     }
-    try {
-      this.yy = Yy.parse(
-        await this.project.readDocumentText(resolved),
-        this.assetKind,
-      );
-      this.project.setResourceDiagnostics(this.yyPath.absolute, 'metadata', []);
-      return this.yy;
-    } catch (error) {
-      this.project.setResourceDiagnostics(this.yyPath.absolute, 'metadata', [
-        Asset.resourceDiagnostic(
-          `Cannot read resource ${this.resource.id.path}: ${error instanceof Error ? error.message : error}`,
-        ),
-      ]);
-      throw error;
-    }
+    ok(asPath, `Could not find a .yy file for ${this.name}`);
+    this.yy = await Yy.read(asPath.absolute, this.assetKind);
+    return this.yy;
   }
 
   get dir() {
@@ -674,60 +654,50 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     return this.gmlFiles.get(path.absolute.toLocaleLowerCase());
   }
 
-  /** Reconcile model metadata without writing YY or mutating the public type graph. */
-  refreshParent(): void {
-    if (!this.isObject) return;
-    const yy = this.yy as YyObject;
-    const parent = this.project.getAssetByName(yy.parentObjectId?.name);
-    const seen = new Set<Asset>([this]);
-    let invalid: string | undefined;
-    for (
-      let current = parent;
-      current;
-      current = this.project.getAssetByName(
-        (current.yy as YyObject).parentObjectId?.name,
-      )
-    ) {
-      if (seen.has(current)) {
-        invalid = 'Object inheritance contains a cycle.';
-        break;
-      }
-      seen.add(current);
-      if (!current.isObject) {
-        invalid = 'The parent resource must be an object.';
-        break;
-      }
+  protected updateParent() {
+    if (this.assetKind !== 'objects') {
+      return;
     }
-    if (yy.parentObjectId && !parent)
-      invalid = `Parent object ${yy.parentObjectId.name} is unavailable.`;
-    this._parent =
-      !invalid && parent?.isObject ? (parent as Asset<'objects'>) : undefined;
-    this.project.setResourceDiagnostics(
-      this.yyPath.absolute,
-      'parent',
-      invalid
-        ? [
-            new Diagnostic(
-              invalid,
-              {
-                start: { line: 1, column: 1, offset: 0 },
-                end: { line: 1, column: 1, offset: 0 },
-              },
-              'error',
-            ),
-          ]
-        : [],
-    );
+    const yy = this.yy as YyObject;
+    if (!yy.parentObjectId) {
+      return;
+    }
+    const parent = this.project.getAssetByName(yy.parentObjectId.name);
+    if (!parent || parent.assetKind !== 'objects') {
+      // TODO: Add diagnostic if parent missing
+      return;
+    }
+    // Set the parent
+    this.parent = parent as Asset<'objects'>;
   }
 
-  /** @deprecated Use Project.analysis.analyze() for the complete dependency closure. */
-  updateGlobals(_initial = false) {
-    this.refreshParent();
-    this.project.analysis.analyzeSync();
+  updateGlobals(initial = false) {
+    this.updateParent();
+    // Ensure parent is updated first
+    if (initial && !this.initalized.globals && this.parent) {
+      this.parent.updateGlobals(initial);
+    } else if (initial && this.initalized.globals) {
+      // Already initialized by a child
+      return;
+    }
+    for (const gml of this.gmlFilesArray) {
+      gml.updateGlobals();
+    }
+    this.initalized.globals = true;
   }
-  /** @deprecated Use Project.analysis.analyze(). */
-  updateAllSymbols(_initial = false) {
-    this.project.analysis.analyzeSync();
+
+  updateAllSymbols(initial = false) {
+    // Ensure parent is updated first
+    if (initial && !this.initalized.locals && this.parent) {
+      this.parent.updateAllSymbols(initial);
+    } else if (initial && this.initalized.locals) {
+      // Already initialized by a child
+      return;
+    }
+    for (const gml of this.gmlFilesArray) {
+      gml.updateAllSymbols();
+    }
+    this.initalized.locals = true;
   }
 
   updateDiagnostics() {
@@ -736,44 +706,28 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     }
   }
 
-  protected addGmlFile(path: Pathy<string>, context?: GmlSourceContext): Code {
-    const existing = this.getGmlFile(path);
-    if (
-      existing &&
-      (existing.path.absolute !== path.absolute ||
-        existing.analysisState.status === 'retired')
-    ) {
-      this.project.analysis.retire(existing);
-      this.gmlFiles.delete(path.absolute.toLocaleLowerCase());
-    }
-    const gml = this.getGmlFile(path) || new Code(this, path);
-    if (context) gml.setSourceContext(context);
+  protected addGmlFile(path: Pathy<string>): Code {
+    const gml =
+      this.getGmlFile(path) ||
+      new Code(this as Asset<'scripts' | 'objects'>, path);
     assert(path, 'Cannot add GML file, path does not exist');
     this.gmlFiles.set(path.absolute.toLocaleLowerCase(), gml);
     return gml;
   }
 
-  async reload(analyze = true): Promise<void> {
-    if (analyze) return this.project.reloadResource(this.yyPath);
-    try {
-      await this.readYy();
-    } catch (error) {
-      if (!Asset.isMissing(error)) throw error;
-      if (this.project.getAssetByName(this.name) === this)
-        this.project.assets.delete(this.name.toLocaleLowerCase());
-      this.retireModel();
-      this.project.setResourceDiagnostics(this.yyPath.absolute, 'metadata', [
-        Asset.resourceDiagnostic(
-          `Listed resource file is missing: ${this.resource.id.path}`,
-        ),
-      ]);
-      return;
-    }
-    if (this.assetKind === 'extensions') {
-      this.extensionSymbols.clear();
-      this.extensionTypes.clear();
-      const extensionSelf = new Type('Struct');
-      extensionSelf.semanticKey = 'global';
+  async reload() {
+    // Find all immediate children, which might include legacy GML files
+
+    const [, children] = await Promise.all([
+      await this.readYy(),
+      this.dir.listChildren(),
+    ]);
+    if (this.assetKind === 'scripts') {
+      this.addScriptFile(children as Pathy<string>[]);
+    } else if (this.assetKind === 'objects') {
+      this.gmlFiles.clear();
+      this.addObjectFile(children as Pathy<string>[]);
+    } else if (this.assetKind === 'extensions') {
       const diagnostics: Diagnostic[] = [];
 
       // Load constants and functions from the extension
@@ -784,6 +738,12 @@ export class Asset<T extends YyResourceType = YyResourceType> {
       const yy = this.yy as YyExtension;
       for (const file of yy.files) {
         for (const constant of file.constants) {
+          if (constant.hidden) {
+            continue;
+          }
+          if (this.project.self.getMember(constant.name)) {
+            continue;
+          }
           try {
             // Get the type by parsing the value. For now we'll just check for number or string, else "Any".
             const type = constant.value.startsWith('"')
@@ -792,25 +752,23 @@ export class Asset<T extends YyResourceType = YyResourceType> {
                 ? 'Real'
                 : 'Any';
             const signifier = new Signifier(
-              extensionSelf,
+              this.project.self,
               constant.name,
               new Type(type),
             );
             signifier.macro = true;
-            signifier.hidden = constant.hidden;
-            signifier.native = this.name;
             signifier.global = true;
             signifier.writable = false;
             signifier.def = {};
 
-            this.extensionSymbols.set(signifier.name, signifier);
+            this.project.self.addMember(signifier);
           } catch (err) {
             diagnostics.push(
               new Diagnostic(
                 `Error loading extension constant: ${constant.name}`,
                 {
-                  start: { line: 1, column: 1, offset: 0 },
-                  end: { line: 1, column: 1, offset: 0 },
+                  start: { line: 0, column: 0, offset: 0 },
+                  end: { line: 0, column: 0, offset: 0 },
                 },
                 'error',
                 err,
@@ -819,38 +777,29 @@ export class Asset<T extends YyResourceType = YyResourceType> {
           }
         }
         for (const func of file.functions) {
+          if (func.hidden) {
+            continue;
+          }
+          if (this.project.self.getMember(func.externalName)) {
+            continue;
+          }
           try {
             const type = new Type('Function')
-              .named(func.name)
+              .named(func.externalName)
               .describe(func.help);
             type.setReturnType(new Type(typeIndexToName(func.returnType)));
-            // Typed parameter entries remain authoritative even when legacy
-            // metadata leaves argCount at its default zero. A positive count
-            // can supply additional slots whose types were not serialized.
-            const argumentCount = Math.max(func.args.length, func.argCount);
-            for (let i = 0; i < argumentCount; i++) {
+            for (let i = 0; i < func.args.length; i++) {
               const typeIdx = func.args[i];
               type.addParameter(i, `argument${i}`, {
-                type:
-                  typeIdx === undefined
-                    ? Type.Any
-                    : new Type(typeIndexToName(typeIdx)),
+                type: new Type(typeIndexToName(typeIdx)),
               });
             }
-            if (func.argCount < 0)
-              type.addParameter(func.args.length, '...', {
-                type: Type.Any,
-                optional: true,
-              });
-            type.callKind = 'native';
-            const signifier = new Signifier(extensionSelf, func.name, type);
-            signifier.hidden = func.hidden;
-            signifier.native = this.name;
+            const signifier = new Signifier(this.project.self, func.name, type);
             signifier.global = true;
             signifier.writable = false;
             signifier.def = {};
-            this.extensionSymbols.set(signifier.name, signifier);
-            this.extensionTypes.set(`Function.${func.name}`, type);
+            this.project.self.addMember(signifier);
+            this.project.types.set(`Function.${func.externalName}`, type);
           } catch (err) {
             diagnostics.push(
               new Diagnostic(
@@ -867,59 +816,62 @@ export class Asset<T extends YyResourceType = YyResourceType> {
         }
       }
 
-      this.project.setResourceDiagnostics(
-        this.yyPath.absolute,
-        'extension',
-        diagnostics,
-      );
+      this.project.emitDiagnostics(this.yyPath.absolute, diagnostics);
     }
-    const selected = await resourceSources(this);
-    this.project.setResourceDiagnostics(
-      this.yyPath.absolute,
-      'files',
-      selected.diagnostics,
-    );
-    this.sourceCandidates = selected.sources;
-    this.sourcePaths = selected.paths;
-    await this.reconcileGmlSources(selected.sources, true);
-  }
-
-  /** Project ownership reconciliation can retire and restore contexts without disk edits. */
-  async reconcileGmlSources(
-    sources: readonly ResourceSource[],
-    reread = false,
-  ): Promise<void> {
-    const wanted = new Set(
-      sources.map((source) => source.path.absolute.toLocaleLowerCase()),
-    );
-    for (const [key, code] of this.gmlFiles) {
-      if (!wanted.has(key)) {
-        this.gmlFiles.delete(key);
-        this.project.analysis.retire(code);
-      }
-    }
-    for (const source of sources) {
-      const previous = this.getGmlFile(source.path);
-      const code = this.addGmlFile(source.path, source.context);
-      if (reread || code !== previous) await code.readContent();
-    }
-  }
-
-  /** Model-only retirement; watcher reconciliation must never delete user files. */
-  retireModel(): void {
-    for (const code of this.gmlFiles.values())
-      this.project.analysis.retire(code);
-    this.gmlFiles.clear();
-    this.extensionSymbols.clear();
-    this.extensionTypes.clear();
-    this.project.analysis.invalidate();
-    this.project.clearResourceDiagnostics(this.yyPath.absolute);
+    await this.initiallyReadAndParseGml();
   }
 
   async onRemove() {
-    this.retireModel();
+    await Promise.all(this.gmlFilesArray.map((gml) => gml.remove()));
+    // Remove this signifier and any global types from the project
+    this.project.self.removeMember(this.signifier.name);
+    for (const typeName of [this.typeName, this.instanceTypeName]) {
+      const type = this.project.types.get(typeName);
+      if (type) {
+        this.project.types.delete(this.typeName);
+        // Try to get any refereneces using this type updated
+        for (const ref of type.signifier?.refs || []) {
+          ref.file.dirty = true;
+        }
+      }
+    }
+    // Remove the associated files
     await this.dir.delete({ force: true, recursive: true });
-    await this.project.analysis.analyze();
+  }
+
+  protected addObjectFile(children: Pathy<string>[]) {
+    // Objects have one file per event, named after the event.
+    // The YY file includes the list of events, but references them by
+    // numeric identifiers instead of their name. For now we'll just
+    // assume that the GML files are correct.
+    children
+      .filter((p) => p.hasExtension('gml'))
+      .forEach((p) => this.addGmlFile(p));
+  }
+
+  protected addScriptFile(children: Pathy<string>[]) {
+    // Scripts should have exactly one GML file, which is the script itself,
+    // named the same as the script (though there could be casing variations)
+    const matches = children.filter(
+      (p) =>
+        p.basename.toLocaleLowerCase() ===
+        `${this.name?.toLocaleLowerCase?.()}.gml`,
+    );
+    if (matches.length !== 1) {
+      logger.error(
+        `Script ${this.name} has ${matches.length} GML files. Expected 1.`,
+      );
+    } else {
+      this.addGmlFile(matches[0]);
+    }
+  }
+
+  protected async initiallyReadAndParseGml() {
+    const parseWaits: Promise<any>[] = [];
+    for (const file of this.gmlFilesArray) {
+      parseWaits.push(file.parse());
+    }
+    return await Promise.all(parseWaits);
   }
 
   get assetTypeKind() {
@@ -947,86 +899,35 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     }
   }
 
-  private static isMissing(error: unknown): boolean {
-    return ['ENOENT', 'ENOTDIR'].includes(
-      (error as NodeJS.ErrnoException)?.code || '',
-    );
-  }
-
-  private static resourceDiagnostic(message: string): Diagnostic {
-    const location = { line: 1, column: 1, offset: 0 };
-    return new Diagnostic(message, { start: location, end: location }, 'error');
-  }
-
-  private static async children(dir: Pathy): Promise<Pathy[]> {
-    try {
-      return (await readdir(dir.absolute, { withFileTypes: true }))
-        .filter((entry) => entry.isFile() || entry.isSymbolicLink())
-        .map((entry) => dir.join(entry.name));
-    } catch (error) {
-      if (Asset.isMissing(error)) return [];
-      throw error;
-    }
-  }
-
-  private static async resolveYyPath(
-    project: Project,
-    resource: YypResource,
-  ): Promise<Pathy | undefined> {
-    const expected = project.dir.join(resource.id.path);
-    if (
-      typeof project.options?.documentText?.(expected.absolute) === 'string' ||
-      (await pathExists(expected.absolute))
-    )
-      return expected;
-    let directories;
-    try {
-      directories = await readdir(expected.up(2).absolute, {
-        withFileTypes: true,
-      });
-    } catch (error) {
-      if (Asset.isMissing(error)) return;
-      throw error;
-    }
-    const matches = directories.filter(
-      (entry) =>
-        entry.isDirectory() &&
-        entry.name.toLocaleLowerCase() === resource.id.name.toLocaleLowerCase(),
-    );
-    if (matches.length !== 1) return;
-    const children = await Asset.children(expected.up(2).join(matches[0].name));
-    const files = children.filter(
-      (path) =>
-        path.basename.toLocaleLowerCase() ===
-        `${resource.id.name}.yy`.toLocaleLowerCase(),
-    );
-    return files.length === 1 ? files[0] : undefined;
-  }
-
   static async from<T extends YyResourceType>(
     project: Project,
     resource: YypResource,
   ): Promise<Asset<T> | undefined> {
-    const yyPath = await Asset.resolveYyPath(project, resource);
-    if (!yyPath) {
-      project.setResourceDiagnostics(
-        project.dir.join(resource.id.path).absolute,
-        'metadata',
-        [
-          Asset.resourceDiagnostic(
-            `Listed resource file is missing: ${resource.id.path}`,
-          ),
-        ],
+    let yyPath: Pathy | undefined = project.dir.join(resource.id.path);
+    if (!(await yyPath.exists())) {
+      const assetsDir = yyPath.up(2);
+      const namePattern = new RegExp(`^${resource.id.name}$`, 'i');
+      const dir = (await assetsDir.listChildren()).find((p) =>
+        p.basename.match(namePattern),
       );
+      if (dir) {
+        const yyPattern = new RegExp(`^${resource.id.name}\\.yy$`, 'i');
+        yyPath = (await dir.listChildren()).find((p) =>
+          p.basename.match(yyPattern),
+        );
+        if (!yyPath) {
+          logger.warn(`Could not find file for "${resource.id.path}"`);
+        }
+      } else {
+        logger.warn(`Could not find folder for "${resource.id.path}"`);
+      }
+    }
+    if (!yyPath) {
       return;
     }
-    project.setResourceDiagnostics(
-      project.dir.join(resource.id.path).absolute,
-      'metadata',
-      [],
-    );
     const item = new Asset(project, resource, yyPath) as Asset<T>;
-    await item.reload(false);
-    return item.yy ? item : undefined;
+    await item.reload();
+
+    return item;
   }
 }

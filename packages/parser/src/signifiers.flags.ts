@@ -17,16 +17,10 @@ const signifierFlags = {
   Enum: 1 << 14, // Is an enum
   EnumMember: 1 << 15, // Is an enum member
   Placeholder: 1 << 16, // An unresolved access, not an inheritable declaration
-  Hidden: 1 << 17, // Callable but omitted from completion, as extension metadata requests
 };
 
 export class Flags {
   protected flags = signifierFlags.ReadWrite;
-
-  /** Copy metadata at an analysis commit without replaying individual setters. */
-  copyFlagsFrom(source: Flags): void {
-    this.flags = source.flags;
-  }
 
   protected setFlag(flag: number, value: boolean) {
     if (value) {
@@ -44,13 +38,6 @@ export class Flags {
   }
   set placeholder(placeholder: boolean) {
     this.setFlag(signifierFlags.Placeholder, placeholder);
-  }
-
-  get hidden() {
-    return this.getFlag(signifierFlags.Hidden);
-  }
-  set hidden(value: boolean) {
-    this.setFlag(signifierFlags.Hidden, value);
   }
 
   get override() {
@@ -132,9 +119,6 @@ export class Flags {
 
   get readable() {
     return this.getFlag(signifierFlags.Readable);
-  }
-  set readable(readable: boolean) {
-    this.setFlag(signifierFlags.Readable, readable);
   }
 
   get deprecated() {

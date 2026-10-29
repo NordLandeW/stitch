@@ -11,7 +11,6 @@ import {
 import { typeToHoverDetails, typeToHoverText } from './types.hover.js';
 import { PrimitiveName, withableTypes } from './types.primitives.js';
 import { assert, ok } from './util.js';
-import type { BoundUnit } from './analysis/model.js';
 
 export type AnyType = Type<'Any'>;
 export type ArrayType = Type<'Array'>;
@@ -140,42 +139,6 @@ export class Type<T extends PrimitiveName = PrimitiveName> {
    * Otherwise it's the self-context of the function */
   self: WithableType | undefined = undefined;
   returns: TypeStore | undefined = undefined;
-  /** Stable semantic identity; absent for legacy/native construction helpers. */
-  semanticKey: string | undefined;
-  /** The function's static environment, separate from locals and constructed self. */
-  statics: StructType | undefined;
-  callKind: 'native' | 'user' | 'legacy' | undefined;
-  /** Immutable syntax/binding provenance for self-specialized method evaluation. */
-  functionSource:
-    | {
-        readonly bound: BoundUnit;
-        readonly functionId: string;
-        readonly fingerprint: string;
-      }
-    | undefined;
-  /** A method is a new callable value; its source function is never rebound in place. */
-  methodSource: FunctionType | undefined;
-  /** Constant facts are used for exact keys and nullish analysis, not display names. */
-  literalValue: string | number | boolean | undefined;
-  nullPointer: boolean | undefined;
-
-  /** Install a candidate member without changing references or dependent files. */
-  setOwnMember(member: Signifier): void {
-    this._members ||= new Map();
-    this._members.set(member.name, member);
-  }
-
-  /** Replace a committed member table at the host's transaction boundary. */
-  replaceOwnMembers(members: Iterable<Signifier>): void {
-    this._members = new Map(
-      [...members].map((member) => [member.name, member]),
-    );
-  }
-
-  /** A read-only base edge for detached analysis graphs; no reverse mutations. */
-  setBaseView(base: Type | undefined): void {
-    this._extends = base;
-  }
 
   constructor(protected _kind: T) {}
 
@@ -561,28 +524,6 @@ export class Type<T extends PrimitiveName = PrimitiveName> {
     const derived = new Type(this.kind) as Type<T>;
     derived.extends = this;
     derived.name = this.name;
-    return derived;
-  }
-
-  /** Copy a value without reverse edges or a new wrapper in its inheritance chain. */
-  deriveDetached(): Type<T> {
-    const derived = new Type(this.kind) as Type<T>;
-    derived.setBaseView(this.extends);
-    derived.replaceOwnMembers(this.listMembers(true));
-    derived._signifier = this._signifier;
-    derived.name = this.name;
-    derived.description = this.description;
-    derived.flags = this.flags;
-    derived.local = this.local;
-    derived.self = this.self;
-    derived.statics = this.statics;
-    derived.returns = this.returns;
-    derived.items = this.items;
-    derived.callKind = this.callKind;
-    derived.functionSource = this.functionSource;
-    derived.methodSource = this.methodSource;
-    derived.literalValue = this.literalValue;
-    derived.nullPointer = this.nullPointer;
     return derived;
   }
 

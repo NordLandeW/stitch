@@ -10,6 +10,7 @@
 //  - `Array[String|Real]`
 
 import type { Type } from './types.js';
+import { ok } from './util.js';
 
 export interface FeatherTypeUnion {
   kind: 'union';
@@ -49,172 +50,101 @@ export function flattenFeatherTypes(
   return flattened;
 }
 
-export interface FeatherTypeDiagnostic {
-  message: string;
-  /** Zero-based offset within the type string. */
-  offset: number;
-  /** Length of the offending token; zero denotes an empty type string. */
-  length: number;
-}
-
-/**
- * Parse a type string, retaining recognizable types around local syntax errors.
- * Callers displaying diagnostics can supply a collector without changing the
- * type tree consumed by existing native/type-resolution callers.
- */
-export function parseFeatherTypeString(
-  typeString: string,
-  diagnostics: FeatherTypeDiagnostic[] = [],
-): FeatherTypeUnion {
+export function parseFeatherTypeString(typeString: string): FeatherTypeUnion {
+  // Patterns
   const whitespace = /\s+/y;
   const leftBracket = /[<[]/y;
   const rightBracket = /[>\]]/y;
   const or = /(\bOR\b|\bor\b|\||,)/y;
   const identifier = /[a-zA-Z_][a-zA-Z0-9_.]*/y;
   let offset = 0;
-  const report = (message: string, offset: number, length = 1) => {
-    diagnostics.push({ message, offset, length });
-  };
+  // Handle case where a type is incorrectly wrapped in brackets
+  // (e.g. Array<String|Undefined> is fine, but just <String|Undefined> is not)
+  if (typeString.match(/^\s*[<[]/)) {
+    const parts = typeString.match(/^(\s*[<[])(.*)([>\]]\s*)$/);
+    if (parts) {
+      typeString =
+        ' '.repeat(parts[1].length) + parts[2] + ' '.repeat(parts[3].length);
+    }
+  }
+
   const lex = (pattern: RegExp) => {
     pattern.lastIndex = offset;
     const match = pattern.exec(typeString);
-    if (!match) return;
+    if (!match) {
+      return;
+    }
     offset = pattern.lastIndex;
     return match;
   };
   const rootUnion: FeatherTypeUnion = { kind: 'union', types: [] };
-  interface Frame {
-    union: FeatherTypeUnion;
-    opening?: { content: string; offset: number };
-    currentType?: FeatherType;
-    expectType: boolean;
-    separator?: { offset: number; length: number };
-  }
-  const stack: Frame[] = [{ union: rootUnion, expectType: true }];
+  const typeUnionStack: FeatherTypeUnion[] = [rootUnion];
+  0;
+  const currentUnion = (): FeatherTypeUnion => typeUnionStack.at(-1)!;
+  let currentType: FeatherType | undefined;
 
-  if (!typeString.trim()) {
-    report('Expected a type', 0, typeString.length);
-    // Preserve the historical inferred default for callers without a type.
+  if (!typeString?.trim()) {
     rootUnion.types.push({
       kind: 'type',
-      name: { content: 'Any', inferred: true, offset: 0 },
+      name: { content: 'Any', inferred: true, offset },
     });
     return rootUnion;
   }
 
+  // Lex the string
   while (offset < typeString.length) {
-    const frame = stack.at(-1)!;
-    if (lex(whitespace)) continue;
+    let match: RegExpExecArray | undefined;
 
-    let match = lex(leftBracket);
+    match = lex(leftBracket);
     if (match) {
-      let union = frame.union;
-      if (frame.currentType) {
-        union = { kind: 'union', types: [] };
-        frame.currentType.of = union;
-      } else if (stack.length !== 1 || frame.union.types.length) {
-        report(`Expected a type before '${match[0]}'`, match.index);
-      }
-      // A leading wrapper (<Real|String> or [Real|String]) is accepted for
-      // compatibility. Other ownerless brackets recover into the same union.
-      frame.currentType = undefined;
-      frame.expectType = false;
-      frame.separator = undefined;
-      stack.push({
-        union,
-        opening: { content: match[0], offset: match.index },
-        expectType: true,
-      });
+      ok(currentType, 'Unexpected left bracket');
+      // Create a new union
+      const union: FeatherTypeUnion = { kind: 'union', types: [] };
+      // Add it to the current type
+      currentType.of = union;
+      // Push it onto the stack
+      typeUnionStack.push(union);
       continue;
     }
 
     match = lex(rightBracket);
     if (match) {
-      if (stack.length === 1) {
-        // Never pop the root. Treat an extra closer as a synchronization point
-        // so a later type (and the rest of the document) remains available.
-        report(`Unexpected closing bracket '${match[0]}'`, match.index);
-        frame.currentType = undefined;
-        frame.expectType = true;
-        continue;
-      }
-      const expected = frame.opening!.content === '<' ? '>' : ']';
-      if (match[0] !== expected) {
-        report(`Expected '${expected}' but found '${match[0]}'`, match.index);
-      }
-      if (frame.separator) {
-        report(
-          'Expected a type after union separator',
-          frame.separator.offset,
-          frame.separator.length,
-        );
-      } else if (!frame.union.types.length) {
-        report(`Expected a type before '${match[0]}'`, match.index);
-      }
-      stack.pop();
+      // Pop the current union off the stack
+      typeUnionStack.pop();
+      // Can only be followed by an OR, so unset the type
+      currentType = undefined;
       continue;
     }
 
     match = lex(or);
     if (match) {
-      if (frame.expectType && (!frame.union.types.length || frame.separator)) {
-        report(
-          'Expected a type before union separator',
-          match.index,
-          match[0].length,
-        );
-      }
-      frame.currentType = undefined;
-      frame.expectType = true;
-      frame.separator = { offset: match.index, length: match[0].length };
       continue;
     }
 
     match = lex(identifier);
     if (match) {
-      if (!frame.expectType) {
-        report(
-          'Expected a union separator before type',
-          match.index,
-          match[0].length,
-        );
-      }
+      // Create a new type
       const type: FeatherType = {
         kind: 'type',
         name: { content: match[0], offset: match.index },
       };
-      frame.union.types.push(type);
-      frame.currentType = type;
-      frame.expectType = false;
-      frame.separator = undefined;
+      // Add it to the current union
+      currentUnion().types.push(type);
+      currentType = type;
       continue;
     }
 
-    // Consume, rather than silently truncate at, an unsupported token. Every
-    // branch advances the cursor, including malformed and incomplete input.
-    report(`Unexpected character '${typeString[offset]}' in type`, offset);
-    offset++;
-    frame.currentType = undefined;
-    frame.expectType = true;
+    match = lex(whitespace);
+    if (match) {
+      continue;
+    }
+    break;
   }
 
-  for (const frame of stack) {
-    if (frame.separator) {
-      report(
-        'Expected a type after union separator',
-        frame.separator.offset,
-        frame.separator.length,
-      );
-    }
-    if (frame.opening) {
-      const expected = frame.opening.content === '<' ? '>' : ']';
-      report(`Missing closing bracket '${expected}'`, frame.opening.offset);
-    }
-  }
   return rootUnion;
 }
 
-function typeDisplayName(type: Type): string | undefined {
+export function typeToFeatherString(type: Type): string {
   // Functions, Structs, and Enums are the only types that can have names
   if (type.isGeneric && type.name) {
     return type.name;
@@ -233,60 +163,11 @@ function typeDisplayName(type: Type): string | undefined {
     }
     return `${type.kind}.${type.name}`;
   }
-  return undefined;
-}
-
-/** Render item graphs without consuming the JS call stack. An ellipsis marks
- * recursive paths or an exhausted display budget. Shared DAGs can otherwise
- * produce exponentially large text from a small finite graph. The budget only
- * limits presentation; semantic types and inference retain the complete graph. */
-export function typeToFeatherString(type: Type): string {
-  const output: string[] = [];
-  const active = new Set<Type>();
-  let remainingNodes = 8192;
-  const stack: { type: Type; next: number; items?: Type[] }[] = [
-    { type, next: -1 },
-  ];
-  while (stack.length) {
-    const frame = stack[stack.length - 1];
-    const current = frame.type;
-    if (frame.next < 0) {
-      if (remainingNodes-- === 0) {
-        output.push('...');
-        stack.pop();
-        // Preserve balanced container delimiters while omitting pending siblings.
-        while (stack.length) {
-          if (stack.pop()!.next >= 0) output.push('>');
-        }
-        break;
-      }
-      const name = typeDisplayName(current);
-      if (name !== undefined) {
-        output.push(name);
-        stack.pop();
-      } else if (active.has(current)) {
-        output.push('...');
-        stack.pop();
-      } else {
-        const items = current.items?.type;
-        if (!items?.length) {
-          output.push(current.kind);
-          stack.pop();
-        } else {
-          active.add(current);
-          output.push(current.kind, '<');
-          frame.items = items;
-          frame.next = 0;
-        }
-      }
-    } else if (frame.next === frame.items!.length) {
-      output.push('>');
-      active.delete(current);
-      stack.pop();
-    } else {
-      if (frame.next) output.push('|');
-      stack.push({ type: frame.items![frame.next++], next: -1 });
-    }
+  // Arrays etc can contain items of a type) {
+  if (type.items?.type.length) {
+    return `${type.kind}<${type.items.type
+      .map((t) => t.toFeatherString())
+      .join('|')}>`;
   }
-  return output.join('');
+  return type.kind;
 }

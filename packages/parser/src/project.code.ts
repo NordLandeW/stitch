@@ -1,29 +1,12 @@
 import type { Pathy } from '@bscotch/pathy';
+import { sequential } from '@bscotch/utility';
 import { YyObject } from '@bscotch/yy';
-import {
-  globalOwner,
-  nativeGlobalOwner,
-  type CodeSemanticView,
-} from './analysis/model.js';
-import { value } from './analysis/values.js';
-import type { AnalysisState, AnalysisStatus } from './language/state.js';
-import {
-  collectMacros,
-  MacroEnvironment,
-  type PreprocessedDocument,
-} from './syntax/macros.js';
-import { getProjectAnalysis } from './language/service.js';
-import { SourceMap } from './syntax/source.js';
+import MagicString from 'magic-string';
 import type { JsdocSummary } from './jsdoc.js';
 import { ObjectEvent, getEventFromFilename } from './lib.objects.js';
 import { logger } from './logger.js';
 import { parser, type GmlParsed } from './parser.js';
 import type { Asset } from './project.asset.js';
-import {
-  extensionDefinitionNames,
-  roomInstances,
-  type GmlSourceContext,
-} from './project.sources.js';
 import {
   Diagnostic,
   DiagnosticCollectionName,
@@ -40,18 +23,13 @@ import {
   ReferenceableType,
   Scope,
   StructNewMemberRange,
-  type CompletionCandidate,
 } from './project.location.js';
 import type { Signifier } from './signifiers.js';
 import { getTypeOfKind } from './types.checks.js';
 import { Type, type StructType } from './types.js';
 import { assert, isBeforeRange, isInRange } from './util.js';
-
-export interface CodeSyntaxView {
-  readonly parsed: GmlParsed;
-  readonly processed: PreprocessedDocument;
-  readonly diagnostics: readonly Diagnostic[];
-}
+import { registerGlobals } from './visitor.globals.js';
+import { registerSignifiers } from './visitor.js';
 
 /** Represenation of a GML code file. */
 export class Code {
@@ -72,135 +50,8 @@ export class Code {
    * of argument ranges for that call. Useful for diagnostics.*/
   protected _functionCalls: FunctionArgRange[][] = [];
   protected _rangesAreSorted = false;
-  private _content = '';
-  private _contentVersion = 0;
-  private _syntaxVersion = 0;
-  private _semanticVersion = 0;
-  private _projectVersion = -1;
-  private _analysisStatus: AnalysisStatus = 'unparsed';
-  private _syntaxDiagnostics: Diagnostic[] = [];
-  private _internalDiagnostics: Diagnostic[] = [];
-  private _preprocessed?: PreprocessedDocument;
+  content!: string;
   protected _parsed!: GmlParsed;
-
-  private resourceContext?: GmlSourceContext;
-  private extensionNames?: { text: string; names: ReadonlySet<string> };
-  get extensionDefinitions(): ReadonlySet<string> {
-    if (this.extensionNames?.text !== this.content)
-      this.extensionNames = {
-        text: this.content,
-        names: extensionDefinitionNames(this.content),
-      };
-    return this.extensionNames.names;
-  }
-  get sourceContext(): GmlSourceContext {
-    return (
-      this.resourceContext ||
-      (this.isScript
-        ? { kind: 'script' }
-        : this.isObjectEvent
-          ? {
-              kind: 'object-event',
-              selfOwner: `object:${this.asset.name}:self`,
-            }
-          : { kind: 'other' })
-    );
-  }
-  setSourceContext(context: GmlSourceContext): void {
-    if (JSON.stringify(this.sourceContext) === JSON.stringify(context)) return;
-    this.resourceContext = Object.freeze({ ...context });
-    getProjectAnalysis(this.project).invalidate(this);
-  }
-
-  get content(): string {
-    return this._content;
-  }
-  set content(value: string) {
-    if (value === this._content) return;
-    this._content = value;
-    this._contentVersion++;
-    this._analysisStatus = 'unparsed';
-    getProjectAnalysis(this.project).invalidate(this);
-  }
-
-  get analysisState(): AnalysisState {
-    return {
-      contentVersion: this._contentVersion,
-      syntaxVersion: this._syntaxVersion,
-      semanticVersion: this._semanticVersion,
-      projectVersion: this._projectVersion,
-      status: this._analysisStatus,
-    };
-  }
-
-  get sourceMap(): SourceMap {
-    return (
-      this._preprocessed?.sourceMap ||
-      new SourceMap({ uri: this.path.absolute, text: this.content })
-    );
-  }
-
-  get syntaxText(): string {
-    return this._preprocessed?.text ?? this.content;
-  }
-  get preprocessed(): PreprocessedDocument | undefined {
-    return this._preprocessed;
-  }
-
-  /** Host commit only: no parsing, inference, publication or shared graph reset. */
-  replaceSemanticView(view: CodeSemanticView): void {
-    this._refs = [...view.refs];
-    this.scopes.splice(0, this.scopes.length, ...view.scopes);
-    this.jsdocs.splice(0, this.jsdocs.length, ...view.jsdocs);
-    this._functionArgRanges = [...view.functionArgRanges];
-    this._functionCalls = view.functionCalls.map((call) => [...call]);
-    this._structNewMemberRanges = [...view.structNewMemberRanges];
-    this.callsSuper = view.callsSuper;
-    this._rangesAreSorted = false;
-    this.clearAllDiagnostics();
-    this.diagnostics.SYNTAX_ERROR.push(...this._syntaxDiagnostics);
-    this.diagnostics.ANALYSIS.push(...this._internalDiagnostics);
-    for (const [collection, diagnostics] of Object.entries(view.diagnostics)) {
-      this.diagnostics[collection as DiagnosticCollectionName].push(
-        ...diagnostics,
-      );
-    }
-  }
-
-  markAnalyzed(projectVersion: number, status: 'complete' | 'degraded'): void {
-    this._projectVersion = projectVersion;
-    this._semanticVersion++;
-    this._analysisStatus = status;
-    this._internalDiagnostics = [];
-    this.diagnostics.ANALYSIS = [];
-  }
-
-  markAnalysisFailed(error: unknown, projectVersion: number): void {
-    this._projectVersion = projectVersion;
-    this._analysisStatus = 'failed';
-    const message = error instanceof Error ? error.message : String(error);
-    this._internalDiagnostics = [
-      Diagnostic.error(
-        `Language analysis failed: ${message}`,
-        this.startRange,
-        error,
-      ),
-    ];
-    this.diagnostics.ANALYSIS = [...this._internalDiagnostics];
-  }
-
-  retireAnalysis(): void {
-    this._analysisStatus = 'retired';
-    this._refs = [];
-    this.scopes.length = 0;
-    this.jsdocs.length = 0;
-    this._functionArgRanges = [];
-    this._functionCalls = [];
-    this._structNewMemberRanges = [];
-    this._syntaxDiagnostics = [];
-    this._internalDiagnostics = [];
-    this.clearAllDiagnostics();
-  }
 
   // Metadata
   /** For object events, whether or not `event_inherited` is unambiguously being called */
@@ -211,7 +62,6 @@ export class Code {
     readonly path: Pathy<string>,
   ) {
     this.clearAllDiagnostics();
-    getProjectAnalysis(this.project).register(this);
   }
 
   /**
@@ -293,57 +143,20 @@ export class Code {
     offset: number | LinePosition,
     column?: number,
   ): Reference | undefined {
-    const candidates = this.getReferenceCandidatesAt(offset, column);
-    return candidates.length === 1 ? candidates[0] : undefined;
-  }
-
-  /** All possible bindings at one spelling; a union must not choose its first branch. */
-  getReferenceCandidatesAt(
-    offset: number | LinePosition,
-    column?: number,
-  ): readonly Reference[] {
-    if (typeof offset === 'number' && typeof column === 'number')
+    if (typeof offset === 'number' && typeof column === 'number') {
       offset = { line: offset, column };
+    }
     const refs = this.refs;
     assert(refs, 'Refs must be an array');
-    const matches: Reference[] = [];
-    let first: IRange | undefined;
-    for (const ref of refs) {
-      const query = ref.queryRange || ref;
-      if (this.isInRange(query, offset)) {
-        first ||= query;
-        if (
-          query.start.offset === first.start.offset &&
-          query.end.offset === first.end.offset
-        )
-          matches.push(ref);
-      } else if (this.isBeforeRange(query, offset)) break;
+    for (let i = 0; i < refs.length; i++) {
+      const ref = refs[i];
+      if (this.isInRange(ref, offset)) {
+        return ref;
+      } else if (this.isBeforeRange(ref, offset)) {
+        return undefined;
+      }
     }
-    if (matches.length) {
-      // Invocation names win over their expanded body, and shorthand queries
-      // select the value role while rename still sees both independent roles.
-      const macro = matches.find(
-        (ref) =>
-          ref.item.macro && ref.file === this && this.isInRange(ref, offset),
-      );
-      if (macro) return [macro];
-      const shorthand = matches.filter((ref) => ref.role === 'shorthand-value');
-      return [
-        ...new Map(
-          (shorthand.length ? shorthand : matches).map((ref) => [
-            ref.item,
-            ref,
-          ]),
-        ).values(),
-      ];
-    }
-    const external = getProjectAnalysis(this.project)
-      .spellingReferences(this.path.absolute)
-      .filter((ref) => this.isInRange(ref, offset));
-    // A physical macro body has no invoking scope to disambiguate its bindings.
-    return new Set(external.map((ref) => ref.item)).size === 1
-      ? [external[0]]
-      : [];
+    return undefined;
   }
 
   getJsdocAt(
@@ -425,76 +238,6 @@ export class Code {
     return this.scopes.at(-1);
   }
 
-  /** Aggregate names for presentation while retaining every real binding. */
-  getCompletionCandidatesAt(
-    offset: number | LinePosition,
-    column?: number,
-  ): CompletionCandidate[] {
-    const scope = this.getScopeRangeAt(offset, column);
-    if (!scope) return [];
-    if (!scope.isDotAccessor) {
-      return this.getInScopeSymbolsAt(offset, column).map((symbol) => ({
-        name: symbol.name,
-        symbols: [symbol],
-        type: symbol.type,
-        availability: { present: 1, total: 1 },
-      }));
-    }
-    const receivers = scope.dotReceivers || [scope.self];
-    const candidates = new Map<
-      string,
-      {
-        symbols: Set<Signifier>;
-        types: Type[];
-        present: number;
-      }
-    >();
-    for (const receiver of receivers) {
-      if (
-        !['Struct', 'Enum', 'Id.Instance', 'Asset.GMObject'].includes(
-          receiver.kind,
-        )
-      )
-        continue;
-      const names = new Set<string>();
-      for (const symbol of receiver.listMembers()) {
-        if (
-          symbol.hidden ||
-          names.has(symbol.name) ||
-          (!symbol.def && !symbol.native)
-        )
-          continue;
-        names.add(symbol.name);
-        if (receiver.semanticKey === globalOwner) {
-          const definedInProject = !symbol.native && !!symbol.def?.file;
-          const canLiveOnGlobal =
-            !symbol.macro && !getTypeOfKind(symbol, ['Enum']);
-          if (!definedInProject || !canLiveOnGlobal) continue;
-        }
-        let candidate = candidates.get(symbol.name);
-        if (!candidate) {
-          candidate = { symbols: new Set(), types: [], present: 0 };
-          candidates.set(symbol.name, candidate);
-        }
-        candidate.symbols.add(symbol);
-        candidate.types.push(
-          ...(scope.memberTypes?.get(symbol) || symbol.type).type,
-        );
-        candidate.present++;
-      }
-    }
-    return [...candidates]
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([name, candidate]) => ({
-        name,
-        symbols: [...candidate.symbols].sort((a, b) =>
-          (a.semanticKey || a.name).localeCompare(b.semanticKey || b.name),
-        ),
-        type: value(...candidate.types),
-        availability: { present: candidate.present, total: receivers.length },
-      }));
-  }
-
   getInScopeSymbolsAt(
     offset: number | LinePosition,
     column?: number,
@@ -507,29 +250,27 @@ export class Code {
       return [];
     }
     if (scopeRange.isDotAccessor) {
-      return [
-        ...new Set(
-          this.getCompletionCandidatesAt(offset).flatMap(
-            (item) => item.symbols,
-          ),
-        ),
-      ];
+      // Then only return self variables
+      // Filter out those that cannot be dot-accessed on global
+      // (native functions, etc.)
+      if (scopeRange.self === this.project.self) {
+        return this.project.self.listMembers().filter((x) => {
+          // Only stuff defined in the project could appear as an autocomplete
+          const definedInProject = !x.native && !!x.def?.file;
+          const canLiveOnGlobal = !x.macro && !getTypeOfKind(x, ['Enum']);
+          return definedInProject && canLiveOnGlobal;
+        });
+      } else {
+        return scopeRange.self.listMembers().filter((x) => x.def || x.native);
+      }
     }
     // Add to a flat list, and remove all entries that don't have
     // a definition if they are not native
     const allSignifiers = [
       // Local variables
       ...(scopeRange.local.listMembers() || []),
-      // Built-in bare names do not alias an explicit same-name self member.
-      ...this.project.self
-        .listMembers()
-        .filter(
-          (symbol) =>
-            symbol.parent.semanticKey === nativeGlobalOwner && !symbol.instance,
-        ),
       // Self variables, if not global
-      ...((scopeRange.self.semanticKey !== globalOwner &&
-      scopeRange.self !== this.project.self
+      ...((scopeRange.self !== this.project.self
         ? scopeRange.self.listMembers()
         : []) || []),
       // Project globals
@@ -541,7 +282,6 @@ export class Code {
     const uniqueSignifiers = new Map<string, Signifier>();
     for (const signifier of allSignifiers) {
       if (
-        !signifier.hidden &&
         !uniqueSignifiers.has(signifier.name) &&
         (signifier.def || signifier.native)
       ) {
@@ -589,179 +329,53 @@ export class Code {
    * it will be used instead of reading from disk. This
    * is useful for editors that want to provide a live preview.
    */
-  private bufferOwned = false;
-  private bufferEpoch = 0;
-
-  setBufferContent(text: string): void {
-    if (
-      this.project.isDisposed ||
-      getProjectAnalysis(this.project).document(this.path.absolute) !== this
-    )
-      return;
-    this.bufferEpoch++;
-    this.bufferOwned = true;
-    this.content = text;
-  }
-  releaseBuffer(): void {
-    this.bufferEpoch++;
-    this.bufferOwned = false;
-  }
-  private lineStarts?: { version: number; starts: number[] };
-
-  positionAt(offset: number): Position {
-    offset = Number.isFinite(offset)
-      ? Math.max(0, Math.min(offset, this.content.length))
-      : 0;
-    if (this.lineStarts?.version !== this._contentVersion) {
-      const starts = [0];
-      for (let index = 0; index < this.content.length; index++)
-        if (this.content[index] === '\n') starts.push(index + 1);
-      this.lineStarts = { version: this._contentVersion, starts };
-    }
-    const starts = this.lineStarts.starts;
-    let lower = 0,
-      upper = starts.length - 1;
-    while (lower < upper) {
-      const middle = Math.ceil((lower + upper) / 2);
-      if (starts[middle] <= offset) lower = middle;
-      else upper = middle - 1;
-    }
-    return new Position(this, offset, lower + 1, offset - starts[lower] + 1);
-  }
-
-  async readContent(content?: string, forceDisk = false): Promise<void> {
-    const service = getProjectAnalysis(this.project);
-    if (
-      this.project.isDisposed ||
-      service.document(this.path.absolute) !== this
-    )
-      return;
-    if (typeof content === 'string') {
-      this.setBufferContent(content);
-      return;
-    }
-    const buffer = this.project.options?.documentText?.(this.path.absolute);
-    if (typeof buffer === 'string') {
-      this.setBufferContent(buffer);
-      return;
-    }
-    if (this.bufferOwned && !forceDisk) return;
-    const version = this._contentVersion,
-      epoch = this.bufferEpoch;
-    const disk = await this.path.read();
-    // Ownership can change without changing the text (opening an equal buffer).
-    if (
-      this.project.isDisposed ||
-      service.document(this.path.absolute) !== this ||
-      version !== this._contentVersion ||
-      epoch !== this.bufferEpoch
-    )
-      return;
-    const latest = this.project.options?.documentText?.(this.path.absolute);
-    if (typeof latest === 'string') {
-      this.setBufferContent(latest);
-      return;
-    }
-    this.bufferOwned = false;
-    this.content = disk;
-  }
-
-  get hasSyntaxErrors(): boolean {
-    return this._syntaxDiagnostics.length > 0;
-  }
-
-  prepareSyntax(
-    processed: PreprocessedDocument,
-    parsed = parser.parse(processed.text),
-  ): CodeSyntaxView {
-    const diagnostics: Diagnostic[] = [];
-    const range = (start: number, end: number) => {
-      const origin = processed.sourceMap.origin(start, end);
-      const span = origin.expansion || origin.spelling;
-      const file =
-        span.uri === this.path.absolute
-          ? this
-          : getProjectAnalysis(this.project).document(span.uri) || this;
-      return new Range(file.positionAt(span.start), file.positionAt(span.end));
-    };
-    for (const diagnostic of processed.diagnostics) {
-      const file =
-        diagnostic.span.uri === this.path.absolute
-          ? this
-          : getProjectAnalysis(this.project).document(diagnostic.span.uri) ||
-            this;
-      diagnostics.push(
+  async parse(content?: string) {
+    this.clearAllDiagnostics();
+    this.content =
+      typeof content === 'string' ? content : await this.path.read();
+    this._parsed = parser.parse(this.content);
+    for (const diagnostic of this._parsed.errors) {
+      const fromToken = isNaN(diagnostic.token.startOffset)
+        ? diagnostic.previousToken
+        : diagnostic.token;
+      logger.debug(
+        'SYNTAX ERROR',
+        diagnostic?.message,
+        this.path?.absolute,
+        fromToken,
+      );
+      this.diagnostics.SYNTAX_ERROR.push(
         Diagnostic.error(
           diagnostic.message,
-          new Range(
-            file.positionAt(diagnostic.span.start),
-            file.positionAt(diagnostic.span.end),
-          ),
+          Range.fromCst(this, fromToken || diagnostic.token),
           diagnostic,
         ),
       );
     }
-    for (const diagnostic of parsed.lexed.errors) {
-      diagnostics.push(
-        Diagnostic.error(
-          diagnostic.message,
-          range(
-            diagnostic.offset,
-            diagnostic.offset + Math.max(1, diagnostic.length) - 1,
-          ),
-          diagnostic,
-        ),
-      );
-    }
-    for (const diagnostic of parsed.errors) {
-      const token = Number.isFinite(diagnostic.token.startOffset)
-        ? diagnostic.token
-        : diagnostic.previousToken;
-      const start = token?.startOffset ?? processed.text.length;
-      const end = token?.endOffset ?? start;
-      diagnostics.push(
-        Diagnostic.error(diagnostic.message, range(start, end), diagnostic),
-      );
-    }
-    return { parsed, processed, diagnostics };
-  }
-
-  replaceSyntaxView(view: CodeSyntaxView): void {
-    if (this._parsed !== view.parsed) this._syntaxVersion++;
-    this._parsed = view.parsed;
-    this._preprocessed = view.processed;
-    this._syntaxDiagnostics = [...view.diagnostics];
-    this._analysisStatus = 'parsed';
-    this.diagnostics.SYNTAX_ERROR = [...view.diagnostics];
-  }
-
-  parsePreprocessed(processed: PreprocessedDocument): void {
-    this.replaceSyntaxView(this.prepareSyntax(processed));
-    getProjectAnalysis(this.project).invalidate(this);
-  }
-
-  async parse(content?: string): Promise<void> {
-    await this.readContent(content);
-    const document = { uri: this.path.absolute, text: this.content };
-    this.parsePreprocessed(
-      new MacroEnvironment([collectMacros(document)]).expand(document),
-    );
   }
 
   /**
    * Replace all refs for a signifier with a new name,
    * followed by fully reprocessing the file.
    */
+  @sequential
   async renameSignifier(signifier: Signifier, newName: string) {
-    await this.project.renameSignifier(signifier, newName);
-  }
-
-  get hasOwnedBuffer(): boolean {
-    return (
-      this.bufferOwned ||
-      typeof this.project.options?.documentText?.(this.path.absolute) ===
-        'string'
+    const renameableRefs = this.refs.filter(
+      (ref) => ref.item === signifier && ref.isRenameable,
     );
+    // Rename using magic-string so we don't have to track changed positions
+    const updated = new MagicString(this.content);
+    for (const ref of renameableRefs) {
+      updated.update(
+        ref.start.offset,
+        ref.end.offset + 1,
+        ref.toRenamed(newName),
+      );
+    }
+    // Save to disk and reprocess
+    this.content = updated.toString();
+    await this.path.write(this.content);
+    await this.reload(this.content);
   }
 
   clearDiagnosticCollection(collection: DiagnosticCollectionName) {
@@ -770,7 +384,6 @@ export class Code {
 
   protected clearAllDiagnostics() {
     this.diagnostics = {
-      ANALYSIS: [],
       GLOBAL_SELF: [],
       INVALID_OPERATION: [],
       JSDOC_MISMATCH: [],
@@ -816,47 +429,61 @@ export class Code {
       assert(a.start && b.start, 'Ref does not have a start');
       return a.start.offset - b.start.offset;
     };
-    this._refs.sort((a, b) => sorter(a.queryRange || a, b.queryRange || b));
+    this._refs.sort(sorter);
     this._functionArgRanges.sort(sorter);
     this._structNewMemberRanges.sort(sorter);
     this._rangesAreSorted = true;
   }
 
+  protected initializeScopeRanges() {
+    const self = this.asset.variables || this.project.self;
+    // Re-use the root local scope if it exists
+    const local = this.scopes[0]?.local || new Type('Struct');
+    this.scopes.length = 0;
+    this.jsdocs.length = 0;
+    const position = Position.fromFileStart(this);
+    this.scopes.push(new Scope(position, local, self));
+  }
+
+  protected reset() {
+    this.initializeScopeRanges();
+    // Remove each reference in *this file* from its symbol. If that was the only reference to its signifier, and it was a defining reference, also remove the signifier
+    const cleared = new Set<ReferenceableType>();
+    for (const ref of this._refs) {
+      const signifier = ref.item;
+      if (cleared.has(signifier)) {
+        continue;
+      }
+      // If the symbol was declared in this file, remove its location
+      // to flag it as undeclared.
+      const isDefinedInThisFile = this === signifier.def?.file;
+      if (isDefinedInThisFile) {
+        signifier.unsetDef();
+      }
+      // Remove all references to this symbol found in this file.
+      // Flag all other files as being dirty so they get reprocessed.
+      for (const symbolRef of signifier.refs) {
+        if (this === symbolRef.file) {
+          signifier.refs.delete(symbolRef);
+        } else {
+          symbolRef.file.dirty = true;
+        }
+      }
+      // Remove orphaned declarations and unresolved names left behind while editing.
+      if (!signifier.refs.size && (isDefinedInThisFile || !signifier.def)) {
+        signifier.parent.removeMember(signifier.name);
+      }
+      cleared.add(signifier);
+    }
+    // Reset this file's refs list
+    this._refs = [];
+    this._functionArgRanges = [];
+    this._structNewMemberRanges = [];
+    this._functionCalls = [];
+    this._rangesAreSorted = false;
+  }
+
   protected async removeFromYy() {
-    const source = this.sourceContext;
-    if (source.kind === 'instance-creation') {
-      for (const instance of roomInstances(
-        (this.asset.yy as { layers: unknown[] }).layers,
-      ))
-        if (instance.name === source.instanceName)
-          instance.hasCreationCode = false;
-      await this.asset.saveYy();
-      return;
-    }
-    if (source.kind === 'room-creation') {
-      (this.asset.yy as { creationCodeFile: string }).creationCodeFile = '';
-      await this.asset.saveYy();
-      return;
-    }
-    if (source.kind === 'timeline') {
-      const yy = this.asset.yy as { momentList: { moment: number }[] };
-      yy.momentList = yy.momentList.filter(
-        (entry) => entry.moment !== source.moment,
-      );
-      await this.asset.saveYy();
-      return;
-    }
-    if (source.kind === 'extension') {
-      const yy = this.asset.yy as { files: { filename?: string }[] };
-      yy.files = yy.files.filter(
-        (entry) =>
-          !entry.filename ||
-          this.asset.dir.join(entry.filename).absolute.toLocaleLowerCase() !==
-            this.path.absolute.toLocaleLowerCase(),
-      );
-      await this.asset.saveYy();
-      return;
-    }
     if (!this.asset.isObject) return;
     const eventInfo = this.objectEventInfo;
     if (!eventInfo) {
@@ -878,43 +505,154 @@ export class Code {
   }
 
   async remove() {
-    await this.project.withResourceUpdate(async () => {
-      assert(
-        this.analysisState.status !== 'retired' &&
-          this.project
-            .sourceOwners(this.path)
-            .every((owner) => owner === this.asset),
-        'A shared or retired GML source cannot be deleted through one resource.',
-      );
-      await this.removeFromYy();
-      await this.path.delete();
-      this.asset.gmlFiles.delete(this.path.absolute.toLocaleLowerCase());
-      getProjectAnalysis(this.project).retire(this);
-      // Explicit Code-only hosts own their registrations without disk metadata.
-      if (this.asset.sourceCandidates !== undefined)
-        await this.asset.reload(false);
-    });
+    // update yy file
+    await this.removeFromYy();
+    // remove from asset's list of files
+    this.asset.gmlFiles.delete(this.path.absolute.toLocaleLowerCase());
+    // remove file
+    await this.path.delete();
+    // reset to clear refs and diagnostics
+    this.reset();
   }
 
   /**
    * Reprocess after a modification to the file. Optionally
    * provide new content to use instead of reading from disk.
    */
-  async reload(
-    content?: string,
-    _options?: { reloadDirty?: boolean },
-  ): Promise<void> {
-    const analysis = getProjectAnalysis(this.project);
-    if (analysis.document(this.path.absolute) !== this)
-      throw new Error('Cannot reload a retired document');
-    await this.readContent(content, content === undefined);
-    if (
-      this.project.isDisposed ||
-      analysis.document(this.path.absolute) !== this
-    )
+  async reload(content?: string, options?: { reloadDirty?: boolean }) {
+    await this.parse(content);
+    this.updateGlobals();
+    this.updateAllSymbols();
+    this.updateDiagnostics();
+    // Re-run diagnostics on everything that ended up dirty due to the changes
+    if (options?.reloadDirty) {
+      this.project.drainDirtyFileUpdateQueue();
+    }
+  }
+
+  protected discoverEventInheritanceWarnings() {
+    this.diagnostics.MISSING_EVENT_INHERITED = [];
+    if (this.asset.assetKind !== 'objects' || !this.asset.parent) {
       return;
-    analysis.invalidate(this);
-    await analysis.analyze();
+    }
+    // Then the type will have been set up to inherit from the parent.
+    // BUT. If this event does not call `event_inherited()`, then we
+    // need to unlink the type.
+    if (!this.callsSuper) {
+      // TODO: Provide this as an option?
+      // this.diagnostics.MISSING_EVENT_INHERITED.push({
+      //   $tag: 'diagnostic',
+      //   message: `Event does not call \`event_inherited()\`, so it will not inherit from its parent.`,
+      //   severity: 'warning',
+      //   location: this.startRange,
+      // });
+      if (this.isCreateEvent) {
+        // Unlink the type from the parent.
+        // (If there is no create event, then event_inherited is implicit)
+        this.asset.variables!.extends = this.project.native.objectInstanceBase;
+      }
+    } else if (this.isCreateEvent) {
+      // Ensure that the type is set as the parent by re-assigning it.
+      // eslint-disable-next-line no-self-assign
+      this.asset.parent = this.asset.parent;
+    }
+  }
+
+  protected computeFunctionCallDiagnostics() {
+    // Look through the function call ranges to see if we have too many or too few arguments.
+    assert(this._functionCalls, 'Function calls must be initialized');
+    this.diagnostics.MISSING_REQUIRED_ARGUMENT = [];
+    this.diagnostics.TOO_MANY_ARGUMENTS = [];
+
+    calls: for (let i = 0; i < this._functionCalls.length; i++) {
+      const args = this._functionCalls[i];
+      assert(args, 'Function call args must be initialized');
+      const func = args[0].type;
+      if (!func.signifier) {
+        // Then this was a generic function type and we don't know
+        // how many args it takes or what it returns.
+        continue;
+      }
+      const params = func.listParameters() || [];
+      // Handle missing arguments
+      for (let j = 0; j < params.length; j++) {
+        const param = params[j];
+        const arg = args[j] as FunctionArgRange | undefined;
+        const argIsEmpty = !arg?.hasExpression;
+        if (param && !param.optional && argIsEmpty) {
+          this.diagnostics.MISSING_REQUIRED_ARGUMENT.push(
+            Diagnostic.error(
+              `Missing required argument \`${param.name}\` for function \`${func.name}\`.`,
+              arg || args[0],
+            ),
+          );
+          // There may be more missing args but
+          // that just starts to get noisy.
+          continue calls;
+        }
+      }
+      if (params.at(-1)?.name === '...') {
+        // Then we can't have too many arguments
+        continue;
+      }
+      if (!params.length && args.length === 1 && !args[0].hasExpression) {
+        // Then this is a zero-arg function and we aren't providing any args.
+        continue;
+      }
+      // Handle extra arguments.
+      for (let j = params.length; j < args.length; j++) {
+        const arg = args[j];
+        this.diagnostics.TOO_MANY_ARGUMENTS.push(
+          Diagnostic.warn(`Extra argument for function \`${func.name}\`.`, arg),
+        );
+      }
+    }
+  }
+
+  protected computeUndeclaredSymbolDiagnostics() {
+    this.diagnostics.UNDECLARED_VARIABLE_REFERENCE = [];
+    const undeclaredSymbols = new Set<Signifier>();
+    outer: for (const ref of this._refs) {
+      if (ref.item.def || ref.item.native || undeclaredSymbols.has(ref.item)) {
+        continue;
+      }
+      // Handle global prefixes setting
+      const prefixes =
+        this.project.options?.settings?.autoDeclareGlobalsPrefixes || [];
+      for (const prefix of prefixes) {
+        if (ref.item.name.startsWith(prefix)) {
+          // Then mark it as *global* and *declared*
+          ref.item.global = true;
+          ref.item.local = false;
+          ref.item.instance = false;
+          ref.item.def = {};
+          ref.item.describe(`Auto-declared by global prefix \`${prefix}\``);
+          continue outer;
+        }
+      }
+
+      this.diagnostics.UNDECLARED_VARIABLE_REFERENCE.push(
+        Diagnostic.error(`Undeclared symbol \`${ref.item.name}\``, ref, 'warn'),
+      );
+      undeclaredSymbols.add(ref.item);
+    }
+  }
+
+  protected computeJsdocDiagnostics() {
+    this.diagnostics.JSDOC = [];
+    for (const jsdoc of this.jsdocs) {
+      for (const diagnostic of jsdoc.diagnostics) {
+        this.diagnostics.JSDOC.push(
+          Diagnostic.warn(
+            diagnostic.message,
+            new Range(
+              Position.from(this, diagnostic.start),
+              Position.from(this, diagnostic.end),
+            ),
+          ),
+        );
+      }
+    }
   }
 
   computeUnusedSymbolDiagnostics() {
@@ -941,8 +679,13 @@ export class Code {
     }
   }
 
-  /** Publish only the completed view. Semantic computation belongs to ProjectAnalysis. */
-  publishDiagnostics() {
+  /** Update and emit diagnostics */
+  updateDiagnostics() {
+    this.discoverEventInheritanceWarnings();
+    this.computeFunctionCallDiagnostics();
+    this.computeUndeclaredSymbolDiagnostics();
+    this.computeJsdocDiagnostics();
+    this.computeUnusedSymbolDiagnostics();
     const allDiagnostics: Diagnostic[] = [];
     for (const items of Object.values(this.diagnostics)) {
       allDiagnostics.push(...items);
@@ -951,17 +694,12 @@ export class Code {
     return allDiagnostics;
   }
 
-  updateDiagnostics() {
-    getProjectAnalysis(this.project).analyzeSync();
-    return Object.values(this.diagnostics).flat();
+  updateGlobals() {
+    this.reset();
+    return registerGlobals(this);
   }
 
-  /** @deprecated The service binds all declarations before evaluating any unit. */
-  updateGlobals() {
-    getProjectAnalysis(this.project).analyzeSync();
-  }
-  /** @deprecated Use reload() or Project.analysis.analyze(). */
   updateAllSymbols() {
-    getProjectAnalysis(this.project).analyzeSync();
+    registerSignifiers(this);
   }
 }

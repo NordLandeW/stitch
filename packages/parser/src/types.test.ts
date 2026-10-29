@@ -1,88 +1,10 @@
 import { expect } from 'chai';
 import { Signifier } from './signifiers.js';
-import {
-  getTypes,
-  narrows,
-  replaceGenerics,
-  updateGenericsMap,
-} from './types.checks.js';
+import { replaceGenerics, updateGenericsMap } from './types.checks.js';
 import { KnownTypesMap, typeFromFeatherString } from './types.feather.js';
 import { Type, TypeStore } from './types.js';
 
 describe('Types', function () {
-  it('preserves generic alias unions and leaves parameterized inputs unchanged', function () {
-    const alternatives = [
-      new Type('Real').named('T').genericize(),
-      new Type('String').named('T').genericize(),
-    ];
-    const expanded = typeFromFeatherString(
-      'Array<T>|T',
-      [{ T: alternatives }],
-      false,
-    );
-    expect(expanded.map((type) => type.kind)).to.deep.equal([
-      'Array',
-      'Real',
-      'String',
-    ]);
-    expect(expanded[0].items!.type.map((type) => type.kind)).to.deep.equal([
-      'Real',
-      'String',
-    ]);
-    const container = new Type('Struct').named('Container');
-    container.addItemType(new Type('Real'));
-    const parameterized = typeFromFeatherString(
-      'Container<String>',
-      new Map([['Container', container]]),
-      false,
-    )[0];
-    expect(parameterized.items!.type.map((type) => type.kind)).to.deep.equal([
-      'String',
-    ]);
-    expect(container.items!.type.map((type) => type.kind)).to.deep.equal([
-      'Real',
-    ]);
-  });
-
-  it('substitutes generics in recursive item graphs without mutating inputs', function () {
-    const generic = new Type('Any').named('T').genericize();
-    const input = new Type('Array');
-    input.items = new TypeStore().addType([input, generic]);
-    const result = replaceGenerics(
-      input,
-      new Map(),
-      new Map([['T', new TypeStore().addType(new Type('Real'))]]),
-    ).type[0];
-    expect(result).not.to.equal(input);
-    expect(result.items!.type[0]).to.equal(result);
-    expect(result.items!.type[1].kind).to.equal('Real');
-    expect(input.items!.type).to.deep.equal([input, generic]);
-    const expected = new Type('Array');
-    expected.items = new TypeStore().addType(expected);
-    expect(updateGenericsMap(expected, input, new Map()).size).to.equal(0);
-    const mapped = updateGenericsMap(generic, input, new Map());
-    expect(mapped.get('T')!.type).to.deep.equal([input]);
-  });
-
-  it('checks recursive return compatibility while retaining incompatible alternatives', function () {
-    const left = Type.Function;
-    const right = Type.Function;
-    left.setReturnType([left, new Type('Real')]);
-    right.setReturnType([right, new Type('Real')]);
-    expect(narrows(left, right)).to.equal(true);
-    right.setReturnType([right, new Type('String')]);
-    expect(narrows(left, right)).to.equal(false);
-    expect(narrows(right, left)).to.equal(false);
-  });
-
-  it('extracts wide type stores without spreading function arguments', function () {
-    const real = new Type('Real');
-    const input = new TypeStore().addType(Array(200001).fill(real));
-    const output = getTypes(input);
-    expect(output).to.have.length(200001);
-    expect(output.every((type) => type === real)).to.equal(true);
-  });
-
   it('can resursively resolve generic types', function () {
     const genericType = new Type('Any').named('T').genericize();
     const generics = [{ T: [genericType] }];

@@ -5,13 +5,7 @@ export type GmlSpec = z.output<typeof gmlSpecSchema>;
 export type GmlSpecFunction = GmlSpec['functions'][number];
 export type GmlSpecVariable = GmlSpec['variables'][number];
 export type GmlSpecConstant = GmlSpec['constants'][number];
-export type GmlSpecEnumeration = GmlSpec['enumerations'][number];
-export type GmlSpecEnumMember = GmlSpecEnumeration['members'][number];
-export type GmlSpecEntry =
-  | GmlSpecFunction
-  | GmlSpecVariable
-  | GmlSpecConstant
-  | GmlSpecEnumeration;
+export type GmlSpecEntry = GmlSpecFunction | GmlSpecVariable | GmlSpecConstant;
 
 const booleanStringSchema = z
   .union([z.literal('true'), z.literal('false')])
@@ -20,9 +14,7 @@ const typeStringSchema = z.string().transform((v) => normalizeTypeString(v));
 const localeSchema = z.enum(['GB', 'US']);
 const numberSchema = z
   .string()
-  .refine((v) => v.trim() !== '' && Number.isFinite(Number(v)), {
-    message: 'Expected a finite numeric enum value',
-  })
+  .refine((v) => /[\d.-]+/.test(v))
   .transform((v) => +v);
 /**
  * There appear to be a very small number of allowed strings, but

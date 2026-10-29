@@ -76,9 +76,9 @@ export function getTypes(items: Typeable | undefined): Type[] {
   }
   for (const item of arrayWrapped(items)) {
     if (item.$tag === 'Sym') {
-      for (const type of item.type.type) types.push(type);
+      types.push(...item.type.type);
     } else if (item.$tag === 'TypeStore') {
-      for (const type of item.type) types.push(type);
+      return [...item.type];
     } else {
       types.push(item);
     }
@@ -105,20 +105,12 @@ export function narrows(
   narrowType: Type | TypeStore | Type[],
   broadType: Type | TypeStore | Type[],
 ): boolean {
-  return narrowsWithPath(narrowType, broadType, new Map());
-}
-
-type NarrowingPath = Map<Type, Set<Type>>;
-
-function narrowsWithPath(
-  narrowType: Type | TypeStore | Type[],
-  broadType: Type | TypeStore | Type[],
-  path: NarrowingPath,
-): boolean {
+  // Convert to type arrays
   const narrowTypes = getTypes(narrowType);
   const broadTypes = getTypes(broadType);
+  // All "narrow" types must be a subtype of at least one "broad" type
   return narrowTypes.every((narrow) =>
-    broadTypes.some((broad) => narrowsType(narrow, broad, path)),
+    broadTypes.some((broad) => narrowsType(narrow, broad)),
   );
 }
 
@@ -129,11 +121,7 @@ function narrowsWithPath(
  *
  * Identical types also return `true`.
  */
-function narrowsType(
-  narrowType: Type,
-  broadType: Type,
-  path: NarrowingPath = new Map(),
-): boolean {
+function narrowsType(narrowType: Type, broadType: Type): boolean {
   if (narrowType === broadType) {
     return true;
   }
@@ -150,46 +138,36 @@ function narrowsType(
     return false;
   }
 
-  let compared = path.get(narrowType);
-  if (compared?.has(broadType)) return true;
-  if (!compared) path.set(narrowType, (compared = new Set()));
-  compared.add(broadType);
-  try {
-    // The subtype must have all of the same members, though it could also have others
-    for (const member of broadType.listMembers()) {
-      const matching = narrowType.getMember(member.name);
-      if (!matching) {
-        return false;
-      }
-    }
-    // Similarly, the subtype must have the same params (though it could have others)
-    for (const param of broadType.listParameters()) {
-      const matching = !param || narrowType.getParameter(param.idx!);
-      if (!matching) {
-        return false;
-      }
-    }
-    // Check return type
-    if (
-      broadType.returns &&
-      (!narrowType.returns ||
-        !narrowsWithPath(narrowType.returns, broadType.returns, path))
-    ) {
+  // The subtype must have all of the same members, though it could also have others
+  for (const member of broadType.listMembers()) {
+    const matching = narrowType.getMember(member.name);
+    if (!matching) {
       return false;
     }
-    // Check the constructs type
-    if (
-      broadType.isConstructor &&
-      (!narrowType.isConstructor ||
-        !narrowsWithPath(narrowType.self!, broadType.self!, path))
-    ) {
-      return false;
-    }
-
-    return true;
-  } finally {
-    compared.delete(broadType);
   }
+  // Similarly, the subtype must have the same params (though it could have others)
+  for (const param of broadType.listParameters()) {
+    const matching = !param || narrowType.getParameter(param.idx!);
+    if (!matching) {
+      return false;
+    }
+  }
+  // Check return type
+  if (
+    broadType.returns &&
+    (!narrowType.returns || !narrows(narrowType.returns, broadType.returns))
+  ) {
+    return false;
+  }
+  // Check the constructs type
+  if (
+    broadType.isConstructor &&
+    (!narrowType.isConstructor || !narrows(narrowType.self!, broadType.self!))
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 /**
@@ -231,16 +209,14 @@ export function normalizeType(
             new Type(defaultItemKind);
           if (itemType.isGeneric) {
             // Then extend the type to allow having a generic without mutating the original
-            type = type.deriveDetached().genericize().named(itemType.name);
+            type = type.derive().genericize().named(itemType.name);
           }
           if (utilityKind === 'StaticType') {
-            const statics =
-              itemType.statics ||
-              itemType.signifier?.getTypeByKind('Function')?.statics;
-            type = statics || Type.Struct;
-            if (!statics) {
-              for (const member of itemType.listMembers()) {
-                if (member.static) type.setOwnMember(member);
+            // TODO: Create a new type consisting of the type's static members
+            type = Type.Struct;
+            for (const member of itemType.listMembers()) {
+              if (member.static) {
+                type.addMember(member);
               }
             }
           }
@@ -266,47 +242,45 @@ export function updateGenericsMap(
   /** Map of generics by name to their *inferred type* */
   generics: Map<string, TypeStore> = new Map(),
 ) {
-  const frame = (left: Typeable, right: Typeable) => ({
-    expected: getTypes(left).flatMap(
-      (type) => normalizeType(type, knownTypes).type,
-    ),
-    inferred: getTypes(right).flatMap(
-      (type) => normalizeType(type, knownTypes).type,
-    ),
-    expectedIndex: 0,
-    inferredIndex: 0,
-  });
-  const pending = [frame(expected, inferred)];
-  const visited = new Map<Type, Set<Type>>();
-  while (pending.length) {
-    const current = pending[pending.length - 1];
-    if (current.expectedIndex === current.expected.length) {
-      pending.pop();
-      continue;
-    }
-    const expectedType = current.expected[current.expectedIndex];
+  const expectedTypes = getTypes(expected)
+    .map((t) => normalizeType(t, knownTypes).type)
+    .flat();
+  const inferredTypes = getTypes(inferred)
+    .map((t) => normalizeType(t, knownTypes).type)
+    .flat();
+
+  // The collection of 1 or more expected types is supposed
+  // to match up with the collection of 1 or more inferred types.
+  // For the overlap of compatible types we need to recurse through
+  // the types and their contained types (stored on the `items` property)
+  // to identify any generics specified in the expected types that we
+  // can resolve with the inferred types.
+  for (const expectedType of expectedTypes) {
     let generic: TypeStore | undefined;
     if (expectedType.isGeneric) {
-      const name = expectedType.name!;
-      generic = generics.get(name) || new TypeStore();
-      generics.set(name, generic);
+      const genericName = expectedType.name!;
+      generic = generics.get(genericName) || new TypeStore();
+      generics.set(genericName, generic);
     }
-    if (current.inferredIndex === current.inferred.length) {
-      current.expectedIndex++;
-      current.inferredIndex = 0;
-      continue;
+    for (const inferredType of inferredTypes) {
+      if (narrowsType(inferredType, expectedType)) {
+        if (generic) {
+          // Then we can use this inferred type to resolve the generic
+          generic.addType(inferredType);
+        }
+        // Repeat on contained types, if there are any
+        if (inferredType.items?.hasTypes && expectedType.items?.hasTypes) {
+          updateGenericsMap(
+            expectedType.items,
+            inferredType.items,
+            knownTypes,
+            generics,
+          );
+        }
+      }
     }
-    const inferredType = current.inferred[current.inferredIndex++];
-    let compared = visited.get(expectedType);
-    if (!compared) visited.set(expectedType, (compared = new Set()));
-    if (compared.has(inferredType)) continue;
-    compared.add(inferredType);
-    if (!narrowsType(inferredType, expectedType)) continue;
-    if (generic) generic.addType(inferredType);
-    // Resume the parent after its child, preserving generic alternative order.
-    if (inferredType.items?.hasTypes && expectedType.items?.hasTypes)
-      pending.push(frame(expectedType.items, inferredType.items));
   }
+
   return generics;
 }
 
@@ -316,42 +290,25 @@ export function replaceGenerics(
   generics: Map<string, TypeStore>,
 ): TypeStore {
   const startingTypes = getTypes(startingType);
-  if (!generics.size) {
-    const unchanged = new TypeStore();
-    unchanged.type = startingTypes;
-    return unchanged;
-  }
-  // Clone each input node once, reserving its identity before following items.
-  // Generic substitution preserves finite cycles and shared container aliases.
-  const copies = new Map<Type, Type>();
-  const pending: { source: Type; target: Type }[] = [];
-  const replace = (input: Typeable): TypeStore => {
-    const values: Type[] = [];
-    for (const starting of getTypes(input)) {
-      const replacements =
-        starting.isGeneric && generics.has(starting.name!)
-          ? generics.get(starting.name!)!.type
-          : [starting];
-      for (const source of replacements) {
-        let target = copies.get(source);
-        if (!target) {
-          target = source.deriveDetached();
-          copies.set(source, target);
-          if (source.items) pending.push({ source, target });
-        }
-        values.push(target);
+  // Recurse through the types and, if we find a generic, replace it!
+  // The complication is that we don't want to mutate the starting types, we need to replace them (or their containers!) with a new type. The easiest way to do this is to just create new types from the jump.
+  const replacedTypes = new TypeStore();
+  for (const startingType of startingTypes) {
+    const newTypes =
+      startingType.isGeneric && generics.has(startingType.name!)
+        ? generics.get(startingType.name!)?.type
+        : [startingType];
+    for (const type of newTypes || []) {
+      const newType = type.derive();
+      if (type.items) {
+        newType.items = replaceGenerics(type.items, knownTypes, generics);
       }
+      replacedTypes.addType(newType);
     }
-    const result = new TypeStore();
-    result.type = values.some((type) => type.kind !== 'Any')
-      ? values.filter((type) => type.kind !== 'Any')
-      : values;
-    return result;
-  };
-  const result = replace(startingType);
-  for (let index = 0; index < pending.length; index++) {
-    const { source, target } = pending[index];
-    target.items = replace(source.items!);
   }
-  return result;
+  // Remove 'Any' types if there is something more specific
+  if (replacedTypes.type.find((t) => t.kind !== 'Any')) {
+    replacedTypes.type = replacedTypes.type.filter((t) => t.kind !== 'Any');
+  }
+  return replacedTypes;
 }

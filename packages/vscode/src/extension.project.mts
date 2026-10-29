@@ -20,7 +20,6 @@ import vscode from 'vscode';
 import { loudlyLogThrownAsync } from './assert.mjs';
 import { stitchConfig } from './config.mjs';
 import { stitchEvents } from './events.mjs';
-import { applyProjectEdits } from './extension.edits.mjs';
 import { killProjectRunner } from './lib.mjs';
 import { logger, showErrorMessage, warn } from './log.mjs';
 
@@ -36,15 +35,6 @@ export class GameMakerProject extends Project {
 
   get name() {
     return this.yyp.name;
-  }
-
-  override get defaultAnalysisConfiguration(): string {
-    const last = stitchConfig.context?.workspaceState.get<{ config?: unknown }>(
-      'lastRunConfig',
-    );
-    if (typeof last?.config === 'string' && this.configs.includes(last.config))
-      return last.config;
-    return stitchConfig.runConfigDefault || super.defaultAnalysisConfiguration;
   }
 
   openInIde() {
@@ -167,8 +157,7 @@ export class GameMakerProject extends Project {
       options?.clean ? 'clean-project-start' : 'run-project-start',
       this,
     );
-    const config = options?.config || this.defaultAnalysisConfiguration;
-    await this.setAnalysisConfiguration(config);
+    const config = options?.config ?? stitchConfig.runConfigDefault;
     let compiler = options?.compiler ?? stitchConfig.runCompilerDefault;
     if (['yyc', 'vm'].indexOf(compiler) === -1) {
       compiler = stitchConfig.runCompilerDefault;
@@ -195,7 +184,7 @@ export class GameMakerProject extends Project {
               : stringifyGameMakerBuildCommand
           )(runtime, {
             project: this.yypPath.absolute,
-            config,
+            config: config || undefined,
             yyc: compiler === 'yyc',
             debug: options?.debug,
             debuggerPort: options?.debuggerPort,
@@ -229,7 +218,7 @@ export class GameMakerProject extends Project {
               : computeGameMakerBuildCommand
           )(runtime, {
             project: this.yypPath.absolute,
-            config,
+            config: config || undefined,
             yyc: compiler === 'yyc',
             debug: options?.debug,
             debuggerPort: options?.debuggerPort,
@@ -279,29 +268,13 @@ export class GameMakerProject extends Project {
     const options: ProjectOptions = {
       onDiagnostics,
       onLoadProgress: onProgress,
-      documentText: (path) =>
-        vscode.workspace.textDocuments
-          .find(
-            (document) =>
-              !document.isClosed &&
-              document.uri.scheme === 'file' &&
-              pathy(document.uri.fsPath).equals(path),
-          )
-          ?.getText(),
-      applyEdits: applyProjectEdits,
       settings: {
         autoDeclareGlobalsPrefixes: stitchConfig.autoDeclaredGlobalsPrefixes,
-        analysisConfiguration: stitchConfig.runConfigDefault || undefined,
       },
       logger,
     };
     const project = new GameMakerProject(yypPath, options);
-    try {
-      await project.initialize(options);
-      return project;
-    } catch (error) {
-      project.dispose();
-      throw error;
-    }
+    await project.initialize(options);
+    return project;
   }
 }

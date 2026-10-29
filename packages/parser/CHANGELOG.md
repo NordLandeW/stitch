@@ -1,23 +1,5 @@
 # @bscotch/gml-parser Changelog
 
-## Unreleased
-
-### Features
-
-- Added project-wide macro expansion with configuration inheritance, forward references, continuations, and physical/invocation source maps.
-- Added separate syntax, binding, evaluation, checking, and publication phases with dependency-driven updates and explicit document analysis states.
-- Added runtime-aware language capabilities, native-specification provenance, enum values, readability/writability, and recoverable diagnostic ownership.
-- Expanded GML syntax and inference for blocks, function/struct expressions, statics, method rebinding, container access, and control flow.
-- Include inherited object-editor Variable Definitions as pre-Create inputs with source-resource provenance and flow-sensitive GML writes.
-
-### Fixes
-
-- Reconcile resource removal, parent/event changes, extension type changes, and restored files without retaining stale symbols or deleting unrelated resources.
-- Plan complete symbol/resource renames before applying changes, preserve host-owned buffers, and report partial application failures with affected paths.
-- Preserve independent shorthand roles and reject unsafe macro or lexical-capture renames.
-- Keep recoverable JSDoc errors local and report internal analysis failures without publishing a successful empty view.
-- Preserve nullish short-circuit effects and capture `??=` receivers and indices before evaluating the right-hand side.
-
 ## 1.17.0 (2026-01-09)
 
 ### Features

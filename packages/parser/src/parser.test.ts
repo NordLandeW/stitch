@@ -32,25 +32,6 @@ function showErrors(
 }
 
 describe('Parser', function () {
-  it('validates the grammar and distinguishes blocks, assignments and expression atoms', function () {
-    const parser = new GmlParser({ validateGrammar: true });
-    for (const code of [
-      'function f() { { var x = 1; } return { value: 2 }; }',
-      'if (true) begin var a = 1; end else { var b = 2; }',
-      'var obj = { value: 1 }; obj.value += 2; var copy = obj.value;',
-      'var call = (function() { return 42; })();',
-      'switch (x) { case 0: { value = 1; } value += 2; break; case 1: default: break; }',
-      'var callback = function() { return { nested: [1, 2] }; };',
-    ]) {
-      const result = parser.parse(code);
-      expect(result.lexed.errors, code).to.deep.equal([]);
-      expect(
-        result.errors.map((error) => error.message),
-        code,
-      ).to.deep.equal([]);
-    }
-  });
-
   it('can get types from typestrings', function () {
     expect(Type.fromFeatherString('Array', new Map(), false)[0].kind).to.equal(
       'Array',

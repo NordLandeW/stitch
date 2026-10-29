@@ -72,23 +72,18 @@ export class GameMakerTreeProvider
   > = new vscode.EventEmitter<Treeable | undefined | null | void>();
   readonly onDidCollapseElement = this._onDidCollapseElement.event;
 
-  private disposed = false;
-  private readonly subscriptions: { off(): unknown }[] = [];
-
-  constructor(readonly workspace: StitchWorkspace) {}
-
-  dispose(): void {
-    if (this.disposed) return;
-    this.disposed = true;
-    for (const subscription of this.subscriptions.splice(0)) subscription.off();
-    // These indexes belong to the single active workspace's resource tree.
-    TreeAsset.lookup.clear();
-    TreeCode.lookup.clear();
-    GameMakerFolder.lookup.clear();
-    this.tree.folders.length = 0;
-    this.tree.resources.length = 0;
-    this._onDidChangeTreeData.dispose();
-    this._onDidCollapseElement.dispose();
+  constructor(readonly workspace: StitchWorkspace) {
+    stitchEvents.on('asset-changed', (asset) => {
+      const item = TreeAsset.lookup.get(asset);
+      if (item) {
+        item.refreshTreeItem();
+        this.changed(item.parent);
+        this.changed(item);
+      }
+    });
+    stitchEvents.on('project-changed', (project) => {
+      this.rebuild();
+    });
   }
 
   get projects(): GameMakerProject[] {
@@ -107,7 +102,6 @@ export class GameMakerTreeProvider
   }
 
   changed(item?: Treeable) {
-    if (this.disposed) return;
     this._onDidChangeTreeData.fire(item);
   }
 
@@ -117,7 +111,6 @@ export class GameMakerTreeProvider
    * with `/` separators.
    */
   reveal(item: string | Asset | Code | undefined) {
-    if (this.disposed) return;
     item ||= this.workspace.getCurrentAsset();
     if (!item) {
       return;
@@ -267,7 +260,6 @@ export class GameMakerTreeProvider
     folder: GameMakerFolder,
     addedTo: GameMakerFolder,
   ) {
-    if (this.disposed) return;
     if (!asset) {
       showErrorMessage(`Failed to create new asset.`);
       return;
@@ -349,8 +341,8 @@ export class GameMakerTreeProvider
     }
   }
 
-  async editSound(entity: TreeAsset | Asset | undefined) {
-    entity ||= getAssetFromRef(await this.workspace.getRefFromSelection());
+  editSound(entity: TreeAsset | Asset | undefined) {
+    entity ||= getAssetFromRef(this.workspace.getRefFromSelection());
     if (!entity) {
       console.log('No entity to edit sprite for');
       return;
@@ -359,14 +351,14 @@ export class GameMakerTreeProvider
     if (!isAssetOfKind(asset, 'sounds')) {
       return;
     }
-    return vscode.commands.executeCommand(
+    vscode.commands.executeCommand(
       'vscode.open',
       vscode.Uri.file(asset.dir.join(asset.yy.soundFile).absolute),
     );
   }
 
-  async editSprite(entity: TreeAsset | Asset | undefined) {
-    entity ||= getAssetFromRef(await this.workspace.getRefFromSelection());
+  editSprite(entity: TreeAsset | Asset | undefined) {
+    entity ||= getAssetFromRef(this.workspace.getRefFromSelection());
     console.log('editing sprite', entity);
     if (!entity) {
       console.log('No entity to edit sprite for');
@@ -835,7 +827,6 @@ export class GameMakerTreeProvider
   }
 
   getChildren(element?: Treeable | undefined): Treeable[] | undefined {
-    if (this.disposed) return [];
     const assetSorter = (a: TreeAsset, b: TreeAsset) => {
       return a.asset.name
         .toLowerCase()
@@ -895,7 +886,6 @@ export class GameMakerTreeProvider
   }
 
   rebuild() {
-    if (this.disposed) return this;
     // TODO: Move the logic for this into the tree elements so that we
     // don't have to do so much of fully-rebuilding on change.
 
@@ -1023,150 +1013,116 @@ export class GameMakerTreeProvider
     this.rebuild();
   }
 
-  *register(): Generator<vscode.Disposable> {
-    // Activation owns the provider before subsequent allocations can fail.
-    yield this;
-    if (this.disposed) return;
-    this.subscriptions.push(
-      stitchEvents.on('asset-changed', (asset) => {
-        if (this.disposed) return;
-        const item = TreeAsset.lookup.get(asset);
-        if (item) {
-          item.refreshTreeItem();
-          this.changed(item.parent);
-          this.changed(item);
-        }
-      }),
-    );
-    this.subscriptions.push(
-      stitchEvents.on('project-changed', () => this.rebuild()),
-    );
+  register() {
     this.view = vscode.window.createTreeView('bscotch-stitch-resources', {
       treeDataProvider: this.rebuild(),
       canSelectMany: true,
       dragAndDropController: this,
     });
-    yield this.view;
-    this.subscriptions.push(
-      stitchEvents.on('asset-deleted', (asset) => {
-        if (this.disposed) return;
-        const treeItem = TreeAsset.lookup.get(asset);
-        if (!treeItem) return;
-        TreeAsset.lookup.delete(asset);
-        treeItem.parent.removeResource(treeItem);
-        this.changed(treeItem.parent);
-      }),
-    );
-    this.subscriptions.push(
-      stitchEvents.on('code-file-deleted', (code) => {
-        if (this.disposed) return;
-        const treeItem = TreeCode.lookup.get(code);
-        if (!treeItem) return;
-        TreeCode.lookup.delete(code);
-        this.changed(treeItem.parent);
-      }),
-    );
 
-    yield registerCommand('stitch.assets.import', this.importAssets.bind(this));
-    yield registerCommand(
-      'stitch.assets.renameFolder',
-      this.promptToRenameFolder.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.deleteFolder',
-      this.deleteFolder.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.deleteSpriteFrame',
-      this.deleteSpriteFrame.bind(this),
-    );
-    yield registerCommand(
-      'stitch.diagnostics.suppress',
-      this.suppressDiagnostics.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.rename',
-      this.promptToRenameAsset.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.editSprite',
-      (item: TreeAsset | Asset | undefined) => this.editSprite(item),
-    );
-    yield registerCommand(
-      'stitch.assets.editSound',
-      (item: TreeAsset | Asset | undefined) => this.editSound(item),
-    );
-    yield registerCommand(
-      'stitch.assets.duplicate',
-      this.duplicateAsset.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.newSound',
-      this.upsertSounds.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.newFolder',
-      this.createFolder.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.newScript',
-      this.createScript.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.newObject',
-      this.createObject.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.newSprite',
-      this.createSprite.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.newSpriteFromImage',
-      this.createSpriteFromImage.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.replaceSpriteFrames',
-      this.replaceSpriteFrames.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.newShader',
-      this.createShader.bind(this),
-    );
-    yield registerCommand('stitch.assets.newRoom', this.createRoom.bind(this));
-    yield registerCommand(
-      'stitch.assets.newEvent',
-      this.createEvent.bind(this),
-    );
-    yield registerCommand('stitch.assets.setParent', this.setParent.bind(this));
-    yield registerCommand('stitch.assets.setSprite', this.setSprite.bind(this));
-    yield registerCommand(
-      'stitch.assets.addRoomInstance',
-      this.addRoomInstance.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.deleteRoomInstance',
-      this.deleteRoomInstance.bind(this),
-    );
-    yield registerCommand('stitch.assets.reveal', this.reveal.bind(this));
-    yield registerCommand(
-      'stitch.assets.filters.delete',
-      this.deleteFilter.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.filters.enable',
-      this.enableFilter.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.filters.disable',
-      this.disableFilter.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.filters.new',
-      this.createFilter.bind(this),
-    );
-    yield registerCommand(
-      'stitch.assets.filters.edit',
-      this.editFilter.bind(this),
-    );
+    // Handle emitted events
+    stitchEvents.on('asset-deleted', (asset) => {
+      const treeItem = TreeAsset.lookup.get(asset);
+      if (!treeItem) {
+        return;
+      }
+      TreeAsset.lookup.delete(asset);
+      treeItem.parent.removeResource(treeItem);
+      this.changed(treeItem.parent);
+    });
+    stitchEvents.on('code-file-deleted', (code) => {
+      const treeItem = TreeCode.lookup.get(code);
+      if (!treeItem) {
+        return;
+      }
+      TreeCode.lookup.delete(code);
+      this.changed(treeItem.parent);
+    });
+
+    // Return subscriptions to owned commands and this view
+    const subscriptions = [
+      this.view,
+      registerCommand('stitch.assets.import', this.importAssets.bind(this)),
+      registerCommand(
+        'stitch.assets.renameFolder',
+        this.promptToRenameFolder.bind(this),
+      ),
+      registerCommand(
+        'stitch.assets.deleteFolder',
+        this.deleteFolder.bind(this),
+      ),
+      registerCommand(
+        'stitch.assets.deleteSpriteFrame',
+        this.deleteSpriteFrame.bind(this),
+      ),
+      registerCommand(
+        'stitch.diagnostics.suppress',
+        this.suppressDiagnostics.bind(this),
+      ),
+      registerCommand(
+        'stitch.assets.rename',
+        this.promptToRenameAsset.bind(this),
+      ),
+      registerCommand(
+        'stitch.assets.editSprite',
+        (item: TreeAsset | Asset | undefined) => this.editSprite(item),
+      ),
+      registerCommand(
+        'stitch.assets.editSound',
+        (item: TreeAsset | Asset | undefined) => {
+          console.log('triggered edit sound');
+          this.editSound(item);
+        },
+      ),
+      registerCommand(
+        'stitch.assets.duplicate',
+        this.duplicateAsset.bind(this),
+      ),
+      registerCommand('stitch.assets.newSound', this.upsertSounds.bind(this)),
+      registerCommand('stitch.assets.newFolder', this.createFolder.bind(this)),
+      registerCommand('stitch.assets.newScript', this.createScript.bind(this)),
+      registerCommand('stitch.assets.newObject', this.createObject.bind(this)),
+      registerCommand('stitch.assets.newSprite', this.createSprite.bind(this)),
+      registerCommand(
+        'stitch.assets.newSpriteFromImage',
+        this.createSpriteFromImage.bind(this),
+      ),
+      registerCommand(
+        'stitch.assets.replaceSpriteFrames',
+        this.replaceSpriteFrames.bind(this),
+      ),
+      registerCommand('stitch.assets.newShader', this.createShader.bind(this)),
+      registerCommand('stitch.assets.newRoom', this.createRoom.bind(this)),
+      registerCommand('stitch.assets.newEvent', this.createEvent.bind(this)),
+      registerCommand('stitch.assets.setParent', this.setParent.bind(this)),
+      registerCommand('stitch.assets.setSprite', this.setSprite.bind(this)),
+      registerCommand(
+        'stitch.assets.addRoomInstance',
+        this.addRoomInstance.bind(this),
+      ),
+      registerCommand(
+        'stitch.assets.deleteRoomInstance',
+        this.deleteRoomInstance.bind(this),
+      ),
+      registerCommand('stitch.assets.reveal', this.reveal.bind(this)),
+      registerCommand(
+        'stitch.assets.filters.delete',
+        this.deleteFilter.bind(this),
+      ),
+      registerCommand(
+        'stitch.assets.filters.enable',
+        this.enableFilter.bind(this),
+      ),
+      registerCommand(
+        'stitch.assets.filters.disable',
+        this.disableFilter.bind(this),
+      ),
+      registerCommand(
+        'stitch.assets.filters.new',
+        this.createFilter.bind(this),
+      ),
+      registerCommand('stitch.assets.filters.edit', this.editFilter.bind(this)),
+    ];
+    return subscriptions;
   }
 }

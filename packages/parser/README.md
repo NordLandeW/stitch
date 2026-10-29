@@ -19,7 +19,7 @@ Unlike the Stitch CLI, which is focused on high-level project management, this p
 - [Node.js](https://nodejs.org) v20+
 - Windows. Might partially work on other operating systems, but it is developed and tested only on Windows.
 
-Language analysis selects native specifications and language capabilities for the project's runtime/IDE version, including legacy callable scripts and newer GML features. Project-file compatibility and target-specific runtime behavior still depend on the GameMaker version. See [language analysis and editor integration](docs/language-service.md#runtime-and-language-capabilities) for the capability boundaries and fallback behavior.
+⚠️ This project supports a narrow set of GameMaker versions. It does not try to be backwards-compatible with every version of GameMaker, and may not properly handle changes in the most recent versions either. It may break your project if your GameMaker version isn't fully compatible.
 
 ## Installation
 
@@ -58,14 +58,11 @@ import { Project } from '@bscotch/gml-parser';
 // and create a model of the project you can then interact with.
 const project = await Project.initialize('path/to/your/project.yyp');
 
-// Reconcile an externally changed YYP resource list.
-await project.reloadYyp();
-
-// Reconcile a listed resource after an external YY or GML change.
-await project.reloadResource(project.dir.join('objects/player/player.yy'));
+// If you've changed something in the project's files *externally*
+// to the Project model, you can do a full reload of the project
+// to make sure you're up to date.
+await project.reload();
 ```
-
-See [language analysis and editor integration](docs/language-service.md) for document states, dependency updates, macros, diagnostics, and buffer-safe rename contracts.
 
 ### View/Manage Project metadata
 
@@ -94,7 +91,7 @@ A `Project` instance provides methods for adding and removing assets, which you 
 // Get a GML file in its parsed state. Returns a Code instance,
 // which includes various methods for querying/modifying them.
 const code = project.getGmlFile(
-  project.dir.join('scripts/some_script/some_script.gml'),
+  '/path/to/my/project/scripts/some_script/some_script.gml',
 );
 
 // Find an asset. Assets are represented by Asset instances,

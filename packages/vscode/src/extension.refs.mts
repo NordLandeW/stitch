@@ -8,30 +8,21 @@ export class StitchReferenceProvider implements vscode.ReferenceProvider {
   async provideReferences(
     document: vscode.TextDocument,
     position: vscode.Position,
-    context: vscode.ReferenceContext,
+    _context: vscode.ReferenceContext,
     token: vscode.CancellationToken,
   ): Promise<vscode.Location[] | undefined> {
-    const file = await this.workspace.ensureProjectCurrent(document, token);
-    const candidates =
-      file?.getReferenceCandidatesAt(document.offsetAt(position)) || [];
-    if (!candidates.length) return;
-    const symbols = new Set(candidates.map((reference) => reference.item));
-    const references = new Set(
-      [...symbols].flatMap((symbol) => [...symbol.refs]),
-    );
-    const locations = new Map<string, vscode.Location>();
-    for (const ref of references) {
-      if (!context.includeDeclaration && ref.isDef) continue;
-      for (const range of ref.queryRange ? [ref, ref.queryRange] : [ref]) {
-        const location = locationOf(range);
-        if (location)
-          locations.set(
-            `${location.uri.toString()}:${range.start.offset}:${range.end.offset}`,
-            location,
-          );
-      }
+    if (!(await this.workspace.ensureProjectCurrent(document, token))) return;
+    const symbol = this.workspace.getSignifier(document, position);
+    if (!symbol) {
+      return;
     }
-    return [...locations.values()];
+    return [...symbol.refs.values()]
+      .map((ref) => {
+        const range = locationOf(ref);
+        if (!range) return;
+        return range;
+      })
+      .filter((loc) => !!loc) as vscode.Location[];
   }
 
   static register(workspace: StitchWorkspace) {

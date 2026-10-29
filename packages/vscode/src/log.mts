@@ -1,7 +1,5 @@
+import { Pathy } from '@bscotch/pathy';
 import vscode from 'vscode';
-import { emitLog, formatLogArgument, writeLogLine } from './log.core.mjs';
-
-export { getErrorMessage } from './log.core.mjs';
 
 export async function showErrorMessage<T extends string>(
   message: string | Error,
@@ -19,17 +17,17 @@ export async function showErrorMessage<T extends string>(
  */
 export class Logger {
   static outputChannels = new Map<string, vscode.OutputChannel>();
-  private static active = true;
 
-  // Allocate channels only inside the guarded output path. Construction and
-  // prefix creation must remain safe if the editor output API is unavailable.
   constructor(
     readonly channel: string,
     readonly prefix?: string,
-  ) {}
-
-  static resume(): void {
-    this.active = true;
+  ) {
+    if (!Logger.outputChannels.has(channel)) {
+      Logger.outputChannels.set(
+        channel,
+        vscode.window.createOutputChannel(channel, 'stitch-logs'),
+      );
+    }
   }
 
   withPrefix(prefix: string) {
@@ -37,40 +35,45 @@ export class Logger {
   }
 
   get output() {
-    if (!Logger.active) throw new Error('Output-channel logging is inactive');
-    let output = Logger.outputChannels.get(this.channel);
-    if (!output) {
-      output = vscode.window.createOutputChannel(this.channel, 'stitch-logs');
-      Logger.outputChannels.set(this.channel, output);
-    }
-    return output;
-  }
-
-  static disposeAll(): void {
-    this.active = false;
-    const channels = [...this.outputChannels.values()];
-    this.outputChannels.clear();
-    for (const output of channels) {
-      try {
-        output.dispose();
-      } catch {
-        /* A failed channel cannot retain its peers. */
-      }
-    }
+    return Logger.outputChannels.get(this.channel)!;
   }
 
   protected emit(type: 'debug' | 'info' | 'warn' | 'error', ...args: any[]) {
-    emitLog(
-      {
-        workspaceFolders: () => vscode.workspace.workspaceFolders,
-        appendLine: (line) => this.output.appendLine(line),
-        console: (level, ...components) => console[level](...components),
-      },
-      type,
-      this.channel,
-      this.prefix,
-      args,
-    );
+    const timestamp = new Date().toISOString().replace(/^.*T(.*)Z$/, '$1');
+    args = args.map((arg) => {
+      const isObject = arg && typeof arg === 'object';
+      if (isObject && 'uri' in arg && 'fsPath' in arg.uri) {
+        // Then this is probably a text document
+        // convert it to a URI
+        arg = arg.uri;
+      }
+      if (isObject && 'fsPath' in arg) {
+        // change arg to a pathy object
+        arg = arg.fsPath;
+      }
+      if (isObject && arg instanceof Pathy) {
+        // Log the path relative to the workspace root
+        return arg.relativeFrom(
+          vscode.workspace.workspaceFolders![0].uri.fsPath,
+        );
+      }
+      if (isObject && arg instanceof Error) {
+        return stringifyError(arg, true);
+      }
+      if (isObject && arg.toString() === '[object Object]') {
+        try {
+          return JSON.stringify(arg);
+        } catch {}
+      }
+      return arg;
+    });
+    const components = [type.toUpperCase(), timestamp];
+    if (this.prefix) {
+      components.push(`[${this.prefix}]`);
+    }
+    components.push(...args);
+    this.output.appendLine(components.join(' '));
+    console[type](this.channel, ...components);
   }
 
   log(...args: any[]) {
@@ -94,11 +97,8 @@ export class Logger {
   }
 
   dir(obj: any, options?: any) {
-    writeLogLine(
-      formatLogArgument(obj, () => vscode.workspace.workspaceFolders, 2),
-      (line) => this.output.appendLine(line),
-      () => console.dir(obj, options),
-    );
+    this.output.appendLine(JSON.stringify(obj, null, 2));
+    console.dir(obj, options);
   }
 }
 
@@ -128,4 +128,42 @@ export class Timer {
     const timer = new Timer();
     return timer;
   }
+}
+
+function stringifyError(error: Error, includeStack = false, indent = 0) {
+  const indentation = '  '.repeat(indent);
+  const lines = [
+    `${indentation}${indent === 0 ? 'ERROR' : 'CAUSE'}: ${error.message}`,
+  ];
+  if (includeStack && error.stack) {
+    lines.push(
+      ...error.stack.split(/[\r\n]/).map((line) => `${indentation}${line}`),
+    );
+  }
+  if (error.cause && error.cause instanceof Error) {
+    lines.push(stringifyError(error.cause, includeStack, indent + 1));
+  }
+  return lines.join('\n');
+}
+
+export function getErrorMessage(error: unknown): string {
+  let combinedMessage = '';
+  if (error instanceof Error) {
+    if (
+      'message' in error &&
+      typeof error.message === 'string' &&
+      error.message.length
+    ) {
+      combinedMessage = error.message;
+    }
+    if ('cause' in error && error.cause instanceof Error) {
+      const causeError = getErrorMessage(error.cause);
+      if (combinedMessage && causeError) {
+        combinedMessage += ` ← ${causeError}`;
+      } else if (causeError) {
+        combinedMessage = causeError;
+      }
+    }
+  }
+  return combinedMessage;
 }

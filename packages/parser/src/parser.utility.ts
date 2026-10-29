@@ -53,13 +53,11 @@ export function rhsFrom(
 }
 
 export function functionFromRhs(rhs: Rhs) {
-  return rhsFrom(rhs)?.expression?.[0].children.primaryExpression?.[0].children
-    .functionExpression?.[0].children;
+  return rhsFrom(rhs)?.functionExpression?.[0].children;
 }
 
 export function structLiteralFromRhs(rhs: Rhs) {
-  return rhsFrom(rhs)?.expression?.[0].children.primaryExpression?.[0].children
-    .structLiteral?.[0].children;
+  return rhsFrom(rhs)?.structLiteral?.[0].children;
 }
 
 export function arrayLiteralFromRhs(rhs: Rhs) {

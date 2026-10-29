@@ -2,7 +2,6 @@ import { Pathy, pathy } from '@bscotch/pathy';
 import { findReleaseFromFeeds } from '@bscotch/gamemaker-releases';
 import { GameMakerIde, GameMakerRuntime } from '@bscotch/stitch-launcher';
 import { ok } from 'node:assert';
-import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { parseStringPromise } from 'xml2js';
 import { parseJsdoc } from './jsdoc.js';
@@ -14,62 +13,9 @@ import { Type, type StructType } from './types.js';
 import { addSpriteInfoStruct } from './types.sprites.js';
 import { StitchParserError, assert } from './util.js';
 
-export type NativeSpecStage = 'read' | 'xml' | 'schema' | 'load';
-
-export interface NativeSpecSource {
-  readonly path: string;
-  /** The spec's declared header, not independently verified API coverage. */
-  readonly runtime: string;
-  readonly module: string;
-  readonly bundled: boolean;
-  readonly sha256: string;
-}
-
-type DeepReadonly<T> = T extends object
-  ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
-  : T;
-
-function freezeSpec<T extends object>(value: T): T {
-  for (const child of Object.values(value)) {
-    if (child && typeof child === 'object') {
-      freezeSpec(child);
-    }
-  }
-  return Object.freeze(value);
-}
-
-/** A selected specification failed; callers must not treat it as a partial load. */
-export class NativeSpecError extends StitchParserError {
-  constructor(
-    readonly specFilePath: string,
-    readonly stage: NativeSpecStage,
-    cause: unknown,
-  ) {
-    super(`Error loading native spec "${specFilePath}" during ${stage}`);
-    this.cause = cause;
-  }
-}
-
 export class Native {
   protected specs!: GmlSpec[];
-  protected specSources: readonly NativeSpecSource[] = [];
-  protected readonly sourcesBySpec = new Map<GmlSpec, NativeSpecSource>();
   objectInstanceBase!: StructType;
-  protected readonly enumMemberValues = new WeakMap<Signifier, number>();
-
-  getSpecSources(): readonly NativeSpecSource[] {
-    return this.specSources;
-  }
-
-  /** Parsed source metadata, including availability flags not yet interpreted. */
-  getSpecs(): readonly DeepReadonly<GmlSpec>[] {
-    return this.specs;
-  }
-
-  /** The numeric spec value, not the declaration/parameter index. */
-  getEnumMemberValue(symbol: Signifier): number | undefined {
-    return this.enumMemberValues.get(symbol);
-  }
 
   protected constructor(
     readonly globalSelf: StructType,
@@ -88,22 +34,61 @@ export class Native {
     assetGmObject.extends = this.objectInstanceBase;
     this.types.set('Asset.GMObject', assetGmObject);
 
+    // The `throw` function is not in the spec, so add it manually.
+    const throwsType = new Type('Function').named('throw');
+    throwsType.addParameter(0, 'message', { type: Type.Any, optional: false });
+    const throws = new Signifier(this.globalSelf, 'throw', throwsType);
+    this.globalSelf.addMember(throws);
+    this.types.set('Function.throw', throwsType);
+    throws.def = {};
+    throws.native = 'Base';
+
+    // The `static_get` function just returns a blank Struct type instead
+    // of inferring the static struct from the argument. This function
+    // replaces that signature to make it more useful.
+    const staticGetType = typeFromParsedJsdocs(
+      parseJsdoc(`
+      /// @template {Function|Struct} T
+      /// @param {T} target
+      /// @returns {StaticType<T>}
+    `),
+      this.types,
+      false,
+    )[0] as Type<'Function'>;
+    staticGetType.named('static_get');
+    const staticGet = new Signifier(
+      this.globalSelf,
+      'static_get',
+      staticGetType,
+    );
+    this.globalSelf.addMember(staticGet);
+    this.types.set('Function.static_get', staticGetType);
+    staticGet.def = {};
+    staticGet.native = 'Base';
+
+    // The `display_get_frequency` function is not in the spec, so add it manually.
+
+    const displayGetFrequencyType = new Type('Function').named(
+      'display_get_frequency',
+    );
+    displayGetFrequencyType.addReturnType(Type.Real);
+    const displayGetFrequency = new Signifier(
+      this.globalSelf,
+      'display_get_frequency',
+      displayGetFrequencyType,
+    );
+    this.globalSelf.addMember(displayGetFrequency);
+    this.types.set('Function.display_get_frequency', displayGetFrequencyType);
+    displayGetFrequency.def = {};
+    displayGetFrequency.native = 'Base';
+
     // Process all of the found specs
     for (const spec of this.specs) {
-      try {
-        logger.info(`Loading spec for module ${spec.module}`);
-        this.loadEnumerations(spec);
-        this.loadConstants(spec);
-        this.loadVariables(spec);
-        this.loadStructs(spec);
-        this.loadFunctions(spec);
-      } catch (cause) {
-        throw new NativeSpecError(
-          this.sourcesBySpec.get(spec)!.path,
-          'load',
-          cause,
-        );
-      }
+      logger.info(`Loading spec for module ${spec.module}`);
+      this.loadConstants(spec);
+      this.loadVariables(spec);
+      this.loadStructs(spec);
+      this.loadFunctions(spec);
     }
 
     // Update the base instance type using instance variables.
@@ -120,41 +105,6 @@ export class Native {
     assetGmObject.isReadonly = true;
   }
 
-  protected loadEnumerations(spec: GmlSpec) {
-    for (const enumeration of spec.enumerations) {
-      const typeName = `Enum.${enumeration.name}`;
-      const enumType = this.types.get(typeName) || new Type('Enum');
-      assert(enumType.kind === 'Enum', `Expected enum type ${typeName}`);
-      assert(
-        !this.globalSelf.getMember(enumeration.name),
-        `Native enum ${enumeration.name} already exists`,
-      );
-      enumType.named(enumeration.name);
-      const symbol = new Signifier(this.globalSelf, enumeration.name, enumType);
-      symbol.enum = true;
-      symbol.global = true;
-      symbol.writable = false;
-      symbol.native = enumeration.module;
-      enumType.signifier = symbol;
-      this.types.set(typeName, enumType);
-      this.globalSelf.addMember(symbol);
-
-      for (const member of enumeration.members) {
-        const memberType = new Type('EnumMember').named(member.name);
-        const memberSymbol = new Signifier(enumType, member.name, memberType)
-          .describe(member.description)
-          .deprecate(member.deprecated);
-        memberSymbol.enumMember = true;
-        memberSymbol.writable = false;
-        memberSymbol.native = enumeration.module;
-        memberType.signifier = memberSymbol;
-        enumType.addMember(memberSymbol);
-        this.enumMemberValues.set(memberSymbol, member.value);
-      }
-      enumType.isReadonly = true;
-    }
-  }
-
   protected loadVariables(spec: GmlSpec) {
     for (const variable of spec.variables) {
       assert(variable, 'Variable must be defined');
@@ -162,7 +112,6 @@ export class Native {
       const symbol = new Signifier(this.globalSelf, variable.name, type)
         .describe(variable.description)
         .deprecate(variable.deprecated);
-      symbol.readable = variable.readable;
       symbol.writable = variable.writable;
       symbol.native = variable.module;
       symbol.global = !variable.instance;
@@ -232,39 +181,11 @@ export class Native {
         ),
       );
 
-      // Refine only a signature actually present in the selected spec. In
-      // particular, older Struct-only signatures must not gain Function support,
-      // and unfamiliar future signatures keep their original spec types.
-      if (
-        func.name === 'static_get' &&
-        func.parameters.length === 1 &&
-        func.returnType === 'Struct' &&
-        func.parameters[0].type
-          .split('|')
-          .every((type) =>
-            ['Function', 'Struct', 'Asset.GMScript'].includes(type),
-          )
-      ) {
-        const param = func.parameters[0];
-        const inferred = typeFromParsedJsdocs(
-          parseJsdoc(`
-          /// @template {${param.type}} T
-          /// @param {T} ${param.name}
-          /// @returns {StaticType<T>}
-        `),
-          this.types,
-          false,
-        )[0] as Type<'Function'>;
-        functionType.getParameter(0)!.setType(inferred.getParameter(0)!.type);
-        functionType.setReturnType(inferred.returns!);
-      }
-
       const symbol = new Signifier(
         this.globalSelf,
         func.name,
         functionType,
       ).deprecate(func.deprecated);
-      symbol.describe(func.description);
       symbol.writable = false;
       symbol.native = func.module;
       functionType.signifier = symbol;
@@ -346,16 +267,7 @@ export class Native {
 
   protected loadStructs(spec: GmlSpec) {
     // Create struct types. Each one extends the base Struct type.
-    if (
-      spec.functions.some(
-        (func) =>
-          func.name === 'sprite_get_info' &&
-          func.returnType === 'Struct.SpriteInfo',
-      ) &&
-      !spec.structures.some((struct) => struct.name === 'SpriteInfo')
-    ) {
-      addSpriteInfoStruct(this.types);
-    }
+    addSpriteInfoStruct(this.types);
     for (const struct of spec.structures) {
       if (!struct.name) {
         continue;
@@ -369,11 +281,9 @@ export class Native {
       for (const prop of struct.properties) {
         if (prop && !structType.getMember(prop.name)) {
           const type = Type.fromFeatherString(prop.type, this.types, true);
-          const symbol = structType
+          structType
             .addMember(prop.name, { type, writable: prop.writable })!
             .describe(prop.description);
-          symbol.readable = prop.readable;
-          symbol.native = struct.module;
         }
       }
     }
@@ -395,76 +305,54 @@ export class Native {
     types: Map<string, Type>,
   ): Promise<Native> {
     filePaths = filePaths || [Native.fallbackGmlSpecPath];
-    // Every selected spec is required. Silently dropping a failed module would
-    // publish an apparently complete but version-inaccurate native environment.
-    const parsed = await Promise.all(
-      filePaths.map((path) => Native.parseSource(path.absolute)),
-    );
-    // Stable ordering preserves module precedence while always loading Base first.
-    parsed.sort(
-      (a, b) =>
-        Number(b.spec.module.toLowerCase() === 'base') -
-        Number(a.spec.module.toLowerCase() === 'base'),
-    );
+    const parsed = (
+      await Promise.all(
+        filePaths.map((path) => {
+          try {
+            return Native.parse(path.absolute);
+          } catch (err) {
+            logger.error(err);
+          }
+          return;
+        }),
+      )
+    ).filter((x) => !!x) as GmlSpec[];
     const native = new Native(globalSelf, types);
-    native.specs = parsed.map(({ spec, source }) => {
-      native.sourcesBySpec.set(spec, source);
-      return spec;
+    native.specs = parsed;
+    // Ensure the base module is always first
+    native.specs.sort((a, b) => {
+      if (a.module.toLowerCase() === 'base') {
+        return -1;
+      } else if (b.module.toLowerCase() === 'base') {
+        return 1;
+      }
+      return 0;
     });
-    native.specSources = Object.freeze(parsed.map(({ source }) => source));
     native.load();
-    freezeSpec(native.specs);
     return native;
   }
 
   static async parse(specFilePath: string): Promise<GmlSpec> {
-    return (await Native.parseSource(specFilePath)).spec;
-  }
-
-  private static async parseSource(specFilePath: string): Promise<{
-    spec: GmlSpec;
-    source: NativeSpecSource;
-  }> {
-    let specRaw: Buffer;
+    const specRaw = await readFile(specFilePath, 'utf8');
+    const asJson = await parseStringPromise(specRaw.replace('\ufeff', ''), {
+      trim: true,
+      normalize: true,
+      emptyTag() {
+        return {};
+      },
+      // Prevent surprises if modules provide single entries
+      explicitArray: true,
+    }); // Prevent possible errors: "Non-white space before first tag"
     try {
-      specRaw = await readFile(specFilePath);
-    } catch (cause) {
-      throw new NativeSpecError(specFilePath, 'read', cause);
-    }
-    let asJson: unknown;
-    try {
-      asJson = await parseStringPromise(
-        specRaw.toString('utf8').replace(/^\ufeff/, ''),
-        {
-          trim: true,
-          normalize: true,
-          emptyTag() {
-            return {};
-          },
-          // Prevent surprises if modules provide single entries.
-          explicitArray: true,
-        },
+      return gmlSpecSchema.parse(asJson);
+    } catch (zodError) {
+      const err = new StitchParserError(
+        `Error parsing spec file "${specFilePath}"`,
       );
-    } catch (cause) {
-      throw new NativeSpecError(specFilePath, 'xml', cause);
+      err.cause = zodError;
+      logger.error(err);
+      throw err;
     }
-    let spec: GmlSpec;
-    try {
-      spec = gmlSpecSchema.parse(asJson);
-    } catch (cause) {
-      throw new NativeSpecError(specFilePath, 'schema', cause);
-    }
-    const path = pathy(specFilePath).absolute;
-    return {
-      spec,
-      source: Object.freeze({
-        path,
-        runtime: spec.runtime,
-        module: spec.module,
-        bundled: path === Native.fallbackGmlSpecPath.absolute,
-        sha256: createHash('sha256').update(specRaw).digest('hex'),
-      }),
-    };
   }
 
   static readonly fallbackGmlSpecPath = pathy(import.meta.url).resolveTo(

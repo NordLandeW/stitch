@@ -13,23 +13,21 @@ export class StitchTypeDefinitionProvider
     token: vscode.CancellationToken,
   ): Promise<vscode.Definition | vscode.LocationLink[] | undefined> {
     const file = await this.workspace.ensureDocumentCurrent(document, token);
-    const references =
-      file?.getReferenceCandidatesAt(document.offsetAt(position)) || [];
-    if (!references.length) return;
-    const locations = new Map<string, vscode.Location>();
-    for (const reference of references)
-      for (const type of (reference.evaluatedType || reference.item.type)
-        .type) {
-        const definition = type.signifier?.def;
-        if (!definition?.file) continue;
-        const location = locationOf(definition);
-        if (location)
-          locations.set(
-            `${definition.file.path.absolute}:${definition.start.offset}:${definition.end.offset}`,
-            location,
-          );
-      }
-    return [...locations.values()];
+    const offset = document.offsetAt(position);
+    const ref = file?.getReferenceAt(offset);
+    const item = ref?.item;
+    if (!item) return;
+
+    // Get the types associated with this item that have associated signifiers.
+    const typeSignifiers = item.type.type
+      .map((t) => {
+        if (t.signifier?.def?.file) {
+          return locationOf(t.signifier!.def!);
+        }
+        return;
+      })
+      .filter((x) => !!x) as vscode.Location[];
+    return typeSignifiers;
   }
 
   static register(workspace: StitchWorkspace) {

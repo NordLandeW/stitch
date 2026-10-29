@@ -11,8 +11,6 @@ export {
   Range,
   Reference,
   Scope,
-  planReferenceRename,
-  type CompletionCandidate,
   type ReferenceableType,
 } from './project.location.js';
 export * from './signifiers.flags.js';

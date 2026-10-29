@@ -5,10 +5,15 @@ import { identifier, numericLiterals } from './tokens.shared.js';
 export const codeTokens = [
   //#region Whitespace and comments
 
-  // Macro continuation is handled by the source-mapped preprocessor.
+  // Lines can end with a "\" character, which is required
+  // by GML in multi-line macros but not needed anywhere else.
+  // Outside of that, "\" is only used in strings as an escape character.
+  // Stitch doesn't allow macros to be invalid standalone code anyway,
+  // so if we just treat "\" characters (outside of strings) as whitespace
+  // and ignore them we can treat macros like variables.
   createToken({
     name: 'WhiteSpace',
-    pattern: /[ \t\n\r]+/,
+    pattern: /[ \t\n\r\\]+/,
     line_breaks: true,
     group: Lexer.SKIPPED,
   }),
@@ -31,14 +36,14 @@ export const codeTokens = [
   createToken({
     name: 'SingleLineComment',
     pattern: /\/\/[^\r\n]*/,
-    group: 'comments',
+    group: Lexer.SKIPPED,
     start_chars_hint: ['/'],
     categories: [c.Comment],
   }),
   createToken({
     name: 'MultiLineComment',
     pattern: /(?<!\\)\/\*([\r\n]|.)*?(?<!\\)\*\//,
-    group: 'comments',
+    group: Lexer.SKIPPED,
     line_breaks: true,
     start_chars_hint: ['/'],
     categories: [c.Comment],
@@ -47,7 +52,7 @@ export const codeTokens = [
   createToken({
     name: 'MultiLineCommentNotTerminated',
     pattern: /(?<!\\)\/\*([\r\n]|.)*/,
-    group: 'comments',
+    group: Lexer.SKIPPED,
     line_breaks: true,
     start_chars_hint: ['/'],
     categories: [c.Comment],
@@ -142,12 +147,14 @@ export const codeTokens = [
   createToken({
     name: 'Begin',
     pattern: /\bbegin\b/,
-    categories: [c.Keyword, c.Separators, c.BlockStart],
+    categories: [c.Keyword, c.Separators],
+    push_mode: 'code',
   }),
   createToken({
     name: 'End',
     pattern: /\bend\b/,
-    categories: [c.Keyword, c.Separators, c.BlockEnd],
+    categories: [c.Keyword, c.Separators],
+    pop_mode: true,
   }),
   createToken({ name: 'If', pattern: /\bif\b/, categories: [c.Keyword] }),
   createToken({ name: 'Then', pattern: /\bthen\b/, categories: [c.Keyword] }),
@@ -198,7 +205,6 @@ export const codeTokens = [
     pattern: /\breturn\b/,
     categories: [c.Keyword],
   }),
-  createToken({ name: 'Throw', pattern: /\bthrow\b/, categories: [c.Keyword] }),
   createToken({
     name: 'Modulo',
     pattern: /\bmod\b/,
@@ -268,11 +274,7 @@ export const codeTokens = [
     pattern: /\bconstructor\b/,
     categories: [c.Keyword],
   }),
-  createToken({
-    name: 'Define',
-    pattern: /#define\b/,
-    categories: [c.Keyword],
-  }),
+  // TODO: Add separate parser modes for macros
   createToken({ name: 'Macro', pattern: /#macro\b/, categories: [c.Keyword] }),
   // TODO: Add separate parser modes for regions
   createToken({
@@ -507,13 +509,13 @@ export const codeTokens = [
   createToken({
     name: 'StartBrace',
     pattern: /\{/,
-    categories: [c.Separators, c.BlockStart],
+    categories: [c.Separators],
     push_mode: 'code',
   }),
   createToken({
     name: 'EndBrace',
     pattern: /\}/,
-    categories: [c.Separators, c.BlockEnd],
+    categories: [c.Separators],
     pop_mode: true,
   }),
   createToken({ name: 'Escape', pattern: /\\/, categories: [c.Separators] }),

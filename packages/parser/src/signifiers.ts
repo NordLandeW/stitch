@@ -4,7 +4,6 @@ import { getTypes } from './types.checks.js';
 import { Type, TypeStore } from './types.js';
 import { PrimitiveName } from './types.primitives.js';
 import { assert } from './util.js';
-import type { ResourceDefinition } from './analysis/model.js';
 
 export class Signifier extends Flags {
   readonly $tag = 'Sym';
@@ -36,30 +35,6 @@ export class Signifier extends Flags {
    */
   declaration: Range | undefined = undefined;
   refs = new Set<Reference>();
-  /** Stable storage identity used by the transactional semantic model. */
-  semanticKey: string | undefined;
-  /** Input-owned provenance is independent of native/type constraints. */
-  resourceDefinition: ResourceDefinition | undefined;
-
-  /** Replace source ownership only while committing an analysis generation. */
-  replaceDefinition(
-    location: Range | { file?: undefined } | undefined,
-    declaration?: Range,
-  ): void {
-    this._def = location;
-    this.declaration = declaration;
-    this.placeholder = !location && !this.native;
-  }
-
-  /** Copy non-identity metadata without reference/inheritance side effects. */
-  replaceMetadata(source: Signifier, type: TypeStore): void {
-    this.description = source.description;
-    this.type = type;
-    this.idx = source.idx;
-    this._native = source._native;
-    this.resourceDefinition = source.resourceDefinition;
-    this.copyFlagsFrom(source);
-  }
 
   constructor(
     parent: Type,
@@ -77,7 +52,6 @@ export class Signifier extends Flags {
     return (
       !!this.name &&
       !this.native &&
-      !this.resourceDefinition &&
       !['other', 'self', 'global'].includes(this.name)
     );
   }
@@ -92,7 +66,6 @@ export class Signifier extends Flags {
     copy.type = this.type;
     copy.idx = this.idx;
     copy._native = this._native;
-    copy.resourceDefinition = this.resourceDefinition;
     copy._def = this._def;
     copy.declaration = this.declaration;
     copy.flags = this.flags;
