@@ -13,6 +13,8 @@
 - Parse standalone and nested blocks, supported `begin`/`end` delimiters, `else if ... then`, and trailing semicolons after a `for` loop's third operation while preserving symbol scopes and source ranges.
 - Follow parenthesized and literal expression results through calls, member access and array indexing, preserving callable metadata, assignment identities and original-source editor ranges.
 - Support keyword property names and supported bare keyword struct keys, visit both two-dimensional index expressions, and diagnose unsupported new postfix combinations.
+- Refresh unchanged callers when returned struct members change, preserving current types and definition locations through edits and recovery; avoid redundant parsing when selecting the active configuration.
+- Recognize object Variable Definitions and their inheritance before Create events, preserve GML typing, and protect resource-backed variables from incomplete GML-only renames.
 
 ## 1.81.0 (2026-01-11)
 

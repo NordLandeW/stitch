@@ -26,6 +26,7 @@ import { Project } from './project.js';
 import { Signifier } from './signifiers.js';
 import { StructType, Type } from './types.js';
 import { assert, getPngSize, groupPathToPosix, ok } from './util.js';
+import { ObjectVariables } from './project.object-variables.js';
 
 export function isAssetOfKind<T extends YyResourceType>(
   asset: any,
@@ -55,6 +56,12 @@ export class Asset<T extends YyResourceType = YyResourceType> {
   assetType: Type<Asset['assetTypeKind']>;
   variables: StructType | undefined;
   nativeVariables: StructType | undefined;
+  private readonly objectVariables = new ObjectVariables(this);
+
+  /** Refresh metadata declarations without reparsing or writing the resource. */
+  refreshObjectVariables(reconcileInheritance = false) {
+    this.objectVariables.refresh(reconcileInheritance);
+  }
 
   /** For objects, their parent */
   protected _parent: Asset<'objects'> | undefined = undefined;
@@ -680,6 +687,7 @@ export class Asset<T extends YyResourceType = YyResourceType> {
       // Already initialized by a child
       return;
     }
+    this.refreshObjectVariables();
     for (const gml of this.gmlFilesArray) {
       gml.updateGlobals();
     }
@@ -827,6 +835,10 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     }
     await this.initiallyReadAndParseGml(buffer);
     if (wasInitialized) {
+      if (this.isObject) {
+        for (const asset of this.project.assets.values())
+          asset.refreshObjectVariables();
+      }
       this.initalized.globals = false;
       this.initalized.locals = false;
       this.project.initiallyParseAssetCode([this]);
@@ -836,6 +848,7 @@ export class Asset<T extends YyResourceType = YyResourceType> {
   /** External resource retirement must not delete author-owned files. */
   retire() {
     for (const code of this.gmlFiles.values()) code.retire();
+    this.objectVariables.clear();
     this.gmlFiles.clear();
     if (
       this.project.self.getMember(this.signifier.name, true) === this.signifier

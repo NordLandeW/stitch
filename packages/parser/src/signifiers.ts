@@ -8,6 +8,8 @@ import { assert } from './util.js';
 export class Signifier extends Flags {
   readonly $tag = 'Sym';
   description: string | undefined = undefined;
+  /** A resource-backed variable must not be renamed only in its GML usages. */
+  resourceDefinition?: { path: string; name: string };
   type: TypeStore = new TypeStore();
   /** For function params, the index of this param */
   idx: number | undefined = undefined;
@@ -49,7 +51,7 @@ export class Signifier extends Flags {
   }
 
   get isRenameable(): boolean {
-    return !!this.name && !this.native;
+    return !!this.name && !this.native && !this.resourceDefinition;
   }
 
   /**
@@ -65,6 +67,7 @@ export class Signifier extends Flags {
     copy._def = this._def;
     copy.declaration = this.declaration;
     copy.flags = this.flags;
+    copy.resourceDefinition = this.resourceDefinition;
     return copy as this;
   }
 

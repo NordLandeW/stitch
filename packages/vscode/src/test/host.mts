@@ -103,7 +103,7 @@ async function compileSubjects(): Promise<string> {
     export { activateStitchExtension } from ${JSON.stringify(source('extension.activate.mts'))};
     export { ChangeTracker } from ${JSON.stringify(source('changes.mts'))};
     export { stitchEvents } from ${JSON.stringify(source('events.mts'))};
-    export { GameMakerProject, Code, Type, Signifier };
+    export { GameMakerProject, Asset, Code, Type, Signifier };
     export { StitchDefinitionsProvider } from ${JSON.stringify(source('extension.definitions.mts'))};
     export { StitchReferenceProvider } from ${JSON.stringify(source('extension.refs.mts'))};
     export { StitchRenameProvider } from ${JSON.stringify(source('extension.rename.mts'))};

@@ -155,6 +155,51 @@ export class Project {
   protected emitter = new EventEmitter();
   /** Code that needs to be reprocessed, for one reason or another. */
   protected dirtyFiles = new Set<Code>();
+  private readonly semanticDirtyFiles = new Set<Code>();
+  private refreshingSemanticFiles = false;
+
+  /** Semantic invalidation follows definitions, unlike diagnostic-only dirtiness. */
+  queueSemanticFileUpdate(code: Code) {
+    if (!code.isRetired) this.semanticDirtyFiles.add(code);
+  }
+
+  completeSemanticFileUpdate(code: Code) {
+    this.semanticDirtyFiles.delete(code);
+  }
+
+  refreshSemanticFiles() {
+    if (this.refreshingSemanticFiles || !this.semanticDirtyFiles.size) return;
+    this.refreshingSemanticFiles = true;
+    const visits = new Map<Code, number>();
+    const declarations = new Set<unknown>();
+    try {
+      while (this.semanticDirtyFiles.size) {
+        const code = this.semanticDirtyFiles.values().next().value!;
+        this.semanticDirtyFiles.delete(code);
+        if (code.isRetired) continue;
+        if (!visits.has(code)) {
+          for (const ref of code.refs)
+            if (ref.item.def?.file === code && !ref.item.local)
+              declarations.add(ref.item);
+        }
+        const count = (visits.get(code) || 0) + 1;
+        visits.set(code, count);
+        // A finite symbol path may revisit the same file many times. Bound
+        // unsuccessful convergence by declarations, not by source-file count.
+        if (count > declarations.size + 1) {
+          this.semanticDirtyFiles.add(code);
+          throw new Error(
+            `Cross-file analysis did not stabilize at ${code.path.absolute}`,
+          );
+        }
+        code.updateGlobals();
+        code.updateAllSymbols();
+        this.dirtyFiles.add(code);
+      }
+    } finally {
+      this.refreshingSemanticFiles = false;
+    }
+  }
 
   protected constructor(
     readonly yypPath: Pathy<any>,
@@ -172,6 +217,7 @@ export class Project {
    * @internal Drain the queue of dirty files, updating their diagnostics
    */
   drainDirtyFileUpdateQueue() {
+    this.refreshSemanticFiles();
     for (const code of this.dirtyFiles) {
       code.updateDiagnostics();
       // await code.reload(code.content);

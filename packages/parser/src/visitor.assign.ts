@@ -12,6 +12,7 @@ import { Signifier } from './signifiers.js';
 import { normalizeType } from './types.checks.js';
 import { WithableType } from './types.js';
 import type { GmlSignifierVisitor } from './visitor.js';
+import { ObjectVariables } from './project.object-variables.js';
 
 export interface AssignmentInfo {
   static?: boolean;
@@ -34,6 +35,17 @@ export function assignVariable(
   info: AssignmentInfo,
 ) {
   const rhs = rhsFrom(rawRhs);
+  if (variable.container.getMember(variable.name)?.resourceDefinition) {
+    let container = variable.container;
+    while (
+      (container.kind === 'Id.Instance' ||
+        container.kind === 'Asset.GMObject') &&
+      container.extends
+    ) {
+      container = container.extends as WithableType;
+    }
+    variable = { ...variable, container };
+  }
 
   //#region Collect useful info
   // Figure out what we're assigning to so we can handle
@@ -45,12 +57,33 @@ export function assignVariable(
 
   // Find the existing variable
   let signifier = variable.container.getMember(variable.name);
+  const resourceDefinition = ObjectVariables.definitionFor(
+    signifier,
+    variable.container,
+  );
+  if (
+    signifier &&
+    resourceDefinition &&
+    signifier.parent !== variable.container
+  ) {
+    const inherited = signifier;
+    signifier = new Signifier(variable.container, variable.name);
+    signifier.resourceDefinition = resourceDefinition;
+    signifier.instance = true;
+    signifier.override = true;
+    // This write infers an independent value, including fresh struct members.
+    // Revisit readers through their real receiver instead of transferring the
+    // parent's references (which also include siblings) to this new shadow.
+    for (const ref of inherited.refs)
+      visitor.PROCESSOR.project.queueSemanticFileUpdate(ref.file);
+    variable.container.addMember(signifier, { override: true });
+  }
   const isSelfOwned =
     !!signifier && !!variable.container.getMember(variable.name, true);
   let ref: Reference | undefined;
 
   // Add the variable if missing
-  let wasUndeclared = false;
+  let wasUndeclared = !!resourceDefinition && !signifier?.def?.file;
   if (!signifier) {
     wasUndeclared = true;
 
@@ -84,7 +117,8 @@ export function assignVariable(
     ref = signifier.addRef(variable.range);
     // If this is the first time we've seen it, and it wouldn't have
     // an unambiguous declaration, add its definition
-    if (!signifier.def) {
+    if (!signifier.def || wasUndeclared) {
+      if (wasUndeclared) signifier.unsetDef();
       wasUndeclared = true;
       signifier.definedAt(variable.range);
       ref.isDef = true;

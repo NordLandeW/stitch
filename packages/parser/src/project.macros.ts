@@ -376,7 +376,9 @@ export class ProjectMacros {
         code.updateAllSymbols();
       }
     this.complete(codes);
+    this.project.refreshSemanticFiles();
     for (const code of codes) code.updateDiagnostics();
+    this.project.drainDirtyFileUpdateQueue();
   }
 
   forget(code: Code) {

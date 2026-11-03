@@ -34,6 +34,11 @@ import { Type, type StructType } from './types.js';
 import { assert, isBeforeRange, isInRange } from './util.js';
 import { registerGlobals } from './visitor.globals.js';
 import { registerSignifiers } from './visitor.js';
+import {
+  identifyLiteral,
+  semanticReaders,
+  semanticSignature,
+} from './project.dependencies.js';
 
 /** Represenation of a GML code file. */
 export class Code {
@@ -65,6 +70,46 @@ export class Code {
   private analysisLines?: SourceLines;
   private incomingRefs?: Set<Reference>;
   private retired = false;
+  private readonly literalTypes = new WeakMap<
+    object,
+    Type<'Struct' | 'Array'>
+  >();
+  private previousSemanticSignature?: string;
+  private readonly previousSemanticReaders = new Set<Code>();
+  private readonly resourceVariableScopes = new Set<Type>();
+
+  private refreshResourceVariables(reconcileInheritance: boolean) {
+    if (this.asset.isObject)
+      this.resourceVariableScopes.add(this.asset.variables!);
+    if (!this.resourceVariableScopes.size) return;
+    for (const asset of this.project.assets.values()) {
+      if (!asset.isObject || !this.resourceVariableScopes.has(asset.variables!))
+        continue;
+      asset.refreshObjectVariables(reconcileInheritance);
+      if (reconcileInheritance) {
+        for (const child of asset.children) child.refreshObjectVariables(true);
+      }
+    }
+    if (reconcileInheritance) this.resourceVariableScopes.clear();
+  }
+
+  /** Anonymous value identity belongs to this exact parsed syntax node. */
+  anonymousContainer<T extends 'Struct' | 'Array'>(
+    site: object,
+    kind: T,
+  ): Type<T> {
+    let type = this.literalTypes.get(site);
+    if (!type) {
+      type = new Type(kind);
+      identifyLiteral(type);
+      this.literalTypes.set(site, type);
+    }
+    return type as Type<T>;
+  }
+
+  get isRetired() {
+    return this.retired;
+  }
 
   // Metadata
   /** For object events, whether or not `event_inherited` is unambiguously being called */
@@ -553,6 +598,8 @@ export class Code {
   }
 
   protected reset() {
+    for (const reader of semanticReaders(this))
+      this.previousSemanticReaders.add(reader);
     this.initializeScopeRanges();
     for (const ref of this._refs) {
       const source = ref.source.file;
@@ -569,6 +616,8 @@ export class Code {
       // to flag it as undeclared.
       const isDefinedInThisFile = this === signifier.def?.file;
       if (isDefinedInThisFile) {
+        if (signifier.resourceDefinition)
+          this.resourceVariableScopes.add(signifier.parent);
         signifier.unsetDef();
       }
       // Remove all references to this symbol found in this file.
@@ -583,6 +632,7 @@ export class Code {
       // Remove orphaned declarations and unresolved names left behind while editing.
       if (
         !signifier.refs.size &&
+        !signifier.resourceDefinition &&
         (isDefinedInThisFile || !signifier.def) &&
         signifier.parent.getMember(signifier.name, true) === signifier
       ) {
@@ -646,31 +696,17 @@ export class Code {
     }
   }
 
-  protected discoverEventInheritanceWarnings() {
+  protected updateEventInheritance() {
     this.diagnostics.MISSING_EVENT_INHERITED = [];
-    if (this.asset.assetKind !== 'objects' || !this.asset.parent) {
+    if (!this.asset.isObject || !this.asset.parent || !this.isCreateEvent)
       return;
-    }
-    // Then the type will have been set up to inherit from the parent.
-    // BUT. If this event does not call `event_inherited()`, then we
-    // need to unlink the type.
-    if (!this.callsSuper) {
-      // TODO: Provide this as an option?
-      // this.diagnostics.MISSING_EVENT_INHERITED.push({
-      //   $tag: 'diagnostic',
-      //   message: `Event does not call \`event_inherited()\`, so it will not inherit from its parent.`,
-      //   severity: 'warning',
-      //   location: this.startRange,
-      // });
-      if (this.isCreateEvent) {
-        // Unlink the type from the parent.
-        // (If there is no create event, then event_inherited is implicit)
-        this.asset.variables!.extends = this.project.native.objectInstanceBase;
-      }
-    } else if (this.isCreateEvent) {
-      // Ensure that the type is set as the parent by re-assigning it.
-      // eslint-disable-next-line no-self-assign
-      this.asset.parent = this.asset.parent;
+    const parent = this.callsSuper
+      ? this.asset.parent.variables
+      : this.project.native.objectInstanceBase;
+    if (this.asset.variables!.extends === parent) return;
+    this.asset.variables!.extends = parent;
+    for (const code of this.asset.gmlFilesArray) {
+      if (code !== this) this.project.queueSemanticFileUpdate(code);
     }
   }
 
@@ -804,7 +840,6 @@ export class Code {
 
   /** Update and emit diagnostics */
   updateDiagnostics() {
-    this.discoverEventInheritanceWarnings();
     this.computeFunctionCallDiagnostics();
     this.computeUndeclaredSymbolDiagnostics();
     this.computeJsdocDiagnostics();
@@ -820,7 +855,10 @@ export class Code {
   updateGlobals() {
     this.reset();
     this.project.macros.registerSymbols(this, this.preprocessed);
-    return registerGlobals(this);
+    const globals = registerGlobals(this);
+    this.updateEventInheritance();
+    this.refreshResourceVariables(false);
+    return globals;
   }
 
   /** Retire semantic contributions without changing any project files. */
@@ -828,11 +866,35 @@ export class Code {
     if (this.retired) return;
     this.retired = true;
     this.reset();
+    if (this.isCreateEvent && this.asset.parent) {
+      this.asset.variables!.extends = this.asset.parent.variables;
+      for (const code of this.asset.gmlFilesArray)
+        this.project.queueSemanticFileUpdate(code);
+    }
+    this.refreshResourceVariables(true);
     this.project.macros.forget(this);
+    for (const reader of this.previousSemanticReaders)
+      this.project.queueSemanticFileUpdate(reader);
+    this.previousSemanticReaders.clear();
     this.project.emitDiagnostics(this, []);
   }
 
   updateAllSymbols() {
     registerSignifiers(this);
+    this.project.completeSemanticFileUpdate(this);
+    for (const ref of this.refs) {
+      if (ref.item.resourceDefinition && ref.item.def?.file === this)
+        this.resourceVariableScopes.add(ref.item.parent);
+    }
+    this.refreshResourceVariables(true);
+    const signature = semanticSignature(this);
+    if (signature !== this.previousSemanticSignature) {
+      for (const reader of semanticReaders(this))
+        this.previousSemanticReaders.add(reader);
+      for (const reader of this.previousSemanticReaders)
+        this.project.queueSemanticFileUpdate(reader);
+      this.previousSemanticSignature = signature;
+    }
+    this.previousSemanticReaders.clear();
   }
 }

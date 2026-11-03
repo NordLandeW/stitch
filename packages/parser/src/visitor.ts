@@ -1,4 +1,5 @@
 // CST Visitor for creating an AST etc
+import { ObjectVariables } from './project.object-variables.js';
 import { arrayWrapped } from '@bscotch/utility';
 import type { CstNode } from 'chevrotain';
 import type {
@@ -559,12 +560,20 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     const assignedToFunction = !!functionFromRhs(rhs);
     const excludeGlobal = !!(isStatic || assignedToFunction);
     const excludeParents = !!(isStatic || assignedToFunction);
-    let container: WithableType | undefined = (
-      this.FIND_ITEM(children, {
-        excludeGlobal,
-        excludeParents,
-      })?.item as Signifier | undefined
-    )?.parent as WithableType | undefined;
+    const existing = this.FIND_ITEM(children, {
+      excludeGlobal,
+      excludeParents,
+    })?.item as Signifier | undefined;
+    let container = existing?.parent as WithableType | undefined;
+    if (
+      existing &&
+      !existing.local &&
+      ObjectVariables.definitionFor(existing, this.PROCESSOR.fullScope.self)
+    ) {
+      // An inherited resource field is written on this receiver. Its declaring
+      // parent owns the metadata, not assignments performed by child objects.
+      container = this.PROCESSOR.fullScope.self as WithableType;
+    }
     if (!container) {
       const fullScope = this.PROCESSOR.fullScope;
       // Add to the self-scope unless it's a static inside a non-constructor function, and if that scope is not global.
@@ -603,7 +612,7 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     const struct =
       ctx.signifier?.getTypeByKind('Struct') ||
       structFromDocs ||
-      this.PROCESSOR.createStruct(children.StartBrace[0], closing);
+      this.FILE.anonymousContainer(children, 'Struct');
     signifier?.setType(struct);
     if (signifier?.def?.file && ctx.signifierIsDefinition) {
       const literalStart = this.PROCESSOR.range(children.StartBrace[0]).start;
@@ -978,7 +987,8 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     // Infer the content type of the array
     // Make sure that the content is visited
     const types: Type[] = [];
-    const arrayType = new Type('Array');
+    const arrayType = this.FILE.anonymousContainer(children, 'Array');
+    arrayType.items = undefined;
     for (const item of children.assignmentRightHandSide || []) {
       const itemTypes = this.assignmentRightHandSide(
         item.children,

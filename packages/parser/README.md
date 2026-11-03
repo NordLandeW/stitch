@@ -64,6 +64,14 @@ const project = await Project.initialize('path/to/your/project.yyp');
 await project.reload();
 ```
 
+### Semantic dependency updates
+
+Changes to declared symbols refresh their existing readers before the updated diagnostics are published. This includes members of anonymous returned structs and aliases passed through other functions. Repeated semantic visits to the same parsed literal share its type identity; a new parse creates new sites and rebinds affected readers. Selecting the same effective configuration avoids redundant macro parsing.
+
+Dependency updates compare declaration locations, member bindings, constructor inheritance and types using an iterative shared-graph representation. This preserves deep annotations and shared return types without expanding them into recursive trees. An unstable update is reported as an analysis failure. Unresolved-name discovery and general assignments that change another file's declaration retain the existing inference limits.
+
+Object YY `properties` contribute pre-creation instance declarations, including inherited properties independent of Create-event inheritance. Metadata supplies primitive types and multi-select list arrays; expression and asset values use conservative `Any` types. Analysis prefers an object's own GML definition, then an inherited GML definition when its Create event is inherited, then the metadata fallback. Assignments to these YY-backed variables on a child establish a child-owned definition, including qualified writes from another event. Removing that assignment restores the effective inherited definition or metadata fallback. Explicit annotations retain their typing behavior. These symbols carry `resourceDefinition` metadata and reject GML-only renames.
+
 ### Blocks and control statements
 
 Standalone and nested blocks retain GML's function-local variable scope. Code blocks, switch containers, struct literals and enum bodies accept `{` or `begin` as their opening delimiter and `}` or `end` as their closing delimiter, including mixed pairs. Function and constructor bodies require an opening `{` and accept either closing delimiter. Template interpolation uses its own `{...}` delimiters.
