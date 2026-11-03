@@ -63,9 +63,10 @@ export class ProjectMacros {
   }
 
   configure(configuration?: string) {
-    this.lineage(configuration);
-    if (configuration === this.requestedConfiguration) return;
+    const lineage = this.lineage(configuration);
+    const previous = this.lineage(this.requestedConfiguration);
     this.requestedConfiguration = configuration;
+    if (lineage.join('\0') === previous.join('\0')) return;
     this.configurationTreeChanged();
   }
 
