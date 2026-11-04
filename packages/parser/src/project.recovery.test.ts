@@ -319,6 +319,39 @@ describe('diagnostic and recovery safety', function () {
     }
   });
 
+  it('retains the following declarations and repairs unchanged readers after incomplete static input', async () => {
+    const complete =
+      'function RecoveryStaticCtor() constructor {static kept=1;}' + tail;
+    await code.reload(complete);
+    await neighbor.reload(
+      'var instance=new RecoveryStaticCtor(); var result=instance.kept;',
+    );
+    for (const fragment of ['static', 'static = 1;', 'static kept=']) {
+      await code.reload(
+        `function RecoveryStaticCtor() constructor {${fragment}}` + tail,
+      );
+      assert(code.getDiagnostics().SYNTAX_ERROR.length, fragment);
+      assert(
+        !diagnostics().some((d) =>
+          /Internal .* analysis failed/.test(d.message),
+        ),
+        fragment,
+      );
+      healthyTail();
+      finiteRanges(neighbor);
+      await code.reload(complete);
+      healthyTail();
+      assert.equal(code.getDiagnostics().SYNTAX_ERROR.length, 0);
+      const member = reference('kept', neighbor.content, neighbor);
+      assert.equal(member.item.def?.file, code);
+      assert.equal(member.item.type.kind, 'Real');
+      assert.equal(
+        neighbor.getDiagnostics().UNDECLARED_VARIABLE_REFERENCE.length,
+        0,
+      );
+    }
+  });
+
   it('restores local/self contexts after malformed delimited functions, with bodies and catch clauses', async () => {
     for (const text of [
       'function RecoveryBroken(){var private_local=;}',

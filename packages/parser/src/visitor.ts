@@ -548,11 +548,13 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     children: VariableAssignmentCstChildren,
     ctx: VisitorContext,
   ) {
-    // Determine the args for ASSIGN
-    const name = children.Identifier[0].image;
-    const range = this.PROCESSOR.range(children.Identifier[0]);
-    const rhs = children.assignmentRightHandSide;
+    const identity = identifierFrom(children);
     const docs = this.PROCESSOR.consumeJsdoc();
+    // A partially typed static declaration may have no authored identifier.
+    if (!identity) return;
+    const name = identity.name;
+    const range = this.PROCESSOR.range(identity.token);
+    const rhs = children.assignmentRightHandSide;
 
     // Determine the container for this variable
     const { isStatic } = ctx;
