@@ -11,58 +11,31 @@ export class StitchHoverProvider implements vscode.HoverProvider {
     position: vscode.Position,
     token: vscode.CancellationToken,
   ): Promise<vscode.Hover | undefined> {
-    const file = await this.provider.ensureDocumentCurrent(document, token);
-    if (!file) return;
-    const items = new Set(
-      file
-        .getReferenceCandidatesAt(document.offsetAt(position))
-        .map((ref) => ref.item),
+    const result = await this.provider.query(
+      document,
+      { kind: 'hover', offset: document.offsetAt(position) },
+      token,
     );
-    if (!items.size) return;
+    if (!result) return;
     const hoverContents = new vscode.MarkdownString();
-    const codeBlocks = new Set<string>();
-    const textBlocks = new Set<string>();
-    if (items.size > 1)
-      textBlocks.add('This spelling has multiple macro expansion contexts.');
-    for (const item of items) {
-      if (item.description) {
-        textBlocks.add(item.description);
-      }
-      if (item.type.type.length === 0) {
-        codeBlocks.add('Any');
-      }
-      for (const type of item.type.type) {
-        const code = type.code;
-        if (code) {
-          codeBlocks.add(code);
-        }
-        if (type.description) {
-          textBlocks.add(type.description);
-        }
-        if (type.details) {
-          textBlocks.add(type.details);
-        }
-        // If it's a sprite, add preview images
-        const sprite =
-          type.kind === 'Asset.GMSprite' &&
-          item.name &&
-          this.provider.getAsset(document, item.name);
-        if (sprite) {
-          hoverContents.isTrusted = true;
-          assertUserClaim(sprite.dir, 'Sprite must have a directory');
-          hoverContents.baseUri = vscode.Uri.file(sprite.dir.absolute);
-          hoverContents.supportHtml = true;
-          const yy = sprite.yy as YySprite;
-          let images = '';
-          for (const frame of yy.frames) {
-            const framePath = vscode.Uri.file(
-              sprite.dir.join(`${frame.name}.png`).absolute,
-            );
-            images += `![Sprite subimage](${framePath})`;
-          }
-          textBlocks.add(images);
-        }
-      }
+    const codeBlocks = new Set(result.code);
+    const textBlocks = new Set(result.text);
+    for (const name of result.sprites) {
+      const sprite = this.provider.getAsset(document, name);
+      if (!sprite) continue;
+      hoverContents.isTrusted = true;
+      assertUserClaim(sprite.dir, 'Sprite must have a directory');
+      hoverContents.baseUri = vscode.Uri.file(sprite.dir.absolute);
+      hoverContents.supportHtml = true;
+      const yy = sprite.yy as YySprite;
+      textBlocks.add(
+        yy.frames
+          .map(
+            (frame) =>
+              `![Sprite subimage](${vscode.Uri.file(sprite.dir.join(`${frame.name}.png`).absolute)})`,
+          )
+          .join(''),
+      );
     }
     if (!codeBlocks.size && !textBlocks.size) {
       return;

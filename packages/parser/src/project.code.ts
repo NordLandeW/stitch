@@ -493,6 +493,7 @@ export class Code {
   private collectText(content: string) {
     if (this.retired) return;
     this.content = content;
+    if (!this.project.analysisEnabled) return;
     this.sourceLines = new SourceLines(content);
     this.project.macros.collect(this, content);
     this.parseCollected();
@@ -500,6 +501,7 @@ export class Code {
 
   /** @internal Re-expand a collected buffer without reading over an open editor. */
   parseCollected() {
+    if (!this.project.analysisEnabled) return;
     this.clearAllDiagnostics();
     const previousText = this.preprocessed?.text;
     this.preprocessed = this.project.macros.preprocess(this);
@@ -743,8 +745,9 @@ export class Code {
     this.asset.gmlFiles.delete(this.path.absolute.toLocaleLowerCase());
     // remove file
     await this.path.delete();
+    this.project.resourceChanged(this.path.absolute);
     this.retire();
-    this.project.macros.flush();
+    if (this.project.analysisEnabled) this.project.macros.flush();
   }
 
   /**
@@ -755,7 +758,7 @@ export class Code {
     const next = typeof content === 'string' ? content : await this.path.read();
     if (this.retired) return;
     this.collectText(next);
-    this.project.macros.flush();
+    if (this.project.analysisEnabled) this.project.macros.flush();
     // Re-run diagnostics on everything that ended up dirty due to the changes
     if (options?.reloadDirty) {
       this.project.drainDirtyFileUpdateQueue();
@@ -906,6 +909,7 @@ export class Code {
 
   /** Update and emit diagnostics */
   updateDiagnostics() {
+    if (!this.project.analysisEnabled) return [];
     this.computeFunctionCallDiagnostics();
     this.computeUndeclaredSymbolDiagnostics();
     this.computeJsdocDiagnostics();
@@ -919,6 +923,7 @@ export class Code {
   }
 
   updateGlobals() {
+    if (!this.project.analysisEnabled) return;
     this.reset(this.semanticTree === this._parsed);
     this.semanticTree = this._parsed;
     this.project.macros.registerSymbols(this, this.preprocessed);
@@ -931,6 +936,10 @@ export class Code {
   /** Retire semantic contributions without changing any project files. */
   retire() {
     if (this.retired) return;
+    if (!this.project.analysisEnabled) {
+      this.retired = true;
+      return;
+    }
     const affected = this.project.prepareSemanticFiles([this]);
     this.retired = true;
     for (const code of affected) this.project.queueSemanticFileUpdate(code);
@@ -950,6 +959,7 @@ export class Code {
   }
 
   updateAllSymbols() {
+    if (!this.project.analysisEnabled) return;
     registerSignifiers(this);
     this.finishProvisionalDefinitions();
     this.project.completeSemanticFileUpdate(this);

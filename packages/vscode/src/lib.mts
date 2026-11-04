@@ -3,7 +3,6 @@ import type {
   Code,
   DiagnosticsEventPayload,
   Range,
-  Reference,
 } from '@bscotch/gml-parser';
 import { Pathy, pathy } from '@bscotch/pathy';
 import { exec } from 'node:child_process';
@@ -28,14 +27,6 @@ export function getWorkspaceRoot() {
     throw new Error('Not in a workspace!');
   }
   return root;
-}
-
-export function getAssetFromRef(ref: Reference | undefined): Asset | undefined {
-  if (!ref) return;
-  const project = ref.file.project;
-  return ref.item.asset
-    ? project.getAssetByName(ref.item.name)
-    : ref.item.def?.file?.asset;
 }
 
 /**

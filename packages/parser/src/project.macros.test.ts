@@ -193,6 +193,32 @@ describe('macro source integration', function () {
       assert(await asset.yyPath.exists());
       assert.equal(await asset.dir.up().join('RENAME_TARGET').exists(), false);
       assert.equal(await use.path.read(), originalUse);
+      const renameFile = (project as any).renameResourceFile;
+      let writes = 0;
+      (project as any).renameResourceFile = async (
+        from: string,
+        to: string,
+      ) => {
+        if (++writes === 2) throw new Error('Injected rename write failure');
+        return renameFile(from, to);
+      };
+      try {
+        await assert.rejects(
+          project.renameAsset(oldName, newName),
+          /Original files were restored/,
+        );
+        assert(writes >= 2, 'The IO fault must run');
+        assert.equal(definitions.content, originalDefinitions);
+        assert.equal(use.content, originalUse);
+        const restored = project.getAssetByName(oldName)!;
+        assert.equal(
+          use.refs.filter((reference) => reference.item === restored.signifier)
+            .length,
+          2,
+        );
+      } finally {
+        (project as any).renameResourceFile = renameFile;
+      }
       await project.renameAsset(oldName, newName);
       const renamed = project.getAssetByName(newName)!;
       assert(renamed && !project.getAssetByName(oldName));

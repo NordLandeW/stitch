@@ -1,6 +1,6 @@
 import vscode from 'vscode';
 import type { StitchWorkspace } from './extension.workspace.mjs';
-import { locationOf } from './lib.mjs';
+import { displayLocation } from './language/presentation.mjs';
 
 export class StitchTypeDefinitionProvider
   implements vscode.TypeDefinitionProvider
@@ -12,22 +12,12 @@ export class StitchTypeDefinitionProvider
     position: vscode.Position,
     token: vscode.CancellationToken,
   ): Promise<vscode.Definition | vscode.LocationLink[] | undefined> {
-    const file = await this.workspace.ensureDocumentCurrent(document, token);
-    const offset = document.offsetAt(position);
-    const ref = file?.getReferenceAt(offset);
-    const item = ref?.item;
-    if (!item) return;
-
-    // Get the types associated with this item that have associated signifiers.
-    const typeSignifiers = item.type.type
-      .map((t) => {
-        if (t.signifier?.def?.file) {
-          return locationOf(t.signifier!.def!);
-        }
-        return;
-      })
-      .filter((x) => !!x) as vscode.Location[];
-    return typeSignifiers;
+    const locations = await this.workspace.query(
+      document,
+      { kind: 'typeDefinition', offset: document.offsetAt(position) },
+      token,
+    );
+    return locations?.map(displayLocation);
   }
 
   static register(workspace: StitchWorkspace) {

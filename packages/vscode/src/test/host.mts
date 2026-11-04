@@ -99,7 +99,10 @@ async function compileSubjects(): Promise<string> {
     import { Signifier } from ${JSON.stringify(parserSource('signifiers.ts'))};
     import { Native } from ${JSON.stringify(parserSource('project.native.ts'))};
     import { GameMakerProject } from ${JSON.stringify(source('extension.project.mts'))};
-    export { StitchWorkspace } from ${JSON.stringify(source('extension.workspace.mts'))};
+    import { StitchWorkspace } from ${JSON.stringify(source('extension.workspace.mts'))};
+    import { TestLanguageService } from ${JSON.stringify(source('test/language.mts'))};
+    StitchWorkspace.prototype.createLanguageService = function(project) { return new TestLanguageService(project); };
+    export { StitchWorkspace };
     export { activateStitchExtension } from ${JSON.stringify(source('extension.activate.mts'))};
     export { ChangeTracker } from ${JSON.stringify(source('changes.mts'))};
     export { stitchEvents } from ${JSON.stringify(source('events.mts'))};
@@ -117,6 +120,7 @@ async function compileSubjects(): Promise<string> {
     // tests supply independent source text and use real Code/Asset entry points.
     GameMakerProject.prototype.initialize = function() { return host.initializeProject(this); };
     export async function seedProject(project) {
+      project.options.analysis = 'full';
       project.self = new Type('Struct').named('global');
       project.symbol = new Signifier(project.self, 'global', project.self);
       project.symbol.global = true; project.symbol.def = {};
@@ -230,10 +234,19 @@ class Position {
   }
 }
 class Range {
+  readonly start: Position;
+  readonly end: Position;
   constructor(
-    readonly start: Position,
-    readonly end: Position,
-  ) {}
+    start: Position | number,
+    end: Position | number,
+    endLine?: number,
+    endCharacter?: number,
+  ) {
+    this.start =
+      typeof start === 'number' ? new Position(start, end as number) : start;
+    this.end =
+      typeof end === 'number' ? new Position(endLine!, endCharacter!) : end;
+  }
   get isSingleLine() {
     return this.start.line === this.end.line;
   }
@@ -550,6 +563,12 @@ export async function createHost() {
       constructor(
         public label: any,
         public kind: number,
+      ) {}
+    },
+    CompletionList: class {
+      constructor(
+        public items: unknown[],
+        public isIncomplete: boolean,
       ) {}
     },
     CompletionItemKind: {

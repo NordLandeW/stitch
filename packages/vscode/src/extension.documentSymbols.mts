@@ -1,7 +1,7 @@
 import vscode from 'vscode';
-import { collectGmlDocumentSymbols } from './extension.documentSymbols.core.mjs';
+import type { DocumentSymbol } from './language/protocol.mjs';
 import type { StitchWorkspace } from './extension.workspace.mjs';
-import { rangeFrom } from './lib.mjs';
+import { displayRange } from './language/presentation.mjs';
 import { warn } from './log.mjs';
 
 const symbolKinds = {
@@ -26,30 +26,28 @@ export class StitchDocumentSymbolProvider
     token: vscode.CancellationToken,
   ): Promise<vscode.DocumentSymbol[]> {
     try {
-      const file = await this.workspace.ensureDocumentCurrent(
+      const symbols = await this.workspace.query(
         document,
+        { kind: 'documentSymbols' },
         token,
-        false,
       );
-      if (!file) return [];
+      if (!symbols) return [];
 
-      const convert = (
-        symbol: ReturnType<typeof collectGmlDocumentSymbols>[number],
-      ): vscode.DocumentSymbol => {
+      const convert = (symbol: DocumentSymbol): vscode.DocumentSymbol => {
         const result = new vscode.DocumentSymbol(
           symbol.name,
           symbol.detail,
           symbolKinds[symbol.kind],
-          document.validateRange(rangeFrom(symbol.range)),
-          document.validateRange(rangeFrom(symbol.selectionRange)),
+          document.validateRange(displayRange(symbol.range)),
+          document.validateRange(displayRange(symbol.selectionRange)),
         );
         result.children = symbol.children.map(convert);
-        if (symbol.item.deprecated) {
+        if (symbol.deprecated) {
           result.tags = [vscode.SymbolTag.Deprecated];
         }
         return result;
       };
-      return collectGmlDocumentSymbols(file).map(convert);
+      return symbols.map(convert);
     } catch (error) {
       warn(error);
       return [];

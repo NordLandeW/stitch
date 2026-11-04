@@ -26,8 +26,17 @@ import {
   type YySprite,
 } from '@bscotch/yy';
 import { EventEmitter } from 'events';
+import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { logger } from './logger.js';
-import { importAssets } from './modules.js';
+import {
+  importAssets,
+  planAssetImport,
+  type ModuleImportPlan,
+} from './modules.js';
+export type { ModuleImportPlan } from './modules.js';
 import { ImportModuleOptions } from './modules.types.js';
 import { Asset, isAssetOfKind } from './project.asset.js';
 import { Code } from './project.code.js';
@@ -64,7 +73,31 @@ export interface DiagnosticsEventPayload {
 
 export type OnDiagnostics = (diagnostics: DiagnosticsEventPayload) => void;
 
+export interface ResourceRenamePlan {
+  from: string;
+  to: string;
+  resourceState: string;
+  sources: { path: string; text: string }[];
+  edits: { path: string; start: number; end: number; text: string }[];
+}
+export interface ResourceEditBatch {
+  texts: { path: string; before: string; after: string }[];
+  /** Ordered after text changes; paths after an earlier move use its destination. */
+  moves: { from: string; to: string }[];
+}
+export interface ResourceRenameOptions {
+  plan: ResourceRenamePlan;
+  /** Final editor-side validation only; all writes use the common disk transaction. */
+  validate?(batch: ResourceEditBatch): Promise<boolean>;
+}
+
 export interface ProjectOptions {
+  /** Resource inventory and writes only; language analysis remains in its owner. */
+  analysis?: 'full' | 'resources';
+  /** Already selected spec files, avoiding duplicate discovery in a worker. */
+  nativeSpecFiles?: string[];
+  /** Load documentation links for presentation; language-only owners can omit them. */
+  documentation?: boolean;
   /** Active GameMaker configuration; omitted uses the build's first-child/default selection. */
   configuration?: string;
   /**
@@ -105,6 +138,34 @@ export class Project {
   readonly assets = new Map<AssetName, Asset>();
   readonly macros = new ProjectMacros(this);
   private readonly sourceUpdates = new Set<Promise<unknown>>();
+  private resourceOperations: Promise<void> = Promise.resolve();
+
+  private serializeResourceOperation<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const prior = this.resourceOperations;
+    const result = this.withSourceUpdate(() => prior.then(operation));
+    this.resourceOperations = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  }
+
+  get analysisEnabled() {
+    return this.options?.analysis !== 'resources';
+  }
+  nativeSpecFiles: string[] = [];
+
+  onResourceChange(callback: (path: string) => void): () => void {
+    this.emitter.on('resource-change', callback);
+    return () => this.emitter.off('resource-change', callback);
+  }
+
+  /** A completed host resource write invalidates its independent language owner. */
+  resourceChanged(path: string) {
+    this.emitter.emit('resource-change', path);
+  }
 
   /** Keep editor queries outside async resource reads and physical rename writes. */
   async withSourceUpdate<T>(operation: () => Promise<T>): Promise<T> {
@@ -117,6 +178,10 @@ export class Project {
     }
   }
 
+  get sourcesCurrent(): boolean {
+    return this.sourceUpdates.size === 0;
+  }
+
   async whenSourcesCurrent(): Promise<void> {
     while (this.sourceUpdates.size) await Promise.all([...this.sourceUpdates]);
   }
@@ -127,7 +192,7 @@ export class Project {
 
   setAnalysisConfiguration(configuration?: string) {
     this.macros.configure(configuration);
-    this.macros.flush();
+    if (this.analysisEnabled) this.macros.flush();
   }
   /**
    * Store the "native" functions, constants, and enums on
@@ -226,6 +291,7 @@ export class Project {
    * @internal Drain the queue of dirty files, updating their diagnostics
    */
   drainDirtyFileUpdateQueue() {
+    if (!this.analysisEnabled) return;
     this.refreshSemanticFiles();
     for (const code of this.dirtyFiles) {
       code.updateDiagnostics();
@@ -514,123 +580,441 @@ export class Project {
    * @param from The name of the asset to rename, case-insensitive.
    * @param to The new name for the asset, which must be a valid identifier that doesn't already have an associated asset. The name will be set in the provided casing, but must be unique case-insensitively.
    */
-  @sequential
-  async renameAsset(from: string, to: string) {
-    return this.withSourceUpdate(() => this.renameAssetFiles(from, to));
+  async renameAsset(
+    from: string,
+    to: string,
+    external?: ResourceRenameOptions,
+  ) {
+    return this.serializeResourceOperation(async () => {
+      assert(
+        this.analysisEnabled || external,
+        'Resource-only rename requires a current language plan',
+      );
+      return this.renameResourceAsset(
+        from,
+        to,
+        external || { plan: this.createAssetRenamePlan(from, to) },
+      );
+    });
   }
 
-  private async renameAssetFiles(from: string, to: string) {
+  resourceState(): string {
+    return JSON.stringify([
+      Yy.stringify(this.yyp, 'project'),
+      [...this.assets.values()]
+        .sort((a, b) => a.yyPath.absolute.localeCompare(b.yyPath.absolute))
+        .map((asset) => [
+          asset.yyPath.absolute,
+          Yy.stringify(asset.yy, asset.assetKind, this.yyp),
+        ]),
+    ]);
+  }
+
+  /** Verify metadata baselines immediately before a separately planned write. */
+  async validateResourceState(expected: string): Promise<boolean> {
+    if (this.resourceState() !== expected) return false;
+    const yyp = await Yy.read(this.yypPath.absolute, 'project');
+    if (Yy.stringify(yyp, 'project') !== Yy.stringify(this.yyp, 'project'))
+      return false;
+    for (const asset of this.assets.values()) {
+      const yy = await Yy.read(asset.yyPath.absolute, asset.assetKind);
+      if (
+        Yy.stringify(yy, asset.assetKind, yyp) !==
+        Yy.stringify(asset.yy, asset.assetKind, yyp)
+      )
+        return false;
+    }
+    return this.resourceState() === expected;
+  }
+
+  /** Language-owner validation; only physical immutable source values leave it. */
+  createAssetRenamePlan(from: string, to: string): ResourceRenamePlan {
+    assert(
+      this.analysisEnabled,
+      'Asset rename planning requires language analysis',
+    );
     const asset = this.getAssetByName(from, { assertExists: true });
     assertIsValidIdentifier(to);
-    const toAsset = this.getAssetByName(to);
-    assert(!toAsset, `Cannot rename. An asset named "${to}" already exists`);
-    // Reject capture or ambiguous macro spellings before changing resource files.
-    this.renameEdits(asset.signifier, to);
-
-    // Create a new asset with the new name, copying over the old asset's files and updating them as needed
-    const newAssetDir = asset.dir.up().join(to);
-    const reset = async () =>
-      await newAssetDir.delete({ force: true, recursive: true });
-    await newAssetDir.ensureDirectory();
-    await newAssetDir.isEmptyDirectory({ assert: true });
-    await asset.dir.copy(newAssetDir);
-
-    // The yy files contain the old 'name' field, and there may be
-    // other files named after the old asset name.
-    // Rename all copied files that have the old asset name in them
-    const oldNamePattern = new RegExp(`\\b${from}\\b`, 'gi');
-    let newYyFile: Pathy | undefined;
-    await newAssetDir.listChildrenRecursively({
-      filter: async (p) => {
-        if (await p.isDirectory()) return;
-        // Get the relative path
-        const relative = p.relativeFrom(newAssetDir);
-        const newRelative = relative.replaceAll(oldNamePattern, to);
-        if (newRelative === relative) return;
-        // Rename!
-        const newFile = newAssetDir.join(newRelative);
-        if (newRelative === `${to}.yy`) {
-          newYyFile = newFile;
-        }
-        await p.copy(newFile);
-        await p.delete();
-      },
+    assert(!this.getAssetByName(to), `An asset named "${to}" already exists`);
+    const sources = new Map<string, string>();
+    const edits = this.renameEdits(asset.signifier, to).map((edit) => {
+      const source = edit.range.source;
+      sources.set(source.file.path.absolute, source.file.content);
+      return {
+        path: source.file.path.absolute,
+        start: source.start.offset,
+        end: source.end.offset + 1,
+        text: edit.text,
+      };
     });
-    if (!newYyFile) {
-      await reset();
-      throwError(`Could not find yy after copying files`);
-    }
-    // Update the "name" field
-    const yy = await Yy.read(newYyFile.absolute, asset.assetKind);
-    yy.name = to;
-    if (isAssetOfKind(asset, 'sounds')) {
-      // Then we've renamed the sound file and need to update that in the yy!
-      const yySound = yy as YySound;
-      yySound.soundFile = yySound.soundFile.replace(oldNamePattern, to);
-    } else if (isAssetOfKind(asset, 'sprites')) {
-      const yySprite = yy as YySprite;
-      // Update the sequence track references.
-      // They're in an absurd, deeply nested structure that changes
-      // periodically. So the easiest thing is to stringify it, replace all,
-      // and reparse it.
-      if (yySprite.sequence?.tracks?.length) {
-        for (let i = 0; i < yySprite.sequence.tracks.length; i++) {
-          const track = yySprite.sequence.tracks[i];
-          let stringified = Yy.stringify(track);
-          stringified = stringified.replaceAll(oldNamePattern, to);
-          yySprite.sequence.tracks[i] = Yy.parse(stringified) as any;
-        }
-      }
-    }
+    return {
+      from: asset.name,
+      to,
+      resourceState: this.resourceState(),
+      edits,
+      sources: [...sources].map(([path, text]) => ({ path, text })),
+    };
+  }
 
-    await Yy.write(newYyFile.absolute, yy, asset.assetKind, this.yyp);
-
-    // Register the new asset
-    const info = await this.addAssetToYyp(newYyFile!.absolute);
-    const newAsset = await Asset.from(this, info);
-    assert(newAsset, `Could not create new asset ${to}`);
-    this.registerAsset(newAsset);
-
-    if (isAssetOfKind(newAsset, 'sprites')) {
-      // Then find any object that had its sprite set to the old one,
-      // and set it to the new one
-      for (const obj of this.assets.values()) {
-        if (!isAssetOfKind(obj, 'objects')) continue;
-        if (!obj.sprite) continue;
-        console.log(
-          'Checking old sprite name',
-          obj.sprite.name,
-          asset.name,
-          newAsset.name,
-        );
-        if (obj.sprite?.name === asset.name) {
-          console.log('UPDATING SPRITE');
-          obj.sprite = newAsset;
-        }
-      }
-    }
-
-    // Remove the old asset
-    await this.removeAssetByName(from);
-
-    // Fully process the change
-    await this.initiallyParseAssetCode([newAsset]);
-
-    // Update the code from all refs to have the new name
-    await this.applyRenameEdits(
-      createRenameEdits(asset.signifier, to, newAsset.signifier),
+  private async renameResourceAsset(
+    from: string,
+    to: string,
+    external: ResourceRenameOptions,
+  ) {
+    const asset = this.getAssetByName(from, { assertExists: true }),
+      plan = external.plan;
+    assertIsValidIdentifier(to);
+    assert(
+      plan.from === asset.name && plan.to === to,
+      'Asset rename plan does not match the requested operation',
     );
+    assert(!this.getAssetByName(to), `An asset named "${to}" already exists`);
+    assert(
+      await this.validateResourceState(plan.resourceState),
+      'Resource metadata changed since rename planning',
+    );
+    const destination = asset.dir.up().join(to);
+    assert(
+      !(await destination.exists()),
+      'Asset rename destination already exists',
+    );
+    const batch: ResourceEditBatch = {
+      texts: [],
+      moves: [{ from: asset.dir.absolute, to: destination.absolute }],
+    };
+    const sourceTexts = new Map(
+      plan.sources.map((source) => [source.path, source.text]),
+    );
+    // Full-analysis clients may own physical sources outside the resource
+    // inventory. Keep those owners local; only value plans cross workers.
+    const sourceFiles = new Set(
+      this.analysisEnabled
+        ? [...asset.signifier.refs]
+            .map((reference) => reference.source.file)
+            .filter((code) => sourceTexts.has(code.path.absolute))
+        : [],
+    );
+    assert(sourceTexts.size === plan.sources.length, 'Duplicate rename source');
+    for (const edit of plan.edits)
+      assert(sourceTexts.has(edit.path), 'Rename edit has no source baseline');
+    for (const [file, text] of sourceTexts) {
+      assert(
+        this.dir.isParentOf(pathy(file)) && pathy(file).hasExtension('gml'),
+        'Rename source is outside project GML',
+      );
+      assert(
+        (await readFile(file, 'utf8')) === text,
+        'Rename source changed since planning; save affected files and try again',
+      );
+      const edits = plan.edits
+        .filter((edit) => edit.path === file)
+        .sort((a, b) => b.start - a.start);
+      let after = text,
+        boundary = text.length;
+      for (const edit of edits) {
+        const spelling = text.slice(edit.start, edit.end);
+        assert(
+          Number.isInteger(edit.start) &&
+            Number.isInteger(edit.end) &&
+            edit.start >= 0 &&
+            edit.end <= boundary &&
+            edit.end > edit.start &&
+            edit.text !== spelling &&
+            edit.text ===
+              spelling.replace(new RegExp(`\\b${asset.name}\\b`), to),
+          'Invalid or overlapping asset rename edit',
+        );
+        after = after.slice(0, edit.start) + edit.text + after.slice(edit.end);
+        boundary = edit.start;
+      }
+      if (after !== text) batch.texts.push({ path: file, before: text, after });
+    }
+    const oldPattern = new RegExp(`\\b${asset.name}\\b`, 'gi');
+    const copiedFiles = await asset.dir.listChildrenRecursively();
+    for (const file of copiedFiles) {
+      if (await file.isDirectory()) continue;
+      const relative = file.relativeFrom(asset.dir),
+        renamed = relative.replaceAll(oldPattern, to);
+      if (relative !== renamed)
+        batch.moves.push({
+          from: destination.join(relative).absolute,
+          to: destination.join(renamed).absolute,
+        });
+    }
+    const oldId = asset.resource.id.path,
+      newId = `${asset.assetKind}/${to}/${to}.yy`;
+    const replaceIds = (value: any): void => {
+      if (!value || typeof value !== 'object') return;
+      if (
+        typeof value.path === 'string' &&
+        value.path.toLowerCase() === oldId.toLowerCase()
+      ) {
+        value.path = newId;
+        if ('name' in value) value.name = to;
+      }
+      for (const child of Object.values(value)) replaceIds(child);
+    };
+    const originalYyp = Yy.parse(Yy.stringify(this.yyp, 'project'), 'project');
+    const yypBefore = await readFile(this.yypPath.absolute, 'utf8');
+    assert(
+      Yy.stringify(Yy.parse(yypBefore), 'project') ===
+        Yy.stringify(originalYyp, 'project'),
+      'Project metadata changed while capturing rename inputs',
+    );
+    // Derive replacements from these validated disk bytes. Schema-populated YY
+    // values contain FixedNumber instances: structuredClone loses their class,
+    // while schema serialization can round otherwise untouched numeric fields.
+    const nextYyp = Yy.parse(yypBefore) as Yyp;
+    replaceIds(nextYyp);
+    for (const resource of this.assets.values()) {
+      const originalYy = Yy.stringify(
+        resource.yy,
+        resource.assetKind,
+        originalYyp,
+      );
+      const before = await readFile(resource.yyPath.absolute, 'utf8');
+      const original = Yy.parse(before);
+      assert(
+        Yy.stringify(original, resource.assetKind, originalYyp) === originalYy,
+        'Resource metadata changed while capturing rename inputs',
+      );
+      const yy = Yy.parse(before) as typeof resource.yy;
+      replaceIds(yy);
+      if (resource === asset) {
+        yy.name = to;
+        if ('%Name' in yy) yy['%Name'] = to;
+        if (isAssetOfKind(asset, 'sounds'))
+          (yy as YySound).soundFile = (yy as YySound).soundFile.replace(
+            oldPattern,
+            to,
+          );
+        if (isAssetOfKind(asset, 'sprites')) {
+          const sprite = yy as YySprite;
+          if (sprite.sequence?.tracks)
+            sprite.sequence.tracks = Yy.parse(
+              Yy.stringify(sprite.sequence.tracks).replaceAll(oldPattern, to),
+            ) as typeof sprite.sequence.tracks;
+        }
+      }
+      if (
+        isAssetOfKind(asset, 'objects') &&
+        isAssetOfKind(resource, 'objects')
+      ) {
+        for (const event of resource.yy.eventList)
+          if (event.collisionObjectId?.name === asset.name) {
+            const file = resource.dir.join(`Collision_${asset.name}.gml`);
+            if (await file.exists()) {
+              const root = resource === asset ? destination : resource.dir;
+              batch.moves.push({
+                from: root.join(file.basename).absolute,
+                to: root.join(`Collision_${to}.gml`).absolute,
+              });
+            }
+          }
+      }
+      if (!Yy.areEqual(original, yy)) {
+        batch.texts.push({
+          path: resource.yyPath.absolute,
+          before,
+          after: Yy.stringify(yy, undefined, nextYyp),
+        });
+      }
+    }
+    batch.texts.push({
+      path: this.yypPath.absolute,
+      before: yypBefore,
+      after: Yy.stringify(nextYyp),
+    });
+    const destinations = new Set<string>();
+    for (const move of batch.moves) {
+      const key = pathy(move.to).absolute.toLowerCase();
+      assert(!destinations.has(key), 'Asset rename paths collide');
+      destinations.add(key);
+      const existingPath = key.startsWith(
+        destination.absolute.toLowerCase() + '/',
+      )
+        ? asset.dir.join(pathy(move.to).relativeFrom(destination))
+        : pathy(move.to);
+      assert(
+        !(await existingPath.exists()),
+        'An asset rename target file already exists',
+      );
+    }
+    assert(
+      plan.resourceState === this.resourceState(),
+      'Resource metadata changed while preparing rename',
+    );
+    await this.applyResourceRename(batch, sourceFiles, external.validate);
+    return this.getAssetByName(to, { assertExists: true });
+  }
 
-    if (isAssetOfKind(newAsset, 'objects')) {
-      // Update immediate children to have the new asset as the parent
-      for (const child of asset.children) {
-        child.parent = newAsset;
+  /** Single IO seam for ordinary replacement, moves, and their reverse operations. */
+  private readonly renameResourceFile = rename;
+
+  private async applyResourceRename(
+    batch: ResourceEditBatch,
+    sourceFiles: ReadonlySet<Code>,
+    validate?: ResourceRenameOptions['validate'],
+  ) {
+    const recovery = await mkdtemp(join(tmpdir(), 'stitch-resource-rename-'));
+    const id = randomUUID();
+    const staged = batch.texts.map((text) => `${text.path}.stitch-${id}.tmp`);
+    const writes: ResourceEditBatch['texts'] = [];
+    const moves: ResourceEditBatch['moves'] = [];
+    const journal = {
+      project: this.yypPath.absolute,
+      batch,
+      status: 'prepared',
+      writes: [] as string[],
+      moves,
+    };
+    const record = () =>
+      writeFile(
+        join(recovery, 'recovery.json'),
+        JSON.stringify(journal, null, 2),
+        'utf8',
+      );
+    const reload = async () => {
+      await this.reloadYyp();
+      for (const asset of this.assets.values()) await asset.reload();
+      // Publish actual disk contents after both success and rollback. Collect
+      // every surviving physical source before expanding its macro consumers.
+      try {
+        for (const code of sourceFiles) {
+          if (code.isRetired) continue;
+          if (this.getAssetByName(code.asset.name) !== code.asset) {
+            code.retire();
+            continue;
+          }
+          await code.parse();
+        }
+      } finally {
+        if (sourceFiles.size) this.macros.flush();
       }
-      // Update any rooms that reference the old object name
-      for (const room of this.assets.values()) {
-        if (!isAssetOfKind(room, 'rooms')) continue;
-        await room.renameRoomInstanceObjects(from, to);
+    };
+    const currentPath = (original: string) => {
+      let file = pathy(original);
+      for (const move of moves) {
+        const from = pathy(move.from);
+        if (file.absolute.toLowerCase() === from.absolute.toLowerCase())
+          file = pathy(move.to);
+        else if (from.isParentOf(file))
+          file = pathy(move.to).join(file.relativeFrom(from));
       }
+      return file.absolute;
+    };
+    try {
+      // Durable before/after baselines precede any project mutation. Stage beside
+      // each target so replacement does not depend on cross-volume rename.
+      await record();
+      for (const [index, text] of batch.texts.entries())
+        await writeFile(staged[index], text.after, {
+          encoding: 'utf8',
+          flag: 'wx',
+        });
+      for (const text of batch.texts)
+        assert(
+          (await readFile(text.path, 'utf8')) === text.before,
+          `Rename input changed: ${text.path}`,
+        );
+      assert(
+        !validate || (await validate(batch)),
+        'Asset rename inputs changed; save affected files and try again',
+      );
+      journal.status = 'applying';
+      await record();
+      for (const [index, text] of batch.texts.entries()) {
+        assert(
+          (await readFile(text.path, 'utf8')) === text.before,
+          `Rename input changed: ${text.path}`,
+        );
+        await this.renameResourceFile(staged[index], text.path);
+        writes.push(text);
+        journal.writes.push(text.path);
+        await record();
+      }
+      for (const move of batch.moves) {
+        assert(
+          !(await pathy(move.to).exists()),
+          `Rename destination appeared: ${move.to}`,
+        );
+        await this.renameResourceFile(move.from, move.to);
+        moves.push(move);
+        await record();
+      }
+      await reload();
+      journal.status = 'complete';
+      await record().catch((error) =>
+        logger.warn(
+          `Could not finalize rename recovery record at ${recovery}`,
+          error,
+        ),
+      );
+      await rm(recovery, { recursive: true, force: true }).catch((error) =>
+        logger.warn(
+          `Rename succeeded; recovery cleanup remains at ${recovery}`,
+          error,
+        ),
+      );
+    } catch (error) {
+      const failures: unknown[] = [];
+      // Stop reversing dependent moves at the first failure. Remaining moves
+      // then still describe the actual path mapping for text restoration.
+      while (moves.length) {
+        const move = moves.at(-1)!;
+        try {
+          assert(
+            !(await pathy(move.from).exists()),
+            `Rollback destination is occupied: ${move.from}`,
+          );
+          await this.renameResourceFile(move.to, move.from);
+          moves.pop();
+        } catch (failure) {
+          failures.push(failure);
+          break;
+        }
+      }
+      for (const text of [...writes].reverse()) {
+        const file = currentPath(text.path),
+          temporary = `${file}.stitch-${id}.restore`;
+        try {
+          const current = await readFile(file, 'utf8');
+          if (current === text.before) continue;
+          assert(
+            current === text.after,
+            `Rollback preserved a subsequent external edit: ${file}`,
+          );
+          await writeFile(temporary, text.before, {
+            encoding: 'utf8',
+            flag: 'wx',
+          });
+          await this.renameResourceFile(temporary, file);
+        } catch (failure) {
+          failures.push(failure);
+        } finally {
+          await rm(temporary, { force: true }).catch((failure) =>
+            logger.warn(failure),
+          );
+        }
+      }
+      await reload().catch((failure) => failures.push(failure));
+      journal.status = failures.length ? 'rollback-incomplete' : 'rolled-back';
+      await record().catch((failure) => failures.push(failure));
+      if (!failures.length)
+        await rm(recovery, { recursive: true, force: true }).catch((failure) =>
+          failures.push(failure),
+        );
+      const state = failures.length
+        ? `Recovery is incomplete. Recovery data: ${recovery}`
+        : 'Original files were restored.';
+      throw new AggregateError(
+        [error, ...failures],
+        `Asset rename failed. ${state}`,
+      );
+    } finally {
+      for (const file of staged)
+        await rm(file, { force: true }).catch((error) => logger.warn(error));
+      this.resourceChanged(this.yypPath.absolute);
     }
   }
 
@@ -674,15 +1058,32 @@ export class Project {
     });
   }
 
-  @sequential
   async import(
     fromProject: Project | string,
     options: ImportModuleOptions = {},
+    plan?: ModuleImportPlan,
+    readSource?: (path: string) => Promise<string>,
   ) {
+    assert(
+      this.analysisEnabled || plan,
+      'Resource-only import requires a current language dependency plan',
+    );
     if (typeof fromProject === 'string') {
-      fromProject = await Project.initialize(fromProject);
+      fromProject = await Project.initialize(fromProject, {
+        analysis: this.options?.analysis,
+      });
     }
-    return await importAssets(fromProject, this, options);
+    const source = fromProject;
+    return this.serializeResourceOperation(() =>
+      importAssets(source, this, options, plan, readSource),
+    );
+  }
+
+  planImport(
+    source: Project,
+    options: ImportModuleOptions = {},
+  ): ModuleImportPlan {
+    return planAssetImport(source, this, options);
   }
 
   @sequential
@@ -1255,7 +1656,10 @@ export class Project {
 
   @sequential
   async saveYyp() {
-    await Yy.write(this.yypPath.absolute, this.yyp, 'project');
+    await this.withSourceUpdate(async () => {
+      await Yy.write(this.yypPath.absolute, this.yyp, 'project');
+      this.resourceChanged(this.yypPath.absolute);
+    });
   }
 
   /**
@@ -1285,7 +1689,7 @@ export class Project {
     const t = Date.now();
 
     // Load AudioGroup assets
-    for (const audioGroup of this.yyp.AudioGroups) {
+    for (const audioGroup of this.analysisEnabled ? this.yyp.AudioGroups : []) {
       if (!this.self.getMember(audioGroup.name)) {
         const signifier = new Signifier(
           this.self,
@@ -1378,28 +1782,40 @@ export class Project {
    */
   protected async loadGmlSpec(): Promise<void> {
     const t = Date.now();
-
+    await this.resolveNativeSpecFiles();
+    if (!this.analysisEnabled) return;
     this.self = new Type('Struct').named('global') as StructType;
     this.symbol = new Signifier(this.self, 'global', this.self);
     this.symbol.global = true;
     this.symbol.writable = false;
     this.symbol.def = {};
 
-    let runtimeVersion: string | undefined;
-    // Check for a stitch config file that specifies the runtime version.
-    // If it exists, use that version. It's likely that it is correct, and this
-    // way we don't have to download the releases summary.
-    if (this.config.runtimeVersion) {
-      logger.info('Found stitch config');
-      runtimeVersion = this.config.runtimeVersion;
-    }
-    await this.yypWaiter; // To ensure that `this.ideVersion` exists
-    const specFiles = await Native.listSpecFiles({
-      ideVersion: this.ideVersion,
-      runtimeVersion,
-    });
-    this.native = await Native.from(specFiles, this.self, this.types);
+    this.native = await Native.from(
+      this.nativeSpecFiles.map((file) => pathy(file)),
+      this.self,
+      this.types,
+    );
     logger.log(`Loaded GML spec in ${Date.now() - t}ms`);
+  }
+
+  /** Select native inputs without parsing XML or creating any language types. */
+  async resolveNativeSpecFiles(): Promise<string[]> {
+    await this.yypWaiter;
+    if (this.options?.nativeSpecFiles) {
+      assert(
+        this.options.nativeSpecFiles.length,
+        'At least one native spec file is required',
+      );
+      this.nativeSpecFiles = [...this.options.nativeSpecFiles];
+    } else {
+      this.nativeSpecFiles = (
+        await Native.listSpecFiles({
+          ideVersion: this.ideVersion,
+          runtimeVersion: this.config.runtimeVersion,
+        })
+      ).map((file) => file.absolute);
+    }
+    return this.nativeSpecFiles;
   }
 
   /**
@@ -1440,6 +1856,7 @@ export class Project {
    * @internal
    * Initialize a collection of new assets by parsing their GML */
   initiallyParseAssetCode(assets: Asset[]) {
+    if (!this.analysisEnabled) return;
     const codes = assets.flatMap((asset) => asset.gmlFilesArray);
     const pending = this.macros.preparePending();
     // Metadata-only resources can invalidate readers without owning any GML.
@@ -1515,14 +1932,17 @@ export class Project {
       log.log('Loaded yyp file!');
     });
     this.nativeWaiter = this.loadGmlSpec();
-    void this.nativeWaiter.then(() => {
-      options?.onLoadProgress?.(5, 'Loaded GML spec');
-    });
+    void this.nativeWaiter.then(
+      () => {
+        options?.onLoadProgress?.(5, 'Loaded GML spec');
+      },
+      () => {},
+    );
     log.log('Loading asset files...');
     await Promise.all([
       this.nativeWaiter,
       this.yypWaiter,
-      this.loadHelpLinks(),
+      options?.documentation === false ? undefined : this.loadHelpLinks(),
     ]);
     this.macros.configure(options?.configuration);
 

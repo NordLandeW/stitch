@@ -3,10 +3,7 @@ import {
   type Asset,
   type Code,
   type DiagnosticsEventPayload,
-  type FunctionArgRange,
   type OnDiagnostics,
-  type Reference,
-  type ReferenceableType,
 } from '@bscotch/gml-parser';
 import { Yy, yypSchema } from '@bscotch/yy';
 import { randomUUID } from 'node:crypto';
@@ -21,7 +18,20 @@ import {
 import { stitchEvents } from './events.mjs';
 import { activateStitchExtension } from './extension.activate.mjs';
 import { completionTriggerCharacters } from './extension.completions.mjs';
-import { DocumentAnalysisQueue } from './extension.analysis.core.mjs';
+import { WorkerLanguageService, cancellable } from './language/client.mjs';
+import type {
+  DiagnosticSnapshot,
+  LanguageService,
+  Overlay,
+  Query,
+  QueryKind,
+  QueryResults,
+  RenamePlan,
+  Selection,
+} from './language/protocol.mjs';
+import { displayRange, displaySignature } from './language/presentation.mjs';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 import { GameMakerSemanticTokenProvider } from './extension.highlighting.mjs';
 import { GameMakerProject } from './extension.project.mjs';
 import {
@@ -48,23 +58,190 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
   projects: GameMakerProject[] = [];
 
   private disposed = false;
-  private readonly diagnosticTimers = new Map<Project, NodeJS.Timeout>();
-  private readonly diskReads = new WeakMap<Code, object>();
-  private readonly analysis = new DocumentAnalysisQueue<Code>({
-    content: (code) => code.content,
-    analyze: async (code, snapshot) => {
-      await code.reload(snapshot.text);
-      if (
-        !this.disposed &&
-        this.projects.some((project) => project === code.project)
-      ) {
-        this.semanticHighlightProvider.refresh();
-        this.scheduleDiagnostics(code.project);
-      }
-    },
-    delay: () => stitchConfig.reprocessOnTypeDelay,
-    onError: (error) => logger.error(error),
-  });
+  private readonly languages = new Map<Project, LanguageService>();
+  private readonly bufferSnapshots = new Map<
+    string,
+    { document: vscode.TextDocument; overlay: Overlay }
+  >();
+  private nextDocumentGeneration = 0;
+  private readonly renameRevisions = new WeakMap<
+    object,
+    { language: number; resources: number }
+  >();
+  private readonly resourceSubscriptions = new Map<Project, () => void>();
+  private readonly nativeWatchers = new Map<Project, vscode.Disposable[]>();
+
+  private watchNativeInputs(project: GameMakerProject) {
+    for (const watcher of this.nativeWatchers.get(project) || [])
+      watcher.dispose();
+    const subscriptions: vscode.Disposable[] = [];
+    for (const file of project.nativeSpecFiles) {
+      const watcher = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(
+          vscode.Uri.file(path.dirname(file)),
+          path.basename(file),
+        ),
+      );
+      const changed = () => {
+        if (this.disposed || !this.projects.includes(project)) return;
+        this.markExternalChange();
+        this.language(project).update(
+          { kind: 'native', files: project.nativeSpecFiles },
+          true,
+        );
+      };
+      subscriptions.push(
+        watcher,
+        watcher.onDidChange(changed),
+        watcher.onDidCreate(changed),
+        watcher.onDidDelete(changed),
+      );
+    }
+    this.nativeWatchers.set(project, subscriptions);
+  }
+
+  private resourceRevision = 0;
+  private readonly pendingDiagnostics = new Map<
+    Project,
+    Map<string, DiagnosticSnapshot>
+  >();
+
+  markExternalChange() {
+    this.resourceRevision++;
+  }
+
+  publishPendingDiagnostics() {
+    if (this.disposed || this.externalChangeTracker.hasPending) return;
+    for (const [project, snapshots] of this.pendingDiagnostics) {
+      if (!project.sourcesCurrent || !this.languages.get(project)?.isCurrent)
+        continue;
+      for (const snapshot of snapshots.values())
+        this.emitDiagnosticSnapshot(snapshot);
+      snapshots.clear();
+    }
+  }
+
+  protected createLanguageService(project: GameMakerProject): LanguageService {
+    const service = new WorkerLanguageService(
+      {
+        yypPath: project.yypPath.absolute,
+        configuration: project.analysisConfiguration,
+        nativeSpecFiles: project.nativeSpecFiles,
+        autoDeclareGlobalsPrefixes: stitchConfig.autoDeclaredGlobalsPrefixes,
+      },
+      path.join(this.ctx.extensionPath, 'dist/language-worker.js'),
+      {
+        delay: () => stitchConfig.reprocessOnTypeDelay,
+        onCommit: (diagnostics) => {
+          if (
+            this.disposed ||
+            !this.projects.includes(project) ||
+            this.languages.get(project) !== service
+          )
+            return;
+          let pending = this.pendingDiagnostics.get(project);
+          if (!pending)
+            this.pendingDiagnostics.set(project, (pending = new Map()));
+          for (const snapshot of diagnostics)
+            pending.set(snapshot.path, snapshot);
+          this.publishPendingDiagnostics();
+          this.semanticHighlightProvider.refresh();
+        },
+        onError: (error) => {
+          logger.error(error);
+          if (!this.disposed)
+            void showErrorMessage(
+              'Stitch language analysis stopped. Resource operations remain available; precise language results are temporarily unavailable.',
+              'Retry analysis',
+            ).then((choice) => {
+              if (choice === 'Retry analysis')
+                void this.retryLanguageService(project, service).catch(
+                  (error) => logger.error(error),
+                );
+            });
+        },
+        onLog: (level, message) => logger[level](message),
+      },
+    );
+    return service;
+  }
+
+  private language(project: GameMakerProject): LanguageService {
+    let service = this.languages.get(project);
+    if (!service) {
+      service = this.createLanguageService(project);
+      this.languages.set(project, service);
+    }
+    return service;
+  }
+
+  /** Explicit, bounded recovery: a new session reads current disk and overlays. */
+  async retryLanguageService(
+    project: GameMakerProject,
+    expected?: LanguageService,
+  ): Promise<boolean> {
+    if (
+      this.disposed ||
+      !this.projects.includes(project) ||
+      (expected && this.languages.get(project) !== expected)
+    )
+      return false;
+    await this.externalChangeTracker.retryPending();
+    await project.whenSourcesCurrent();
+    if (
+      this.disposed ||
+      !this.projects.includes(project) ||
+      (expected && this.languages.get(project) !== expected)
+    )
+      return false;
+    this.languages.get(project)?.dispose();
+    this.languages.delete(project);
+    this.pendingDiagnostics.delete(project);
+    this.resourceRevision++;
+    for (const [uri, snapshot] of this.bufferSnapshots)
+      if (this.getProject(snapshot.document) === project)
+        this.bufferSnapshots.delete(uri);
+    for (const asset of project.assets.values())
+      for (const code of asset.gmlFiles.values())
+        this.diagnosticCollection.delete(vscode.Uri.file(code.path.absolute));
+    this.language(project);
+    this.syncBuffers(project);
+    return this.language(project).flush();
+  }
+
+  private emitDiagnosticSnapshot(snapshot: DiagnosticSnapshot) {
+    if (this.disposed) return;
+    const uri = vscode.Uri.file(snapshot.path);
+    const document = this.openDocument(uri);
+    if (
+      document &&
+      snapshot.text !== undefined &&
+      snapshot.text !== document.getText()
+    )
+      return;
+    if (
+      stitchConfig.suppressDiagnosticsInGroups.some(
+        (group) =>
+          snapshot.folder === `folders/${group}.yy` ||
+          snapshot.folder?.startsWith(`folders/${group}/`),
+      )
+    )
+      return;
+    this.diagnosticCollection.set(
+      uri,
+      snapshot.diagnostics.map((diagnostic) => ({
+        range: displayRange(diagnostic.range),
+        message: diagnostic.message,
+        severity:
+          diagnostic.severity === 'error'
+            ? vscode.DiagnosticSeverity.Error
+            : diagnostic.severity === 'info'
+              ? vscode.DiagnosticSeverity.Information
+              : vscode.DiagnosticSeverity.Warning,
+        source: 'stitch',
+      })),
+    );
+  }
 
   protected constructor(readonly ctx: vscode.ExtensionContext) {
     this.signatureHelpStatus.hide();
@@ -108,9 +285,20 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
   }
 
   clearProjects() {
-    this.analysis.clear();
-    for (const timer of this.diagnosticTimers.values()) clearTimeout(timer);
-    this.diagnosticTimers.clear();
+    for (const unsubscribe of this.resourceSubscriptions.values())
+      unsubscribe();
+    this.resourceSubscriptions.clear();
+    for (const watchers of this.nativeWatchers.values())
+      for (const watcher of watchers) watcher.dispose();
+    this.nativeWatchers.clear();
+    for (const project of this.projects)
+      project.onAnalysisConfiguration = undefined;
+    for (const service of this.languages.values()) service.dispose();
+    this.languages.clear();
+    this.bufferSnapshots.clear();
+    this.pendingDiagnostics.clear();
+    this.resourceRevision++;
+    this.diagnosticCollection.clear();
     this.projects = [];
     void vscode.commands.executeCommand(
       'setContext',
@@ -154,13 +342,29 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
         try {
           await project.syncIncludedFiles();
         } catch {}
-        progress.report({
-          increment: 100,
-          message: 'Done!',
-        });
+        this.projects.push(project);
+        this.watchNativeInputs(project);
+        this.resourceSubscriptions.set(
+          project,
+          project.onResourceChange((file) =>
+            this.externalChangeTracker.addChange({
+              uri: vscode.Uri.file(file),
+              type: 'change',
+            }),
+          ),
+        );
+        project.onAnalysisConfiguration = (name) =>
+          this.language(project).update({ kind: 'configuration', name }, true);
+        this.syncBuffers(project);
+        // A failed language startup keeps resource UI available and offers Retry.
+        try {
+          await this.language(project).flush();
+        } catch (error) {
+          logger.error(error);
+        }
+        progress.report({ increment: 100, message: 'Done!' });
       },
     );
-    this.projects.push(project);
     void vscode.commands.executeCommand(
       'setContext',
       'stitch.projectCount',
@@ -199,8 +403,15 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
 
   selectAnalysisConfiguration(project: Project, configuration?: string) {
     project.setAnalysisConfiguration(configuration);
+    if (
+      this.projects.includes(project as GameMakerProject) &&
+      !(project as GameMakerProject).onAnalysisConfiguration
+    )
+      this.language(project as GameMakerProject).update(
+        { kind: 'configuration', name: configuration },
+        true,
+      );
     this.semanticHighlightProvider.refresh();
-    this.scheduleDiagnostics(project);
   }
 
   refreshAnalysisConfigurations() {
@@ -219,15 +430,54 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
   }
 
   async reloadAsset(asset: Asset) {
+    const project = asset.project as GameMakerProject;
+    this.syncBuffers(project);
+    this.language(project).update({ kind: 'asset', name: asset.name }, true);
     await asset.reload((code) =>
       this.openDocument(vscode.Uri.file(code.path.absolute))?.getText(),
     );
-    this.semanticHighlightProvider.refresh();
-    this.scheduleDiagnostics(asset.project);
+    await this.language(project).flush();
+  }
+
+  async reloadProject(project: GameMakerProject) {
+    this.syncBuffers(project);
+    const previousIde = project.ideVersion;
+    this.markExternalChange();
+    await project.reloadYyp();
+    this.language(project).update(
+      { kind: 'project', configuration: project.analysisConfiguration },
+      true,
+    );
+    if (previousIde !== project.ideVersion)
+      await this.reloadNativeInputs(project);
+    await this.language(project).flush();
+  }
+
+  async reloadNativeInputs(project: GameMakerProject) {
+    await project.reloadConfig();
+    const files = await project.resolveNativeSpecFiles();
+    this.watchNativeInputs(project);
+    this.language(project).update({ kind: 'native', files }, true);
+    await this.language(project).flush();
+  }
+
+  refreshAnalysisSettings() {
+    for (const project of this.projects)
+      this.language(project).update(
+        {
+          kind: 'settings',
+          prefixes: stitchConfig.autoDeclaredGlobalsPrefixes,
+        },
+        true,
+      );
   }
 
   async deleteAsset(asset: Asset) {
     await asset.project.removeAssetByName(asset.name);
+    this.language(asset.project as GameMakerProject).update(
+      { kind: 'project', configuration: asset.project.analysisConfiguration },
+      true,
+    );
     stitchEvents.emit('asset-deleted', asset);
   }
 
@@ -236,53 +486,147 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     position: vscode.Position,
     token?: vscode.CancellationToken,
   ): Promise<vscode.SignatureHelp | undefined> {
-    if (!(await this.ensureDocumentCurrent(document, token))) return;
-    return this.getSignatureHelp(document, position);
-  }
-
-  getSignatureHelp(
-    document: vscode.TextDocument,
-    position: vscode.Position,
-  ): vscode.SignatureHelp | undefined {
-    const argRange = this.getFunctionArg(document, position);
-    if (!argRange?.param?.parent) {
-      return;
-    }
-    const param = argRange.param;
-    const func = argRange.type;
-    // Create the signature help
-    const signature = new vscode.SignatureInformation(
-      func.code,
-      func.description,
+    const signature = await this.query(
+      document,
+      { kind: 'signature', offset: document.offsetAt(position) },
+      token,
     );
-    signature.activeParameter = param.idx!;
-    signature.parameters = func.listParameters().map((p) => {
-      return new vscode.ParameterInformation(
-        p?.name || 'unknown',
-        p?.description,
-      );
-    });
-    const help = new vscode.SignatureHelp();
-    help.signatures = [signature];
-    help.activeSignature = 0;
-    help.activeParameter = param.idx!;
-    return help;
+    return signature && displaySignature(signature);
   }
 
-  /** Obtain current positions and symbols without waiting for unrelated diagnostics. */
+  private syncBuffers(project: GameMakerProject) {
+    const versions: { document: vscode.TextDocument; version: number }[] = [];
+    for (const document of vscode.workspace.textDocuments) {
+      if (
+        document.isClosed ||
+        document.languageId !== 'gml' ||
+        document.uri.scheme !== 'file' ||
+        this.getProject(document) !== project
+      )
+        continue;
+      this.acceptBuffer(project, document);
+      versions.push({ document, version: document.version });
+    }
+    return versions;
+  }
+
+  private acceptBuffer(
+    project: GameMakerProject,
+    document: vscode.TextDocument,
+    immediate = false,
+  ) {
+    const key = document.uri.toString();
+    const prior = this.bufferSnapshots.get(key);
+    if (
+      prior?.document === document &&
+      prior.overlay.version === document.version
+    )
+      return;
+    const overlay: Overlay = {
+      path: document.uri.fsPath,
+      text: document.getText(),
+      version: document.version,
+      generation:
+        prior?.document === document
+          ? prior.overlay.generation
+          : ++this.nextDocumentGeneration,
+    };
+    this.bufferSnapshots.set(key, { document, overlay });
+    this.language(project).update({ kind: 'document', ...overlay }, immediate);
+  }
+
+  async query<K extends QueryKind>(
+    document: vscode.TextDocument,
+    query: Omit<Query<K>, 'path'>,
+    token?: vscode.CancellationToken,
+  ): Promise<QueryResults[K] | undefined> {
+    if (
+      this.disposed ||
+      document.isClosed ||
+      token?.isCancellationRequested ||
+      document.languageId !== 'gml' ||
+      document.uri.scheme !== 'file'
+    )
+      return;
+    const project = this.getProject(document);
+    if (!project) return;
+    const version = document.version;
+    const result = await this.queryProject(
+      project,
+      { ...query, path: document.uri.fsPath },
+      token,
+    );
+    if (
+      this.disposed ||
+      document.isClosed ||
+      document.version !== version ||
+      token?.isCancellationRequested ||
+      this.getProject(document) !== project
+    )
+      return;
+    return result;
+  }
+
+  async queryProject<K extends QueryKind>(
+    project: GameMakerProject,
+    query: Query<K>,
+    token?: vscode.CancellationToken,
+  ): Promise<QueryResults[K] | undefined> {
+    if (
+      this.disposed ||
+      !this.projects.includes(project) ||
+      token?.isCancellationRequested
+    )
+      return;
+    if (
+      (await cancellable(
+        this.externalChangeTracker.flushPending().then(() => true),
+        token,
+      )) !== true
+    )
+      return;
+    if (
+      (await cancellable(
+        project.whenSourcesCurrent().then(() => true),
+        token,
+      )) !== true
+    )
+      return;
+    const resources = this.resourceRevision;
+    const versions = this.syncBuffers(project);
+    const service = this.language(project);
+    const revision = service.revision;
+    const result = await service.query(query, token);
+    if (
+      this.disposed ||
+      !this.projects.includes(project) ||
+      token?.isCancellationRequested ||
+      revision !== service.revision ||
+      resources !== this.resourceRevision ||
+      versions.some(
+        ({ document, version }) =>
+          document.isClosed || document.version !== version,
+      )
+    )
+      return;
+    if (
+      (query.kind === 'rename' ||
+        query.kind === 'assetRename' ||
+        query.kind === 'importPlan') &&
+      result
+    )
+      this.renameRevisions.set(result as object, {
+        language: revision,
+        resources,
+      });
+    return result;
+  }
+
+  /** Compatibility barrier for consumers of resource/file identity, not a graph. */
   async ensureDocumentCurrent(
     document: vscode.TextDocument,
     token?: vscode.CancellationToken,
-    immediate = true,
-  ): Promise<Code | undefined> {
-    return this.ensureBufferCurrent(document, token, immediate, true);
-  }
-
-  private async ensureBufferCurrent(
-    document: vscode.TextDocument,
-    token: vscode.CancellationToken | undefined,
-    immediate: boolean,
-    scanMacroBuffers: boolean,
+    _immediate = true,
   ): Promise<Code | undefined> {
     if (
       this.disposed ||
@@ -295,81 +639,181 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     const project = this.getProject(document);
     if (!project) return;
     await project.whenSourcesCurrent();
-    // A changed macro buffer invalidates other unchanged documents before their
-    // own text-only queue can legitimately take its fast path.
-    if (scanMacroBuffers) {
-      for (const other of vscode.workspace.textDocuments) {
-        if (
-          other === document ||
-          other.isClosed ||
-          other.languageId !== 'gml' ||
-          other.uri.scheme !== 'file' ||
-          this.getProject(other) !== project
-        )
-          continue;
-        const otherCode = this.getGmlFile(other);
-        if (!otherCode) continue;
-        const text = other.getText();
-        if (
-          text !== otherCode.content &&
-          (text.includes('#macro') || otherCode.content.includes('#macro'))
-        ) {
-          await this.analysis.flush(otherCode, {
-            version: other.version,
-            text,
-          });
-        }
-      }
-    }
-    if (this.disposed || document.isClosed || token?.isCancellationRequested)
-      return;
-    const code = this.getGmlFile(document);
-    if (!code) return;
-    this.diskReads.delete(code);
-    const version = document.version;
-    const snapshot = { version, text: document.getText() };
-    if (immediate) await this.analysis.flush(code, snapshot);
-    else await this.analysis.wait(code, snapshot, token);
+    const versions = this.syncBuffers(project);
     if (
-      this.disposed ||
-      document.isClosed ||
-      token?.isCancellationRequested ||
-      document.version !== version ||
-      this.getGmlFile(document) !== code
-    )
-      return;
-    return code;
-  }
-
-  /** Reference edits need current positions in every open buffer in the project. */
-  async ensureProjectCurrent(
-    document: vscode.TextDocument,
-    token?: vscode.CancellationToken,
-  ) {
-    const version = document.version;
-    const project = this.getProject(document);
-    if (!project) return;
-    const buffers = vscode.workspace.textDocuments.filter(
-      (other) =>
-        other.languageId === 'gml' &&
-        other.uri.scheme === 'file' &&
-        !other.isClosed &&
-        this.getProject(other) === project,
-    );
-    const versions = buffers.map((other) => other.version);
-    for (const other of buffers) {
-      // Every buffer is flushed once; macro updates refresh their users. The
-      // final document query scans foreign macros once instead of once per buffer.
-      if (!(await this.ensureBufferCurrent(other, token, true, false))) return;
-    }
-    if (
-      buffers.some(
-        (other, index) => other.isClosed || other.version !== versions[index],
+      !(await this.language(project).flush(token)) ||
+      versions.some(
+        ({ document, version }) =>
+          document.isClosed || document.version !== version,
       )
     )
       return;
-    if (document.version !== version || token?.isCancellationRequested) return;
+    return this.getGmlFile(document);
+  }
+
+  ensureProjectCurrent(
+    document: vscode.TextDocument,
+    token?: vscode.CancellationToken,
+  ) {
     return this.ensureDocumentCurrent(document, token);
+  }
+
+  async validateRenamePlan(
+    document: vscode.TextDocument,
+    plan: RenamePlan,
+    token?: vscode.CancellationToken,
+  ): Promise<boolean> {
+    const project = this.getProject(document);
+    return !!project && this.validateSourcePlan(project, plan, token);
+  }
+
+  private async validateSourcePlan(
+    project: GameMakerProject,
+    plan: { sources: { path: string; text: string }[] },
+    token?: vscode.CancellationToken,
+  ): Promise<boolean> {
+    const service = this.language(project),
+      revision = this.renameRevisions.get(plan);
+    if (
+      !revision ||
+      revision.language !== service.revision ||
+      revision.resources !== this.resourceRevision
+    )
+      return false;
+    const opened: { document: vscode.TextDocument; version: number }[] = [];
+    for (const source of plan.sources) {
+      if (token?.isCancellationRequested) return false;
+      const doc = this.openDocument(vscode.Uri.file(source.path));
+      if (doc) {
+        if (doc.getText() !== source.text) return false;
+        opened.push({ document: doc, version: doc.version });
+      } else if ((await readFile(source.path, 'utf8')) !== source.text)
+        return false;
+    }
+    return (
+      !this.disposed &&
+      !token?.isCancellationRequested &&
+      service.revision === revision.language &&
+      this.resourceRevision === revision.resources &&
+      opened.every(
+        ({ document, version }) =>
+          !document.isClosed && document.version === version,
+      )
+    );
+  }
+
+  async renameAsset(asset: Asset, to: string) {
+    const project = asset.project as GameMakerProject;
+    const plan = await this.queryProject(project, {
+      kind: 'assetRename',
+      assetName: asset.name,
+      newName: to,
+    });
+    assertLoudly(
+      plan && (await this.validateSourcePlan(project, plan)),
+      'Asset inputs changed while planning rename. Try again.',
+    );
+    const assertSaved = (files: readonly { path: string }[]) => {
+      const paths = new Set(
+        files.map((file) => vscode.Uri.file(file.path).toString()),
+      );
+      assertLoudly(
+        !vscode.workspace.textDocuments.some(
+          (document) =>
+            !document.isClosed &&
+            document.isDirty &&
+            (paths.has(document.uri.toString()) ||
+              asset.dir.isParentOf(pathyFromUri(document))),
+        ),
+        'Save modified files affected by this resource rename, then try again. Resource renames write to disk and do not enter editor Undo.',
+      );
+    };
+    assertSaved(plan.sources);
+    try {
+      await project.renameAsset(asset.name, to, {
+        plan,
+        validate: async (batch) => {
+          assertSaved(batch.texts);
+          const versions: { document: vscode.TextDocument; version: number }[] =
+            [];
+          for (const text of batch.texts) {
+            const opened = this.openDocument(vscode.Uri.file(text.path));
+            if (opened) {
+              if (opened.getText() !== text.before) return false;
+              versions.push({ document: opened, version: opened.version });
+            }
+          }
+          return (
+            (await this.validateSourcePlan(project, plan)) &&
+            versions.every(
+              ({ document, version }) =>
+                !document.isClosed &&
+                document.version === version &&
+                !document.isDirty,
+            )
+          );
+        },
+      });
+    } finally {
+      // Read actual disk state after either a committed command or its recovery.
+      this.markExternalChange();
+      this.language(project).update(
+        { kind: 'project', configuration: project.analysisConfiguration },
+        true,
+      );
+    }
+  }
+
+  async importAssets(
+    project: GameMakerProject,
+    source: Project,
+    options: import('@bscotch/gml-parser').ImportModuleOptions,
+  ) {
+    const plan = await this.queryProject(project, {
+      kind: 'importPlan',
+      sourceProject: source.yypPath.absolute,
+      sourceNativeSpecFiles: source.nativeSpecFiles,
+      importOptions: options,
+    });
+    assertLoudly(
+      plan && (await this.validateSourcePlan(project, plan)),
+      'Import inputs changed while planning. Save source files and try again.',
+    );
+    assertLoudly(
+      !this.openDocument(vscode.Uri.file(project.yypPath.absolute))?.isDirty,
+      'Save the modified target YYP before importing resources.',
+    );
+    for (const entry of plan.assets) {
+      if (entry.skip) continue;
+      const imported = source.getAssetByName(entry.name, {
+        assertExists: true,
+      });
+      const targetDirectory = project.dir.join(
+        imported.dir.relativeFrom(source.dir),
+      );
+      assertLoudly(
+        !vscode.workspace.textDocuments.some(
+          (document) =>
+            !document.isClosed &&
+            document.isDirty &&
+            targetDirectory.isParentOf(pathyFromUri(document)),
+        ),
+        'Save or close modified target resource documents before importing over them.',
+      );
+    }
+    const result = await project.import(
+      source,
+      options,
+      plan,
+      async (file) =>
+        this.openDocument(vscode.Uri.file(file))?.getText() ??
+        readFile(file, 'utf8'),
+    );
+    this.language(project).update(
+      { kind: 'project', configuration: project.analysisConfiguration },
+      true,
+    );
+    return result;
   }
 
   private openDocument(uri: vscode.Uri) {
@@ -379,58 +823,47 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     );
   }
 
-  /** Open buffers are authoritative, including when a watcher races a save or edit. */
   async onChangeFile(uri: vscode.Uri): Promise<void> {
     if (this.disposed) return;
+    const project = this.getProject(uri);
+    if (!project) return;
     const open = this.openDocument(uri);
-    if (open) {
-      await this.ensureDocumentCurrent(open);
-      return;
-    }
-    const code = this.getGmlFile(uri);
-    if (!code) return;
-    const read = {};
-    this.diskReads.set(code, read);
-    const text = await code.path.read();
-    if (this.disposed || this.diskReads.get(code) !== read) return;
-    const openedDuringRead = this.openDocument(uri);
-    if (openedDuringRead) {
-      await this.ensureDocumentCurrent(openedDuringRead);
-    } else if (this.getGmlFile(uri) === code) {
-      await this.analysis.flush(code, { text });
-    }
+    if (open) this.acceptBuffer(project, open, true);
+    else
+      this.language(project).update({ kind: 'disk', path: uri.fsPath }, true);
+    await this.language(project).flush();
   }
 
   async onCloseDoc(document: vscode.TextDocument): Promise<void> {
-    if (document.languageId !== 'gml' || document.uri.scheme !== 'file') return;
-    const code = this.getGmlFile(document);
-    if (code) this.analysis.forget(code);
-    // Closing an unsaved buffer must restore the on-disk model as well.
-    await this.onChangeFile(document.uri);
-  }
-
-  private scheduleDiagnostics(project: Project) {
-    clearTimeout(this.diagnosticTimers.get(project));
-    this.diagnosticTimers.set(
-      project,
-      setTimeout(() => {
-        this.diagnosticTimers.delete(project);
-        if (this.disposed) return;
-        try {
-          project.drainDirtyFileUpdateQueue();
-        } catch (error) {
-          logger.error(error);
-        }
-      }, stitchConfig.reprocessOnTypeDelay),
+    if (
+      document.languageId !== 'gml' ||
+      document.uri.scheme !== 'file' ||
+      this.disposed
+    )
+      return;
+    const project = this.getProject(document),
+      key = document.uri.toString();
+    const prior = this.bufferSnapshots.get(key);
+    if (prior && prior.document !== document) return;
+    if (prior?.document === document) this.bufferSnapshots.delete(key);
+    if (!project) return;
+    this.language(project).update(
+      {
+        kind: 'close',
+        path: document.uri.fsPath,
+        generation: prior?.overlay.generation || 0,
+      },
+      true,
     );
+    await this.language(project).flush();
   }
 
   dispose() {
+    if (this.disposed) return;
     this.disposed = true;
-    this.analysis.dispose();
-    for (const timer of this.diagnosticTimers.values()) clearTimeout(timer);
-    this.diagnosticTimers.clear();
+    this.clearProjects();
     this.externalChangeTracker.dispose();
+    this.semanticHighlightProvider.dispose();
   }
 
   getActiveDocument(): vscode.TextDocument | undefined {
@@ -467,57 +900,6 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     );
     if (!projectName) return;
     return this.projects.find((p) => p.name === projectName);
-  }
-
-  getFunctionArg(
-    document: vscode.TextDocument,
-    position: vscode.Position,
-  ): FunctionArgRange | undefined {
-    const offset = document.offsetAt(position);
-    return this.getGmlFile(document)?.getFunctionArgRangeAt(offset);
-  }
-
-  getReference(
-    where: vscode.TextDocument | vscode.Uri,
-    position: vscode.Position,
-  ): Reference | undefined {
-    const document =
-      where instanceof vscode.Uri
-        ? vscode.workspace.textDocuments.find(
-            (d) => d.uri.fsPath === where.fsPath,
-          )
-        : where;
-    if (!document) {
-      return;
-    }
-    const offset = document.offsetAt(position);
-    const file = this.getGmlFile(document);
-    if (!file) {
-      warn(`Could not find file for ${document}`);
-      return;
-    }
-    const ref = file.getReferenceAt(offset);
-    if (!ref) {
-      warn(`Could not find reference at ${offset}`);
-      return;
-    }
-    return ref;
-  }
-
-  getSignifier(
-    document: vscode.TextDocument,
-    position: vscode.Position,
-  ): ReferenceableType | undefined {
-    const ref = this.getReference(document, position);
-    if (!ref) {
-      return;
-    }
-    const item = ref.item;
-    if (!item) {
-      warn(`Could not find symbol for ${ref}`);
-      return;
-    }
-    return item;
   }
 
   getSprite(
@@ -584,30 +966,28 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     return file;
   }
 
-  getRefFromSelection(
+  async getSelection(
     document?: vscode.TextDocument,
-    selection?: readonly vscode.Selection[],
-  ) {
+    selections?: readonly vscode.Selection[],
+  ): Promise<Selection | undefined> {
     document ||= vscode.window.activeTextEditor?.document;
-    if (
-      !document ||
-      document.uri.scheme !== 'file' ||
-      !document.uri.fsPath.endsWith('.gml')
-    ) {
-      return;
-    }
-    const file = this.getGmlFile(document);
-    if (!file) return;
-
-    // Get the reference at the cursor
-    selection ||= vscode.window.activeTextEditor?.selections;
-    if (!selection) return;
-    const start = selection[0].start;
-    const ref = file.getReferenceAt(start.line + 1, start.character);
-    return ref;
+    selections ||= vscode.window.activeTextEditor?.selections;
+    if (!document || !selections?.length) return;
+    return this.query(document, {
+      kind: 'selection',
+      offset: document.offsetAt(selections[0].start),
+    });
   }
 
-  /** Record every text change; explicit completion triggers can bypass the delay. */
+  async getSelectedAsset(): Promise<Asset | undefined> {
+    const document = vscode.window.activeTextEditor?.document;
+    const selection = await this.getSelection(document);
+    return document && selection?.assetName
+      ? this.getAsset(document, selection.assetName)
+      : undefined;
+  }
+
+  /** Send only immutable text/version input. CPU analysis lives in the worker. */
   onChangeDoc(
     event: vscode.TextDocumentChangeEvent | vscode.TextDocument | undefined,
   ): void {
@@ -616,13 +996,12 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     if (
       document.languageId !== 'gml' ||
       document.uri.scheme !== 'file' ||
-      document.isClosed
+      document.isClosed ||
+      ('contentChanges' in event && !event.contentChanges.length)
     )
       return;
-    if ('contentChanges' in event && !event.contentChanges.length) return;
-    const code = this.getGmlFile(document);
-    if (!code) return;
-    this.diskReads.delete(code);
+    const project = this.getProject(document);
+    if (!project) return;
     const triggers: readonly string[] = [
       ...completionTriggerCharacters,
       ' ',
@@ -635,11 +1014,7 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
       !('contentChanges' in event) ||
       (event.contentChanges.length === 1 &&
         triggers.includes(event.contentChanges[0].text));
-    this.analysis.enqueue(
-      code,
-      { version: document.version, text: document.getText() },
-      immediate,
-    );
+    this.acceptBuffer(project, document, immediate);
   }
 
   async createNewProject() {
@@ -726,7 +1101,9 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
       }
 
       // Load as a project
-      const newProject = await Project.initialize(yypPath.absolute);
+      const newProject = await Project.initialize(yypPath.absolute, {
+        analysis: 'resources',
+      });
       // Add the default object
       const obj = await newProject.createObject(`${resourceFolder}/${objName}`);
       // Add the default room

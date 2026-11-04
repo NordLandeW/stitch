@@ -12,7 +12,11 @@ await $`dotnet build ./src/debug/expression-compiler/GameMakerExpressionHook.csp
 await $`cp ./src/debug/expression-compiler/bin/Release/net8.0/GameMakerExpressionHook.dll ./dist/`;
 
 const builder = await esbuild.build({
-  entryPoints: ['./src/extension.ts', './src/manifest.update.mts'],
+  entryPoints: [
+    './src/extension.ts',
+    './src/manifest.update.mts',
+    './src/language-worker.mts',
+  ],
   bundle: true,
   outdir: './dist/',
   target: 'esnext',

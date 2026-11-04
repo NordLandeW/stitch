@@ -6,15 +6,30 @@ import type { Signifier } from './signifiers.js';
 import { findYyFile, groupPathToPosix, neither, xor } from './util.js';
 export type * from './modules.types.js';
 
+export interface ModuleImportPlan {
+  source: string;
+  target: string;
+  options: ImportModuleOptions;
+  sourceState: string;
+  targetState: string;
+  sources: { path: string; text: string }[];
+  assets: { name: string; skip: boolean }[];
+  missing: Dependency[];
+  conflicts: Dependency[];
+}
+
 /**
  * @param sourceFolder Full folder path to import from (e.g. `Scripts/MainMenu`)
  */
-export async function importAssets(
+export function planAssetImport(
   sourceProject: Project,
   targetProject: Project,
   options: ImportModuleOptions = {},
-) {
-  const logFile = targetProject.dir.join('stitch-import.log.yaml');
+): ModuleImportPlan {
+  assertStitchImportClaim(
+    sourceProject.analysisEnabled && targetProject.analysisEnabled,
+    'Import dependency planning requires language analysis',
+  );
   assertStitchImportClaim(
     neither(options.sourceFolder, options.sourceAsset) ||
       xor(options.sourceAsset, options.sourceFolder),
@@ -95,10 +110,76 @@ export async function importAssets(
     );
   }
 
-  // Conflicting deps should not be allowed at all.
-  if (conflictingDeps.size > 0) {
+  return {
+    source: sourceProject.yypPath.absolute,
+    target: targetProject.yypPath.absolute,
+    options: structuredClone(options),
+    sourceState: sourceProject.resourceState(),
+    targetState: targetProject.resourceState(),
+    sources: [sourceProject, targetProject].flatMap((project) =>
+      [...project.assets.values()].flatMap((asset) =>
+        asset.gmlFilesArray.map((code) => ({
+          path: code.path.absolute,
+          text: code.content,
+        })),
+      ),
+    ),
+    assets: [...derivedImports.values()].map((asset) => ({
+      name: asset.name,
+      skip:
+        options.onMissingDependency !== 'include' &&
+        !intendedImports.has(asset.name),
+    })),
+    missing: [...missingDeps],
+    conflicts: [...conflictingDeps],
+  };
+}
+
+export async function importAssets(
+  sourceProject: Project,
+  targetProject: Project,
+  options: ImportModuleOptions = {},
+  approvedPlan?: ModuleImportPlan,
+  readSource: (path: string) => Promise<string> = (path) =>
+    import('node:fs/promises').then((fs) => fs.readFile(path, 'utf8')),
+) {
+  const plan =
+    approvedPlan || planAssetImport(sourceProject, targetProject, options);
+  const logFile = targetProject.dir.join('stitch-import.log.yaml');
+  assertStitchImportClaim(
+    plan.source === sourceProject.yypPath.absolute &&
+      plan.target === targetProject.yypPath.absolute &&
+      JSON.stringify(plan.options) === JSON.stringify(options),
+    'Import plan does not match the operation',
+  );
+  assertStitchImportClaim(
+    plan.source !== plan.target &&
+      !sourceProject.dir.isParentOf(targetProject.dir) &&
+      !targetProject.dir.isParentOf(sourceProject.dir),
+    'Import projects must have separate directories',
+  );
+  assertStitchImportClaim(
+    (await sourceProject.validateResourceState(plan.sourceState)) &&
+      (await targetProject.validateResourceState(plan.targetState)),
+    'Import resource metadata changed since planning',
+  );
+  for (const source of plan.sources)
+    assertStitchImportClaim(
+      (await readSource(source.path)) === source.text,
+      'Import source changed since planning',
+    );
+  for (const entry of plan.assets) {
+    const asset = sourceProject.getAssetByName(entry.name, {
+      assertExists: true,
+    });
+    assertStitchImportClaim(
+      sourceProject.dir.isParentOf(asset.dir),
+      'Import source asset is outside its project',
+    );
+  }
+  if (plan.conflicts.length > 0) {
     await logFile.write({
-      conflicts: conflictingDeps,
+      conflicts: plan.conflicts,
     });
     throw new StitchImportError(
       `Cannot import because of conflicting dependencies. See the logs for details: "${logFile}"`,
@@ -108,11 +189,11 @@ export async function importAssets(
   // By default, missing deps should cause an error
   const { onMissingDependency } = options;
   if (
-    missingDeps.size &&
+    plan.missing.length &&
     (!onMissingDependency || onMissingDependency === 'error')
   ) {
     await logFile.write({
-      missing: missingDeps,
+      missing: plan.missing,
     });
     throw new StitchImportError(
       `Cannot import because of conflicting dependencies. See the logs for details: "${logFile}"`,
@@ -131,9 +212,8 @@ export async function importAssets(
   };
 
   const newAssets: Asset[] = [];
-  for (const [name, asset] of derivedImports) {
-    const skip =
-      onMissingDependency !== 'include' && !intendedImports.has(asset.name);
+  for (const { name, skip } of plan.assets) {
+    const asset = sourceProject.getAssetByName(name, { assertExists: true });
     if (skip) {
       summary.skipped.push(asset.name);
       continue;

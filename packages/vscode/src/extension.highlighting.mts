@@ -1,8 +1,7 @@
-import { Reference, ReferenceableType } from '@bscotch/gml-parser';
 import { literal } from '@bscotch/utility';
 import vscode from 'vscode';
 import type { StitchWorkspace } from './extension.workspace.mjs';
-import { locationOf } from './lib.mjs';
+import { displayRange } from './language/presentation.mjs';
 import { warn } from './log.mjs';
 
 export type SemanticTokenType = (typeof semanticTokenTypes)[number];
@@ -48,111 +47,25 @@ export class GameMakerSemanticTokenProvider
     this._onDidChangeSemanticTokens.fire();
   }
 
+  dispose() {
+    this._onDidChangeSemanticTokens.dispose();
+  }
+
   async provideDocumentSemanticTokens(
     document: vscode.TextDocument,
     token: vscode.CancellationToken,
   ): Promise<vscode.SemanticTokens | undefined> {
     try {
-      const file = await this.provider.ensureDocumentCurrent(
+      const tokens = await this.provider.query(
         document,
+        { kind: 'tokens' },
         token,
-        false,
       );
-      if (!file) {
-        return;
-      }
-
-      const tokensBuilder = new vscode.SemanticTokensBuilder(
-        semanticTokensLegend,
-      );
-      const cache = new Map<
-        ReferenceableType,
-        { type: SemanticTokenType; mods: Set<SemanticTokenModifier> }
-      >();
-      const spellings = new Map<
-        string,
-        { ref: Reference; ambiguous: boolean }
-      >();
-      for (const ref of file.sourceRefs) {
-        const source = ref.source;
-        const key = `${source.start.offset}:${source.end.offset}`;
-        const previous = spellings.get(key);
-        if (!previous) spellings.set(key, { ref, ambiguous: false });
-        else if (inferSemanticToken(previous.ref) !== inferSemanticToken(ref))
-          previous.ambiguous = true;
-      }
-      let previousEnd = -1;
-      for (const { ref, ambiguous } of spellings.values()) {
-        const source = ref.source;
-        if (
-          source.file !== file ||
-          !Number.isFinite(source.start.line) ||
-          !Number.isFinite(source.end.line) ||
-          source.start.line !== source.end.line ||
-          source.start.offset <= previousEnd
-        ) {
-          continue;
-        }
-        // Get the location as a vscode range
-        const signifier = ref.item;
-
-        // Exclude some types that don't make sense to override
-        if (
-          signifier.name &&
-          ['self', 'other', 'noone', 'all', 'global'].includes(signifier.name)
-        ) {
-          continue;
-        }
-        const range = locationOf(ref)!.range;
-        previousEnd = source.end.offset;
-        if (ambiguous) {
-          tokensBuilder.push(range, 'variable', []);
-          continue;
-        }
-        // If we've already seen this symbol, use the cached semantic details
-        if (cache.has(signifier)) {
-          const { type, mods } = cache.get(signifier)!;
-          try {
-            tokensBuilder.push(range, type, [...mods]);
-          } catch (error) {
-            warn(error);
-            warn('CACHE ERROR');
-            console.dir({ range, type, mods });
-          }
-          continue;
-        }
-
-        // Figure out what the semantic details are
-        let tokenType = inferSemanticToken(ref);
-        if (tokenType === 'variable' && signifier.instance) {
-          tokenType = 'property';
-        }
-        const tokenModifiers = inferSemanticModifiers(ref);
-        const isAsset = signifier.type.type.find((t) =>
-          t.kind.startsWith('Asset.'),
-        );
-        if (isAsset) {
-          tokenModifiers.add('asset');
-        }
-        if (!tokenType) {
-          warn('No token type for symbol', signifier);
-          continue;
-        }
-        try {
-          tokensBuilder.push(range, tokenType, [...tokenModifiers]);
-          cache.set(signifier, { type: tokenType, mods: tokenModifiers });
-        } catch (err) {
-          warn(err);
-          warn('PUSH ERROR');
-          console.dir({
-            range,
-            tokenType,
-            tokenModifiers,
-          });
-        }
-      }
-      const tokens = tokensBuilder.build();
-      return tokens;
+      if (!tokens) return;
+      const builder = new vscode.SemanticTokensBuilder(semanticTokensLegend);
+      for (const entry of tokens)
+        builder.push(displayRange(entry.range), entry.type, entry.modifiers);
+      return builder.build();
     } catch (error) {
       warn(error);
       warn('OUTER ERROR');
@@ -167,76 +80,4 @@ export class GameMakerSemanticTokenProvider
       semanticTokensLegend,
     );
   }
-}
-
-function inferSemanticToken(ref: Reference): SemanticTokenType {
-  const signifier = ref.item;
-  const functionType = signifier.getTypeByKind('Function');
-
-  if (signifier.enum) {
-    return 'enum';
-  }
-  if (signifier.enumMember) {
-    return 'enumMember';
-  }
-  if (functionType?.isConstructor) {
-    return 'class';
-  }
-  if (functionType) {
-    return 'function';
-  }
-  if (signifier.macro) {
-    return 'macro';
-  }
-  if (signifier.parameter) {
-    return 'parameter';
-  }
-  if (signifier.instance && !!signifier.def) {
-    return 'property';
-  }
-  return 'variable';
-}
-
-/** Clobbers conflicting, allowing e.g. overriding type modifiers with symbol modifiers. */
-function inferSemanticModifiers(
-  ref: Reference,
-  modifiers = new Set<SemanticTokenModifier>(),
-): Set<SemanticTokenModifier> {
-  const signifier = ref.item;
-  // const isDeclaration = signifier.def?.file && ref.isDef;
-
-  // // If only the only reference is also the declaration,
-  // // then this is an unused variable.
-  // const unused = isDeclaration && signifier.refs.size === 1;
-  // if (unused) {
-  //   modifiers.add('deprecated');
-  // }
-
-  if (signifier.native) {
-    modifiers.add('defaultLibrary');
-  } else {
-    // modifiers.delete('defaultLibrary');
-  }
-
-  if (signifier.global) {
-    modifiers.add('global');
-    modifiers.delete('local');
-  }
-  if (signifier.local) {
-    modifiers.add('local');
-    modifiers.delete('global');
-  }
-
-  if (!signifier.writable) {
-    modifiers.add('readonly');
-  } else {
-    modifiers.delete('readonly');
-  }
-
-  if (signifier.static) {
-    modifiers.add('static');
-  } else {
-    modifiers.delete('static');
-  }
-  return modifiers;
 }

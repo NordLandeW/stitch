@@ -28,6 +28,12 @@ setLogger(logger.withPrefix('PARSER'));
 export class GameMakerProject extends Project {
   readonly kind = 'project';
   public runnerTerminal?: vscode.Terminal;
+  onAnalysisConfiguration?: (configuration?: string) => void;
+
+  override setAnalysisConfiguration(configuration?: string) {
+    super.setAnalysisConfiguration(configuration);
+    this.onAnalysisConfiguration?.(configuration);
+  }
 
   protected constructor(yypPath: vscode.Uri, options: ProjectOptions) {
     super(pathy(yypPath.fsPath), options);
@@ -268,6 +274,7 @@ export class GameMakerProject extends Project {
     configuration?: string,
   ) {
     const options: ProjectOptions = {
+      analysis: 'resources',
       configuration,
       onDiagnostics,
       onLoadProgress: onProgress,

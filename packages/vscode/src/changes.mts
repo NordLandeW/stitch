@@ -13,7 +13,11 @@ interface ChangeEvent {
 export class ChangeTracker {
   protected queue: ChangeEvent[] = [];
   protected timeout: NodeJS.Timeout | undefined;
-  private flushing = false;
+  private flushing?: Promise<void>;
+  private failure?: unknown;
+  get hasPending() {
+    return !!this.flushing || !!this.queue.length || !!this.failure;
+  }
   private disposed = false;
   protected cache = {
     /**
@@ -24,19 +28,24 @@ export class ChangeTracker {
     igorCacheIsClean: false,
   };
 
+  private readonly subscriptions: { off(): unknown }[] = [];
   constructor(readonly provider: StitchWorkspace) {
-    stitchEvents.on(
-      'clean-project-start',
-      () => (this.cache.igorCacheIsClean = true),
-    );
-    stitchEvents.on(
-      'run-project-start',
-      () => (this.cache.igorCacheIsClean = false),
+    this.subscriptions.push(
+      stitchEvents.on(
+        'clean-project-start',
+        () => (this.cache.igorCacheIsClean = true),
+      ),
+      stitchEvents.on(
+        'run-project-start',
+        () => (this.cache.igorCacheIsClean = false),
+      ),
     );
   }
 
   addChange(event: ChangeEvent) {
     if (this.disposed) return;
+    this.provider.markExternalChange();
+    this.failure = undefined;
     const duplicate =
       event.type === 'change' &&
       event.uri.path.endsWith('.gml') &&
@@ -57,23 +66,37 @@ export class ChangeTracker {
     this.disposed = true;
     clearTimeout(this.timeout);
     this.queue = [];
+    for (const subscription of this.subscriptions.splice(0)) subscription.off();
   }
 
-  protected async flush() {
-    if (this.flushing || this.disposed) return;
-    this.flushing = true;
-    try {
-      await this.flushQueue();
-    } finally {
-      this.flushing = false;
-      if (this.queue.length && !this.disposed) {
-        clearTimeout(this.timeout);
-        this.timeout = setTimeout(
-          () => void this.flush().catch((error) => logger.error(error)),
-          stitchConfig.externalChangeDelay,
-        );
-      }
-    }
+  async flushPending() {
+    if (this.failure) throw this.failure;
+    return this.flush();
+  }
+
+  retryPending() {
+    this.failure = undefined;
+    return this.flush();
+  }
+
+  protected flush(): Promise<void> {
+    if (this.flushing) return this.flushing;
+    if (this.disposed) return Promise.resolve();
+    clearTimeout(this.timeout);
+    this.flushing = Promise.resolve()
+      .then(async () => {
+        while (this.queue.length && !this.disposed) await this.flushQueue();
+      })
+      .catch((error) => {
+        this.failure = error;
+        throw error;
+      })
+      .finally(() => {
+        this.flushing = undefined;
+        if (!this.disposed && !this.failure)
+          this.provider.publishPendingDiagnostics();
+      });
+    return this.flushing;
   }
 
   private async flushQueue() {
@@ -82,7 +105,7 @@ export class ChangeTracker {
 
     // Sort by yyp, then yy, then gml files.
     queue.sort((a, b) => {
-      for (const ext of ['.atlas', '.png', '.gml', '.yy', '.yyp']) {
+      for (const ext of ['.yyp', '.yy', '.gml', '.atlas', '.png']) {
         const aExt = a.uri.path.endsWith(ext);
         const bExt = b.uri.path.endsWith(ext);
         if (aExt && !bExt) {
@@ -98,7 +121,7 @@ export class ChangeTracker {
       return 0;
     });
 
-    for (const event of queue) {
+    for (const [index, event] of queue.entries()) {
       if (this.disposed) return;
       try {
         const { type, uri } = event;
@@ -110,12 +133,24 @@ export class ChangeTracker {
           continue;
         }
 
+        await project.whenSourcesCurrent();
+        if (this.disposed) return;
+
         // If this is an included file, we need to force-sync the project's files
         if (project.dir.join('datafiles').isParentOf(pathy(uri.fsPath))) {
           try {
             await project.syncIncludedFiles();
             stitchEvents.emit('datafiles-changed', project);
           } catch {}
+          continue;
+        }
+
+        if (
+          uri.fsPath.toLowerCase() ===
+            project.stitchConfig.absolute.toLowerCase() ||
+          project.dir.join('options').isParentOf(pathy(uri.fsPath))
+        ) {
+          await this.provider.reloadNativeInputs(project);
           continue;
         }
 
@@ -126,15 +161,15 @@ export class ChangeTracker {
         // or added an asset, so we need to respond to that.
         if (type === 'change' && uri.path.endsWith('.yyp')) {
           logger.info(`yyp file changed on disk. Reloading!`);
-          await project.reloadYyp();
+          await this.provider.reloadProject(project);
           stitchEvents.emit('project-changed', project);
           continue;
         }
 
-        // Creation/deletion of GML files must be accompanied
-        // by a change to yy/yyp files, so we can ignore them.
-        // They'll be incidentally handled by handling the yy/yyp changes.
+        // Refresh the resource file inventory even when watcher events for its
+        // YY/YYP arrive separately or a legacy unlisted event was removed.
         if (['create', 'delete'].includes(type) && uri.path.endsWith('.gml')) {
+          if (asset) await this.provider.reloadAsset(asset);
           continue;
         }
         // Changes to existing GML files can be handled immediately.
@@ -177,7 +212,9 @@ export class ChangeTracker {
           stitchEvents.emit('asset-changed', asset, type, uri);
         }
       } catch (error) {
+        this.queue.unshift(...queue.slice(index));
         logger.error(error);
+        throw error;
       }
     }
   }

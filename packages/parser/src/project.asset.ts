@@ -50,16 +50,17 @@ export class Asset<T extends YyResourceType = YyResourceType> {
   readonly gmlFiles: Map<string, Code> = new Map();
   yy!: YyData<T>;
   readonly yyPath: Pathy<YySchemas[T]>;
-  readonly signifier: Signifier;
+  readonly signifier!: Signifier;
   /** For objects, their instance type. */
   instanceType: Type<'Id.Instance'> | undefined;
-  assetType: Type<Asset['assetTypeKind']>;
+  assetType!: Type<Asset['assetTypeKind']>;
   variables: StructType | undefined;
   nativeVariables: StructType | undefined;
   private readonly objectVariables = new ObjectVariables(this);
 
   /** Refresh metadata declarations without reparsing or writing the resource. */
   refreshObjectVariables(reconcileInheritance = false) {
+    if (!this.project.analysisEnabled) return;
     this.objectVariables.refresh(reconcileInheritance);
   }
 
@@ -79,6 +80,7 @@ export class Asset<T extends YyResourceType = YyResourceType> {
     assert(yyPath, 'Must provide a YY path');
     this.assetKind = resource.id.path.split(/[/\\]/)[0] as T;
     this.yyPath = yyPath.withValidator(yySchemas[this.assetKind]) as any;
+    if (!project.analysisEnabled) return;
 
     // Create the symbol
     this.signifier = new Signifier(this.project.self, this.name);
@@ -133,7 +135,7 @@ export class Asset<T extends YyResourceType = YyResourceType> {
   }
 
   get typeName() {
-    return `${this.assetType.kind}.${this.name}`;
+    return `${this.assetTypeKind}.${this.name}`;
   }
 
   get instanceTypeName() {
@@ -143,12 +145,15 @@ export class Asset<T extends YyResourceType = YyResourceType> {
   @sequential
   async saveYy() {
     assert(this.yyPath, 'Cannot save YY without a path');
-    await Yy.write(
-      this.yyPath.absolute,
-      this.yy,
-      this.assetKind,
-      this.project.yyp,
-    );
+    await this.project.withSourceUpdate(async () => {
+      await Yy.write(
+        this.yyPath.absolute,
+        this.yy,
+        this.assetKind,
+        this.project.yyp,
+      );
+      this.project.resourceChanged(this.yyPath.absolute);
+    });
   }
 
   get isScript() {
@@ -220,21 +225,25 @@ export class Asset<T extends YyResourceType = YyResourceType> {
   }
 
   get parent() {
+    if (!this.project.analysisEnabled && this.isObject)
+      return this.project.getAssetByName(
+        (this.yy as YyObject).parentObjectId?.name,
+      ) as Asset<'objects'> | undefined;
     return this._parent;
   }
   set parent(parent: Asset<'objects'> | undefined) {
-    const oldParent = this._parent;
+    const oldParent = this.parent;
     if (oldParent === parent) {
       // No change!
       return;
     }
     this._parent = parent;
-    if (parent) {
+    if (this.project.analysisEnabled && parent) {
       // The instanceType parent is a struct that holds all of this
       // object's instance variables. We need to set ITS parent to
       // the parent's instanceType.
       this.variables!.extends = parent.variables;
-    } else {
+    } else if (this.project.analysisEnabled) {
       this.variables!.extends = this.nativeVariables;
     }
     // Do we need to change the yy file?
@@ -679,6 +688,7 @@ export class Asset<T extends YyResourceType = YyResourceType> {
   }
 
   updateGlobals(initial = false) {
+    if (!this.project.analysisEnabled) return;
     this.updateParent();
     // Ensure parent is updated first
     if (initial && !this.initalized.globals && this.parent) {
@@ -695,6 +705,7 @@ export class Asset<T extends YyResourceType = YyResourceType> {
   }
 
   updateAllSymbols(initial = false) {
+    if (!this.project.analysisEnabled) return;
     // Ensure parent is updated first
     if (initial && !this.initalized.locals && this.parent) {
       this.parent.updateAllSymbols(initial);
@@ -709,6 +720,7 @@ export class Asset<T extends YyResourceType = YyResourceType> {
   }
 
   updateDiagnostics() {
+    if (!this.project.analysisEnabled) return;
     for (const gml of this.gmlFilesArray) {
       gml.updateDiagnostics();
     }
@@ -742,7 +754,10 @@ export class Asset<T extends YyResourceType = YyResourceType> {
       this.addScriptFile(children as Pathy<string>[]);
     } else if (this.assetKind === 'objects') {
       this.addObjectFile(children as Pathy<string>[]);
-    } else if (this.assetKind === 'extensions') {
+    } else if (
+      this.assetKind === 'extensions' &&
+      this.project.analysisEnabled
+    ) {
       const diagnostics: Diagnostic[] = [];
 
       // Load constants and functions from the extension
@@ -847,6 +862,11 @@ export class Asset<T extends YyResourceType = YyResourceType> {
 
   /** External resource retirement must not delete author-owned files. */
   retire() {
+    if (!this.project.analysisEnabled) {
+      for (const code of this.gmlFiles.values()) code.retire();
+      this.gmlFiles.clear();
+      return;
+    }
     // Metadata-only resources have no Code whose retirement can withdraw the
     // readers' inferred facts. Capture owned bindings before any refs are reset.
     const readers = new Set<Code>();
@@ -876,6 +896,10 @@ export class Asset<T extends YyResourceType = YyResourceType> {
 
   async onRemove() {
     await Promise.all(this.gmlFilesArray.map((gml) => gml.remove()));
+    if (!this.project.analysisEnabled) {
+      await this.dir.delete({ force: true, recursive: true });
+      return;
+    }
     // Remove this signifier and any global types from the project
     this.project.self.removeMember(this.signifier.name);
     for (const typeName of [this.typeName, this.instanceTypeName]) {
@@ -957,6 +981,7 @@ export class Asset<T extends YyResourceType = YyResourceType> {
   protected async initiallyReadAndParseGml(
     buffer?: (code: Code) => string | undefined,
   ) {
+    if (!this.project.analysisEnabled) return;
     const contents = await Promise.all(
       this.gmlFilesArray.map(async (code) => {
         const previous = code.content;

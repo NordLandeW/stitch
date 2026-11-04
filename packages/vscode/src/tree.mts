@@ -20,7 +20,6 @@ import type { StitchWorkspace } from './extension.workspace.mjs';
 import { getAssetIcon, getBaseIcon } from './icons.mjs';
 import type { ObjectParentFolder, ObjectSpriteFolder } from './inspector.mjs';
 import {
-  getAssetFromRef,
   pathyFromUri,
   registerCommand,
   showProgress,
@@ -167,6 +166,7 @@ export class GameMakerTreeProvider
       },
       async (progress) => {
         return await Project.initialize(sourceProjectPath.fsPath, {
+          analysis: 'resources',
           onLoadProgress: (percent, message) => {
             progress.report({
               increment: percent,
@@ -217,8 +217,12 @@ export class GameMakerTreeProvider
     };
 
     // Set the options for the merge
-    const results = await showProgress(async function () {
-      return await targetProject.import(sourceProjectPath.fsPath, options);
+    const results = await showProgress(async () => {
+      return await this.workspace.importAssets(
+        targetProject,
+        sourceProject,
+        options,
+      );
     }, 'Importing...');
     assertLoudly(
       !results.errors.length,
@@ -341,8 +345,8 @@ export class GameMakerTreeProvider
     }
   }
 
-  editSound(entity: TreeAsset | Asset | undefined) {
-    entity ||= getAssetFromRef(this.workspace.getRefFromSelection());
+  async editSound(entity: TreeAsset | Asset | undefined) {
+    entity ||= await this.workspace.getSelectedAsset();
     if (!entity) {
       console.log('No entity to edit sprite for');
       return;
@@ -357,8 +361,8 @@ export class GameMakerTreeProvider
     );
   }
 
-  editSprite(entity: TreeAsset | Asset | undefined) {
-    entity ||= getAssetFromRef(this.workspace.getRefFromSelection());
+  async editSprite(entity: TreeAsset | Asset | undefined) {
+    entity ||= await this.workspace.getSelectedAsset();
     console.log('editing sprite', entity);
     if (!entity) {
       console.log('No entity to edit sprite for');
@@ -741,7 +745,7 @@ export class GameMakerTreeProvider
       },
     });
     if (!newName) return;
-    await where.asset.project.renameAsset(where.asset.name, newName);
+    await this.workspace.renameAsset(where.asset, newName);
     this.rebuild();
     const newAsset = where.asset.project.getAssetByName(newName);
     const newTreeItem = TreeAsset.lookup.get(newAsset!)!;

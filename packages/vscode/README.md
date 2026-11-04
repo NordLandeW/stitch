@@ -29,6 +29,14 @@ There are a lot of ways you can support this project:
 
 Stitch provides Intellisense (auto-complete, hovertext, function signature helpers, go-to-definition, find-references, etc) for all built-in and user-defined symbols.
 
+#### Background analysis and live updates
+
+Each loaded project has a persistent language worker. Parsing, macro expansion and type/dependency updates run there; the extension host presents immutable query results and manages resource files. Pending edits are coalesced using `stitch.editing.reprocessOnTypeDelay`. An in-progress transaction finishes before newer inputs run, and obsolete results are discarded. Cancelling a language request releases its waiter while shared analysis continues.
+
+Precise member completion, hover, signatures, navigation and rename wait for current project inputs. During a source update, completion for a bare identifier at the start of a line can immediately offer an incomplete list labelled **Analysis updating · built-in candidate**. These suggestions contain built-in names rather than receiver-specific members. Configuration, resource and native-spec changes invalidate this fallback. Semantic highlighting and document outlines join the normal edit debounce.
+
+Open buffers take precedence over disk contents. Closing a buffer restores the saved file; YY/YYP, selected run configuration, native-spec and analysis-setting changes are synchronized with the worker. If a worker fails, precise language features stop and the error notification offers **Retry analysis**, which rebuilds a fresh session from current files and open buffers. Resource browsing remains available. Moving analysis off the extension host improves responsiveness during CPU work; it does not eliminate that work or guarantee a shorter total analysis time.
+
 #### Diagnostics and incomplete edits
 
 Lexical errors, syntax errors and malformed JSDoc type annotations appear at their original source positions. After an unexpected file-level token, analysis resumes at the next token so later declarations remain available. Incomplete calls and recovered declarations retain usable cursor ranges, including at the end of an empty or unfinished buffer.
@@ -78,6 +86,8 @@ Recursive expansions and incomplete definitions produce diagnostics. Expansion h
 ### 📛 Renaming
 
 Since Stitch knows about all of your project's symbols, it can also rename them for you! Use the hotkey (`F2` by default) or the right-click context menu to "Rename" a symbol. You can also rename assets via the tree view (while maintaining parent/child relationships). Stitch will auto-rename all references to the symbol, including in JSDoc comments.
+
+Rename plans are checked against current source and resource metadata before applying changes. Symbol rename uses normal editor text edits and supports Undo. Asset-tree rename is a disk command and does not enter editor Undo: first save modified files that the command would write or move, including files inside the renamed resource directory. Unrelated unsaved documents can remain open. Stitch never saves these buffers automatically. If inputs change during planning, retry the command against the newer state. A disk failure triggers best-effort recovery; if recovery is incomplete, the error reports the retained recovery-data directory. Multi-file disk changes are not atomic.
 
 > ⚠️ Note that it's possible to write GML code where references to the same symbol are not discoverable by static analysis tools like Stitch, so you may need to do some manual cleanup after renaming.
 
@@ -228,6 +238,8 @@ You can create new Shaders from the context menu of folder items. This will gene
 Stitch provides the "Stitch: Import Assets" command via the palette, which lets you import an asset or a folder of assets from another GameMaker project.
 
 Since Stitch knows about all of your assets and code, it can identify possible conflicts during an import and let you choose how to resolve them.
+
+Dependency and conflict checks run in the language worker before resource files are copied. Save modified source documents and save or close modified target resource documents before importing over them. Changes after planning invalidate the operation and require a new plan.
 
 ### 🔍 Navigating your project
 
@@ -419,7 +431,6 @@ To see the current list of known issues and feature requests, check out the [iss
 
 - 😕 **Code only**. Stitch leverages VSCode's power for editing _code_, and makes no attempt to provide visual editors for any type of GameMaker asset.
 - 😕 **Variable Definitions** via the UI are not supported. Since instance variables can be defined in code (via Creation events) we don't also support defining them via the "Variable Definitions" feature of Objects. If for some reason you need that feature, please provide context on the [associated issue](https://github.com/bscotch/stitch/issues/205)!
-- 😕 **IIFFEs**. Stitch does not support IIFEs (immediately-invoked function expressions), e.g. `(function(){})()`. This is due to parser complexity, but pull requests addressing this are welcome!
 - 📝 **Stitch settings**. Stitch provides a number of settings that you can use to customize your experience. You can find them by opening the command palette and searching for "Preferences: Open Settings".
 - 🪵 **How to view logs**. If you run into trouble, you can view the extension's logs by opening the Output panel and selecting "Stitch" from the dropdown menu. These are particularly helpful for providing context when leaving bug reports!
 - ⁉️ **Unexpected projects appear in the tree view**. If you're seeing extra projects in your tree view, it's likely that these are being discovered inside `node_modules` or other normally-hidden locations. Stitch excludes the same files that your VSCode setup does via the `files.exclude` setting, so if you want to prevent those projects from appearing add their parent folders to your excluded files.

@@ -1,7 +1,6 @@
 import { Asset, Code } from '@bscotch/gml-parser';
 import { literal } from '@bscotch/utility';
 import vscode from 'vscode';
-import { swallowThrown } from './assert.mjs';
 import { stitchConfig } from './config.mjs';
 import { stitchEvents } from './events.mjs';
 import { StitchCompletionProvider } from './extension.completions.mjs';
@@ -29,7 +28,6 @@ import { GameMakerInspectorProvider } from './inspector.mjs';
 import {
   createSorter,
   findProject,
-  getAssetFromRef,
   pathyFromUri,
   registerCommand,
 } from './lib.mjs';
@@ -112,6 +110,7 @@ export async function activateStitchExtension(
       const base = vscode.Uri.file(projectFolder.absolute);
       toWatch.push(
         new vscode.RelativePattern(base, '*.yyp'),
+        new vscode.RelativePattern(base, 'stitch.config.json'),
         new vscode.RelativePattern(base, '*/*/*.yy'),
         new vscode.RelativePattern(base, '*/*/*.gml'),
         new vscode.RelativePattern(base, '*/*/*.atlas'),
@@ -166,6 +165,7 @@ export async function activateStitchExtension(
 
   registerGameMakerDebugger(workspace, ctx);
 
+  let selectionRequest = 0;
   ctx.subscriptions.push(
     // vscode.window.onDidChangeActiveTextEditor((editor) => {
     //   if (!editor) {
@@ -175,9 +175,15 @@ export async function activateStitchExtension(
     // }),
     workspace,
     vscode.workspace.onDidChangeConfiguration((event) => {
-      if (!event.affectsConfiguration('stitch.run.defaultConfig')) return;
       try {
-        workspace.refreshAnalysisConfigurations();
+        if (event.affectsConfiguration('stitch.run.defaultConfig'))
+          workspace.refreshAnalysisConfigurations();
+        if (
+          event.affectsConfiguration(
+            'stitch.diagnostics.autoDeclaredGlobalsPatterns',
+          )
+        )
+          workspace.refreshAnalysisSettings();
       } catch (error) {
         void showErrorMessage(error as Error);
       }
@@ -392,86 +398,61 @@ export async function activateStitchExtension(
     }),
     workspace.semanticHighlightProvider.register(),
     workspace.signatureHelpStatus,
-    vscode.window.onDidChangeTextEditorSelection((e) => {
-      // Update the 'when' clause for the 'stitch.selectionIs(Native|Sprite|Sound)' contexts
-      const ref = workspace.getRefFromSelection(
-        e.textEditor.document,
-        e.selections,
-      );
-      if (!ref) return;
-      const asset = getAssetFromRef(ref);
-
-      // Skip 'event_inherited' since we want to be able to
-      // go-to-def on it to trace the inheritance chain.
-      const isNative =
-        !!ref.item?.native && ref.item.name !== 'event_inherited';
-
-      void vscode.commands.executeCommand(
-        'setContext',
-        'stitch.selectionIsNative',
-        isNative,
-      );
-      void vscode.commands.executeCommand(
-        'setContext',
-        'stitch.selectionIsSprite',
-        asset?.isSprite && asset.name,
-      );
-      void vscode.commands.executeCommand(
-        'setContext',
-        'stitch.selectionIsSound',
-        asset?.isSound && asset.name,
-      );
-    }),
-    vscode.window.onDidChangeTextEditorSelection((e) => {
-      // Update the function signature
-
-      // This includes events from the output window, so skip those
-      if (e.textEditor.document.uri.scheme !== 'file') {
-        return;
-      }
+    vscode.window.onDidChangeTextEditorSelection((event) => {
+      const request = ++selectionRequest;
+      const { document } = event.textEditor;
       workspace.signatureHelpStatus.text = '';
       workspace.signatureHelpStatus.hide();
-      if (!stitchConfig.enableFunctionSignatureStatus) {
+      for (const context of ['Native', 'Sprite', 'Sound'])
+        void vscode.commands.executeCommand(
+          'setContext',
+          `stitch.selectionIs${context}`,
+          false,
+        );
+      if (
+        document.uri.scheme !== 'file' ||
+        document.languageId !== 'gml' ||
+        !event.selections.length
+      )
         return;
-      }
-      // If something is actually selected, versus
-      // just the cursor being in a position, then
-      // we don't want to do anything.
-      if (e.selections.length !== 1) {
-        return;
-      }
-      // Get the signature helper.
-      const signatureHelp = swallowThrown(
-        () =>
-          workspace.getSignatureHelp(
-            e.textEditor.document,
-            e.selections[0].start,
-          )!,
-      );
-      if (!signatureHelp) {
-        return;
-      }
-      // Update the status bar with the signature.
-      // We can't do any formatting, so we'll need
-      // to upper-case the current parameter.
-      const signature = signatureHelp.signatures[signatureHelp.activeSignature];
-      const name = signature.label.match(/^function\s+([^(]+)/i)?.[1];
-      if (!name) {
-        return;
-      }
-      const asString = `${name}(${signature.parameters
-        .map((p, i) => {
-          if (
-            typeof p.label === 'string' &&
-            i === signatureHelp.activeParameter
-          ) {
-            return p.label.toUpperCase();
-          }
-          return p.label;
-        })
-        .join(', ')})`;
-      workspace.signatureHelpStatus.text = asString;
-      workspace.signatureHelpStatus.show();
+      void (async () => {
+        const [selection, signatureHelp] = await Promise.all([
+          workspace.getSelection(document, event.selections),
+          stitchConfig.enableFunctionSignatureStatus &&
+          event.selections.length === 1
+            ? workspace.provideSignatureHelp(
+                document,
+                event.selections[0].start,
+              )
+            : undefined,
+        ]);
+        if (request !== selectionRequest || document.isClosed) return;
+        const asset =
+          selection?.assetName &&
+          workspace.getAsset(document, selection.assetName);
+        void vscode.commands.executeCommand(
+          'setContext',
+          'stitch.selectionIsNative',
+          !!selection?.native && selection.name !== 'event_inherited',
+        );
+        void vscode.commands.executeCommand(
+          'setContext',
+          'stitch.selectionIsSprite',
+          asset && asset.isSprite && asset.name,
+        );
+        void vscode.commands.executeCommand(
+          'setContext',
+          'stitch.selectionIsSound',
+          asset && asset.isSound && asset.name,
+        );
+        if (!signatureHelp) return;
+        const signature =
+          signatureHelp.signatures[signatureHelp.activeSignature];
+        const name = signature.label.match(/^function\s+([^(]+)/i)?.[1];
+        if (!name) return;
+        workspace.signatureHelpStatus.text = `${name}(${signature.parameters.map((parameter, index) => (typeof parameter.label === 'string' && index === signatureHelp.activeParameter ? parameter.label.toUpperCase() : parameter.label)).join(', ')})`;
+        workspace.signatureHelpStatus.show();
+      })().catch((error) => logger.error(error));
     }),
     workspace.diagnosticCollection,
   );

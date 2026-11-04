@@ -1,7 +1,7 @@
-import { isAssetOfKind, type Reference } from '@bscotch/gml-parser';
 import vscode from 'vscode';
 import type { StitchWorkspace } from './extension.workspace.mjs';
-import { locationOf, registerCommand } from './lib.mjs';
+import { registerCommand } from './lib.mjs';
+import { displayLocation } from './language/presentation.mjs';
 
 export class StitchDefinitionsProvider implements vscode.DefinitionProvider {
   constructor(readonly workspace: StitchWorkspace) {}
@@ -11,19 +11,12 @@ export class StitchDefinitionsProvider implements vscode.DefinitionProvider {
     position: vscode.Position,
     token: vscode.CancellationToken,
   ): Promise<vscode.Definition | undefined> {
-    const file = await this.workspace.ensureDocumentCurrent(document, token);
-    const offset = document.offsetAt(position);
-    const locations = new Map<string, vscode.Location>();
-    for (const ref of file?.getReferenceCandidatesAt(offset) || []) {
-      const location = this.definitionOf(ref);
-      if (!location) continue;
-      const range = location.range;
-      locations.set(
-        `${location.uri}:${range.start.line}:${range.start.character}:${range.end.line}:${range.end.character}`,
-        location,
-      );
-    }
-    const results = [...locations.values()];
+    const locations = await this.workspace.query(
+      document,
+      { kind: 'definition', offset: document.offsetAt(position) },
+      token,
+    );
+    const results = locations?.map(displayLocation) || [];
     return results.length === 1
       ? results[0]
       : results.length
@@ -31,99 +24,43 @@ export class StitchDefinitionsProvider implements vscode.DefinitionProvider {
         : undefined;
   }
 
-  private definitionOf(ref: Reference): vscode.Location | undefined {
-    const item = ref.item;
-
-    const assetName = item?.asset
-      ? item.name
-      : item?.getTypeByKind('Id.Instance')?.name ||
-        item?.getTypeByKind('Asset.GMObject')?.name;
-
-    if (item && item.native && item.name !== 'event_inherited') {
-      // const helpLink = file?.project.helpLinks[item.name];
-      // helpLink && vscode.env.openExternal(vscode.Uri.parse(helpLink));
-    } else if (ref && item?.name === 'event_inherited') {
-      // Then this should take us to the parent event.
-      let parent = ref.file.asset.parent;
-      const eventName = ref.file.name;
-      let emergencyBreak = 0;
-      while (parent) {
-        // Get the file for the same event.
-        for (const file of parent.gmlFilesArray) {
-          if (file.name === eventName) {
-            return locationOf(file.startRange);
-          }
-        }
-        emergencyBreak++;
-        if (emergencyBreak > 20) {
-          break;
-        }
-        parent = parent.parent;
-      }
-    } else if (item && !item.native && item.def?.file) {
-      return locationOf(item.def);
-    } else if (ref && item && assetName) {
-      // Then we can go to the asset's defining file.
-      const asset = ref.file.project.getAssetByName(assetName);
-      if (isAssetOfKind(asset, 'objects')) {
-        const files = asset.gmlFilesArray;
-        for (const file of files) {
-          if (file.isCreateEvent) {
-            return locationOf(file.startRange);
-          } else if (file.isStepEvent) {
-            return locationOf(file.startRange);
-          }
-        }
-        // Otherwise just whatever step we have,
-        // if any.
-        if (files.length > 0) {
-          return locationOf(files[0].startRange);
-        }
-      } else if (isAssetOfKind(asset, 'shaders')) {
-        // Go to the fragment shader
-        const fragShad = asset.shaderPaths.fragment;
-        if (fragShad) {
-          return locationOf(fragShad.absolute);
-        }
-      } else if (isAssetOfKind(asset, 'sounds')) {
-        // Go to the sound file.
-        if (asset.soundFile) {
-          return locationOf(asset.soundFile.absolute);
-        }
-      }
-    }
-    return;
-  }
-
   register() {
     return [
       vscode.languages.registerDefinitionProvider('gml', this),
-      registerCommand('stitch.openDocs', (info?: { from?: 'keybind' }) => {
-        // Get the currently select word, if any.
-        let word = '';
-        const editor = vscode.window.activeTextEditor;
-        const project = this.workspace.getActiveProject();
-        if (!project) return;
-        if (editor) {
-          const cursorPosition = editor.selection.active;
-          const wordRange =
-            editor.document.getWordRangeAtPosition(cursorPosition);
-          if (wordRange) {
-            word = editor.document.getText(wordRange);
+      registerCommand(
+        'stitch.openDocs',
+        async (info?: { from?: 'keybind' }) => {
+          // Get the currently select word, if any.
+          let word = '';
+          const editor = vscode.window.activeTextEditor;
+          const project = this.workspace.getActiveProject();
+          if (!project) return;
+          if (editor) {
+            const cursorPosition = editor.selection.active;
+            const wordRange =
+              editor.document.getWordRangeAtPosition(cursorPosition);
+            if (wordRange) {
+              word = editor.document.getText(wordRange);
+            }
           }
-        }
-        const openDocs = () =>
-          vscode.env.openExternal(vscode.Uri.parse(project.helpLinks[word]));
-        if (info?.from === 'keybind') {
-          // Then we only want to open if the word is a native value of some sort.
-          const item = project.self.getMember(word);
-          if (item?.native) {
+          const openDocs = () =>
+            vscode.env.openExternal(vscode.Uri.parse(project.helpLinks[word]));
+          if (info?.from === 'keybind') {
+            // Then we only want to open if the word is a native value of some sort.
+            const selection =
+              editor &&
+              (await this.workspace.query(editor.document, {
+                kind: 'selection',
+                offset: editor.document.offsetAt(editor.selection.active),
+              }));
+            if (selection?.native) {
+              openDocs();
+            }
+          } else {
             openDocs();
           }
-        } else {
-          openDocs();
-        }
-      }),
+        },
+      ),
     ];
   }
 }

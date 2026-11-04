@@ -71,6 +71,84 @@ async function declaredMember(
   );
 }
 
+test('document edits publish same-file forward definitions and inferred types to real providers', async () => {
+  const file = await document('ForwardRefresh', '');
+  const source = (value: string) =>
+    'function forward_use(){return forward_factory().member;}\n' +
+    `function forward_factory(){return {member:${value}};}\n` +
+    'var observed=forward_use();';
+  const hover = new host.subject.StitchHoverProvider(workspace);
+  for (const [value, kind] of [
+    ['1', 'Real'],
+    ['"text"', 'String'],
+    ['2', 'Real'],
+  ]) {
+    const text = source(value);
+    file.doc.setText(text);
+    workspace.onChangeDoc({ document: file.doc, contentChanges: [{ text }] });
+    await workspace.ensureDocumentCurrent(file.doc);
+    await declaredMember(
+      file,
+      'forward_factory().member',
+      file,
+      `member:${value}`,
+      kind,
+    );
+    const offset = text.indexOf('observed');
+    assert.equal(
+      file.code.getReferenceAt(offset).item.type.toFeatherString(),
+      kind,
+    );
+    const result = await hover.provideHover(
+      file.doc,
+      file.doc.positionAt(offset),
+      token,
+    );
+    assert(
+      result.contents.codeBlocks.some((block: any) =>
+        block.value.includes(kind),
+      ),
+    );
+  }
+});
+
+test('unfinished static edits keep later function bodies current and recover provider members', async () => {
+  const source =
+    'function StaticRefresh() constructor { static kept=1; }\n' +
+    'function static_tail(){return 1;}';
+  const producer = await document('StaticRefreshSource', source);
+  const consumer = await document(
+    'StaticRefreshUse',
+    'var instance=new StaticRefresh(); var value=instance.kept;',
+  );
+  const text =
+    'function StaticRefresh() constructor { static }\n' +
+    'function static_tail(){return "changed";}';
+  producer.doc.setText(text);
+  workspace.onChangeDoc({ document: producer.doc, contentChanges: [{ text }] });
+  await workspace.ensureDocumentCurrent(producer.doc);
+  assert(producer.code.getDiagnostics().SYNTAX_ERROR.length);
+  assert(
+    !producer.code
+      .getDiagnostics()
+      .SYNTAX_ERROR.some((d: any) => d.message.includes('Internal')),
+  );
+  const tail = producer.code
+    .getReferenceAt(text.indexOf('static_tail'))
+    .item.getTypeByKind('Function');
+  assert.deepEqual(
+    tail.returns.type.map((type: any) => type.kind),
+    ['String'],
+  );
+  producer.doc.setText(source);
+  workspace.onChangeDoc({
+    document: producer.doc,
+    contentChanges: [{ text: source }],
+  });
+  await workspace.ensureDocumentCurrent(producer.doc);
+  await declaredMember(consumer, 'instance.kept', producer, 'kept=1', 'Real');
+});
+
 test('returned struct members retain real provider definitions through producer edits and recovery', async () => {
   const source =
     'function TextElement() constructor {\n static get_bbox = function() { return { left: 1, height: 2 }; };\n}';
@@ -379,7 +457,17 @@ test('recursive return containers retain a usable analysis when an upstream body
     'function use_recursive() { return recursive_left(true); }',
   );
   await edit(left, '// changed\n' + left.doc.getText());
-  assert.equal(consumer.code.getDiagnostics().SYNTAX_ERROR.length, 0);
+  assert.deepEqual(
+    consumer.code
+      .getDiagnostics()
+      .SYNTAX_ERROR.map((diagnostic: any) => diagnostic.message),
+    [],
+    host.logs
+      .map((entry: any[]) =>
+        entry.map((value: any) => value?.stack || String(value)).join(' '),
+      )
+      .join('\n'),
+  );
   assert(memberAt(consumer, 'recursive_left').ref.item.def?.file === left.code);
 });
 

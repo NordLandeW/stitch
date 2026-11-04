@@ -22,6 +22,9 @@ try {
     platform: 'node',
     sourcemap: 'inline',
     target: 'node22',
+    inject: ['scripts/injection.js'],
+    define: { 'import.meta.url': 'import_meta_url' },
+    loader: { '.xml': 'text', '.html': 'text', '.node': 'file' },
   });
   const outputs = tests.map((test) =>
     path.join(
