@@ -18,12 +18,20 @@ function definition(symbol: Signifier) {
 }
 
 /** Compare published bindings with a flat, shared graph instead of a recursive tree. */
-export function semanticSignature(code: Code): string {
+export function semanticSignature(code: Code, includeLocals = false): string {
   const nodes: unknown[][] = [];
-  const ids = new Map<Type, number>();
-  const active = new Map<Type, number>();
+  const ids = new Map<Type | string, number>();
   const pending: (() => void)[] = [];
-  function links(types: Type[]): number[] {
+  // Comparison may collapse equal views; live unions must retain every mutable
+  // branch because another assignment can add members after the union is made.
+  const identity = (type: Type): Type | string =>
+    type.kind !== 'Function' && type.name
+      ? JSON.stringify([type.kind, type.name, type.isReadonly, type.isGeneric])
+      : type.inferenceIdentity;
+  function links(values: Type[]): number[] {
+    const distinct = new Map<Type | string, Type>();
+    for (const type of values) distinct.set(identity(type), type);
+    const types = [...distinct.values()];
     const result: number[] = new Array(types.length);
     for (let index = types.length - 1; index >= 0; index--) {
       pending.push(() => {
@@ -33,23 +41,24 @@ export function semanticSignature(code: Code): string {
           if (root.name || literalIds.has(root)) break;
           root = root.extends;
         }
-        const previous = active.get(root) ?? ids.get(type);
+        const key = identity(type);
+        const previous = ids.get(key);
         if (previous !== undefined) {
           result[index] = previous;
           return;
         }
         const id = nodes.length;
         result[index] = id;
-        ids.set(type, id);
+        ids.set(key, id);
         const row: unknown[] = [
           type.kind,
           type.name || '',
           literalIds.get(root) || 0,
+          type.isReadonly,
+          type.isGeneric,
         ];
         nodes.push(row);
         if (type.kind !== 'Function' && type.name) return;
-        active.set(root, id);
-        pending.push(() => active.delete(root));
         if (type.kind === 'Function') {
           const lineage: string[] = [];
           const seen = new Set<Type>();
@@ -102,7 +111,8 @@ export function semanticSignature(code: Code): string {
   }
   const symbols = new Set<Signifier>();
   for (const ref of code.refs) {
-    if (ref.item.def?.file === code && !ref.item.local) symbols.add(ref.item);
+    if (ref.item.def?.file === code && (includeLocals || !ref.item.local))
+      symbols.add(ref.item);
   }
   const ordered = [...symbols].sort((a, b) =>
     JSON.stringify([a.name, definition(a)]).localeCompare(

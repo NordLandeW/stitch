@@ -1,5 +1,4 @@
 // CST Visitor for creating an AST etc
-import { ObjectVariables } from './project.object-variables.js';
 import { arrayWrapped } from '@bscotch/utility';
 import type { CstNode } from 'chevrotain';
 import type {
@@ -570,10 +569,10 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     if (
       existing &&
       !existing.local &&
-      ObjectVariables.definitionFor(existing, this.PROCESSOR.fullScope.self)
+      this.PROCESSOR.fullScope.self.getMember(name) === existing
     ) {
-      // An inherited resource field is written on this receiver. Its declaring
-      // parent owns the metadata, not assignments performed by child objects.
+      // Keep the actual receiver when a lookup resolves an inherited member.
+      // Its declaring parent must not claim a child's write as its definition.
       container = this.PROCESSOR.fullScope.self as WithableType;
     }
     if (!container) {
@@ -990,7 +989,8 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
     // Make sure that the content is visited
     const types: Type[] = [];
     const arrayType = this.FILE.anonymousContainer(children, 'Array');
-    arrayType.items = undefined;
+    // Derived call results share this store; withdraw facts without replacing it.
+    if (arrayType.items) arrayType.items.type = [];
     for (const item of children.assignmentRightHandSide || []) {
       const itemTypes = this.assignmentRightHandSide(
         item.children,

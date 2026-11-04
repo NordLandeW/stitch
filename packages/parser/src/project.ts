@@ -35,6 +35,7 @@ import { Diagnostic } from './project.diagnostics.js';
 import { Native } from './project.native.js';
 import { ProjectMacros } from './project.macros.js';
 import { createRenameEdits, type RenameEdit } from './project.rename.js';
+import { semanticReaders } from './project.dependencies.js';
 import { fshDefault, vshDefault } from './shaderDefaults.js';
 import { Signifier } from './signifiers.js';
 import { StructType, Type } from './types.js';
@@ -167,6 +168,15 @@ export class Project {
     this.semanticDirtyFiles.delete(code);
   }
 
+  /** Withdraw an edited region together, so cycles cannot retain obsolete facts. */
+  prepareSemanticFiles(changed: Iterable<Code>): Code[] {
+    const affected = new Set(changed);
+    for (const code of affected)
+      for (const reader of semanticReaders(code)) affected.add(reader);
+    for (const code of affected) code.invalidateSemanticInference();
+    return [...affected].filter((code) => !code.isRetired);
+  }
+
   refreshSemanticFiles() {
     if (this.refreshingSemanticFiles || !this.semanticDirtyFiles.size) return;
     this.refreshingSemanticFiles = true;
@@ -179,8 +189,7 @@ export class Project {
         if (code.isRetired) continue;
         if (!visits.has(code)) {
           for (const ref of code.refs)
-            if (ref.item.def?.file === code && !ref.item.local)
-              declarations.add(ref.item);
+            if (ref.item.def?.file === code) declarations.add(ref.item);
         }
         const count = (visits.get(code) || 0) + 1;
         visits.set(code, count);
@@ -189,7 +198,7 @@ export class Project {
         if (count > declarations.size + 1) {
           this.semanticDirtyFiles.add(code);
           throw new Error(
-            `Cross-file analysis did not stabilize at ${code.path.absolute}`,
+            `Semantic analysis did not stabilize at ${code.path.absolute}`,
           );
         }
         code.updateGlobals();
@@ -1432,7 +1441,12 @@ export class Project {
    * Initialize a collection of new assets by parsing their GML */
   initiallyParseAssetCode(assets: Asset[]) {
     const codes = assets.flatMap((asset) => asset.gmlFilesArray);
-    this.macros.preparePending();
+    const pending = this.macros.preparePending();
+    // Metadata-only resources can invalidate readers without owning any GML.
+    const affected = this.prepareSemanticFiles(
+      new Set([...codes, ...pending, ...this.semanticDirtyFiles]),
+    );
+    for (const code of affected) this.queueSemanticFileUpdate(code);
     // Do scripts before objects
     assets = [...assets.values()].sort((a, b) => {
       if (a.assetKind === b.assetKind) {

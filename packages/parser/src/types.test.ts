@@ -1,6 +1,10 @@
 import { expect } from 'chai';
 import { Signifier } from './signifiers.js';
-import { replaceGenerics, updateGenericsMap } from './types.checks.js';
+import {
+  getTypes,
+  replaceGenerics,
+  updateGenericsMap,
+} from './types.checks.js';
 import { KnownTypesMap, typeFromFeatherString } from './types.feather.js';
 import { Type, TypeStore } from './types.js';
 
@@ -130,5 +134,105 @@ describe('Types', function () {
     narrowStruct.addMember('specialty', { type: new Type('String') });
     expect(narrowStruct.narrows(broadStruct)).to.be.true;
     expect(broadStruct.narrows(narrowStruct)).to.be.false;
+  });
+
+  it('flattens every union branch without duplicating scalars or merging distinct declarations', function () {
+    const left = new Type('Struct');
+    const right = new Type('Struct');
+    left.addMember('value', { type: Type.Real })!.def = {};
+    right.addMember('value', { type: Type.Real })!.def = {};
+    const first = new TypeStore();
+    const second = new TypeStore();
+    const real = Type.Real;
+    first.type = [real, left];
+    second.type = [Type.Real.derive(), Type.String, right, left];
+    const union = getTypes([Type.Bool, first, second]);
+    expect(union.map((type) => type.kind)).to.deep.equal([
+      'Bool',
+      'Real',
+      'Struct',
+      'String',
+      'Struct',
+    ]);
+    expect(union[1]).to.equal(real);
+    expect(union[2]).to.equal(left);
+    expect(union[4]).to.equal(right);
+    const named = Type.Real.named('T').genericize();
+    expect(getTypes([real, named])).to.deep.equal([real, named]);
+  });
+
+  it('retains independent views that diverge after a union is formed', function () {
+    const original = new Type('Struct');
+    original.addMember('value', { type: Type.Real })!.def = {};
+    const left = original.derive();
+    const right = original.derive();
+    const union = getTypes([left, right, left]);
+    right.addMember('extra', { type: Type.String })!.def = {};
+    expect(union).to.deep.equal([left, right]);
+    expect(union[0].getMember('extra')).to.be.undefined;
+    expect(union[1].getMember('extra')!.type.toFeatherString()).to.equal(
+      'String',
+    );
+    const array = new Type('Array').setItemType(original);
+    const firstCall = replaceGenerics(array, new Map(), new Map()).type[0];
+    const nextCall = replaceGenerics(firstCall, new Map(), new Map()).type[0];
+    expect(getTypes([array, firstCall, nextCall])).to.deep.equal([
+      array,
+      firstCall,
+      nextCall,
+    ]);
+    expect(firstCall.items).to.equal(array.items);
+    expect(nextCall.items).to.equal(array.items);
+    const differentItems = array.derive().setItemType(Type.String);
+    expect(getTypes([array, differentItems])).to.deep.equal([
+      array,
+      differentItems,
+    ]);
+  });
+
+  it('matches recursive item pairs while collecting every generic branch', function () {
+    const recursive = new Type('Array');
+    recursive.setItemType(recursive);
+    expect(updateGenericsMap(recursive, recursive, new Map()).size).to.equal(0);
+    const generic = Type.Any.named('T').genericize();
+    const expected = new Type('Array');
+    expected.items = new TypeStore();
+    expected.items.type = [generic, expected];
+    const inferred = new Type('Array');
+    inferred.items = new TypeStore();
+    inferred.items.type = [Type.Real, Type.String, inferred];
+    const resolved = updateGenericsMap(expected, inferred, new Map());
+    expect(resolved.get('T')!.type.map((type) => type.kind)).to.include.members(
+      ['Real', 'String'],
+    );
+  });
+
+  it('specializes recursive item graphs without mutating the generic template', function () {
+    const generic = Type.Any.named('T').genericize();
+    const template = new Type('Array');
+    template.items = new TypeStore();
+    template.items.type = [generic, template];
+    const argument = new TypeStore();
+    argument.type = Type.Real;
+    const specialized = replaceGenerics(
+      template,
+      new Map(),
+      new Map([['T', argument]]),
+    ).type[0];
+    expect(specialized.items!.type.map((type) => type.kind)).to.deep.equal([
+      'Real',
+      'Array',
+    ]);
+    expect(specialized.items!.type[1]).to.equal(specialized);
+    expect(template.items.type).to.deep.equal([generic, template]);
+    expect(specialized.toFeatherString()).to.equal('Array<Real|Array>');
+    argument.type = Type.String;
+    const different = replaceGenerics(
+      template,
+      new Map(),
+      new Map([['T', argument]]),
+    ).type[0];
+    expect(different.items!.type[0].kind).to.equal('String');
+    expect(getTypes([specialized, different])).to.have.lengthOf(2);
   });
 });

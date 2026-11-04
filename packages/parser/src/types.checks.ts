@@ -69,6 +69,31 @@ export function getTypeStoreOrType(
 /** Things that can be converted into an array of types */
 export type Typeable = Signifier | Type | TypeStore | (Type | TypeStore)[];
 
+// Ordinary scalar unions are sets. Preserve nominal/structural and callable
+// identity: equal printed shapes can still belong to different declarations.
+const scalarUnionKinds = new Set<PrimitiveName>([
+  'Any',
+  'Bool',
+  'Mixed',
+  'Never',
+  'Pointer',
+  'Real',
+  'String',
+  'Undefined',
+  'Unknown',
+]);
+
+function unionIdentity(type: Type): Type | PrimitiveName {
+  return scalarUnionKinds.has(type.kind) &&
+    !type.name &&
+    !type.items &&
+    !type.isGeneric &&
+    !type.isReadonly &&
+    !type.signifier
+    ? type.kind
+    : type;
+}
+
 export function getTypes(items: Typeable | undefined): Type[] {
   const types: Type[] = [];
   if (!items) {
@@ -78,12 +103,19 @@ export function getTypes(items: Typeable | undefined): Type[] {
     if (item.$tag === 'Sym') {
       types.push(...item.type.type);
     } else if (item.$tag === 'TypeStore') {
-      return [...item.type];
+      types.push(...item.type);
     } else {
       types.push(item);
     }
   }
-  return types;
+  if (types.length < 2) return types;
+  const seen = new Set<Type | PrimitiveName>();
+  return types.filter((type) => {
+    const key = unionIdentity(type);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 export function isTypeInstance(item: any): item is Type {
@@ -241,6 +273,7 @@ export function updateGenericsMap(
   knownTypes: KnownTypesMap,
   /** Map of generics by name to their *inferred type* */
   generics: Map<string, TypeStore> = new Map(),
+  visited = new Map<Type, Set<Type>>(),
 ) {
   const expectedTypes = getTypes(expected)
     .map((t) => normalizeType(t, knownTypes).type)
@@ -263,6 +296,10 @@ export function updateGenericsMap(
       generics.set(genericName, generic);
     }
     for (const inferredType of inferredTypes) {
+      let matches = visited.get(expectedType);
+      if (matches?.has(inferredType)) continue;
+      if (!matches) visited.set(expectedType, (matches = new Set()));
+      matches.add(inferredType);
       if (narrowsType(inferredType, expectedType)) {
         if (generic) {
           // Then we can use this inferred type to resolve the generic
@@ -275,6 +312,7 @@ export function updateGenericsMap(
             inferredType.items,
             knownTypes,
             generics,
+            visited,
           );
         }
       }
@@ -284,10 +322,29 @@ export function updateGenericsMap(
   return generics;
 }
 
+function hasGenericReplacement(
+  items: Typeable,
+  generics: Map<string, TypeStore>,
+): boolean {
+  if (!generics.size) return false;
+  const pending = getTypes(items);
+  const seen = new Set<Type>();
+  while (pending.length) {
+    const type = pending.pop()!;
+    if (seen.has(type)) continue;
+    seen.add(type);
+    if (type.isGeneric && generics.has(type.name!)) return true;
+    if (type.kind !== 'Function' && type.items)
+      pending.push(...type.items.type);
+  }
+  return false;
+}
+
 export function replaceGenerics(
   startingType: Typeable,
   knownTypes: KnownTypesMap,
   generics: Map<string, TypeStore>,
+  replacements = new Map<Type, Type>(),
 ): TypeStore {
   const startingTypes = getTypes(startingType);
   // Recurse through the types and, if we find a generic, replace it!
@@ -305,9 +362,35 @@ export function replaceGenerics(
         replacedTypes.addType(type);
         continue;
       }
+      const previous = replacements.get(type);
+      if (previous) {
+        replacedTypes.addType(previous);
+        continue;
+      }
       const newType = type.derive();
-      if (type.items) {
-        newType.items = replaceGenerics(type.items, knownTypes, generics);
+      replacements.set(type, newType);
+      if (type.items && !hasGenericReplacement(type.items, generics)) {
+        // Concrete recursive containers need no generic graph copy.
+        newType.items = type.items;
+      } else if (type.items) {
+        const substituted = replaceGenerics(
+          type.items,
+          knownTypes,
+          generics,
+          replacements,
+        );
+        const before = type.items.type;
+        const after = substituted.type;
+        // Keep unchanged argument stores shared with their original containers,
+        // including recursive contents; the result views remain independent.
+        newType.items =
+          before.length === after.length &&
+          before.every(
+            (item, index) =>
+              unionIdentity(item) === unionIdentity(after[index]),
+          )
+            ? type.items
+            : substituted;
       }
       replacedTypes.addType(newType);
     }

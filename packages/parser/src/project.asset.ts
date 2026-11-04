@@ -847,7 +847,20 @@ export class Asset<T extends YyResourceType = YyResourceType> {
 
   /** External resource retirement must not delete author-owned files. */
   retire() {
+    // Metadata-only resources have no Code whose retirement can withdraw the
+    // readers' inferred facts. Capture owned bindings before any refs are reset.
+    const readers = new Set<Code>();
+    const symbols = [
+      this.signifier,
+      ...(this.variables?.listMembers(true) || []).filter(
+        (member) => member.parent === this.variables && !member.native,
+      ),
+    ];
+    for (const symbol of symbols)
+      for (const ref of symbol.refs) readers.add(ref.file);
+    const affected = this.project.prepareSemanticFiles(readers);
     for (const code of this.gmlFiles.values()) code.retire();
+    for (const code of affected) this.project.queueSemanticFileUpdate(code);
     this.objectVariables.clear();
     this.gmlFiles.clear();
     if (

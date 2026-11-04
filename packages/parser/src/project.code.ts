@@ -40,6 +40,10 @@ import {
   semanticSignature,
 } from './project.dependencies.js';
 
+// A different file may reset its last read while the defining file is between
+// globals and symbols. Keep that binding reserved until its owner publishes.
+const pendingDefinitions = new WeakSet<Signifier>();
+
 /** Represenation of a GML code file. */
 export class Code {
   readonly $tag = 'gmlFile';
@@ -75,6 +79,10 @@ export class Code {
     Type<'Struct' | 'Array'>
   >();
   private previousSemanticSignature?: string;
+  private previousLocalSemanticSignature?: string;
+  private semanticTree?: GmlParsed;
+  private readonly provisionalDefinitions = new Set<Signifier>();
+  private readonly functionTypes = new Map<object, Type<'Function'>>();
   private readonly previousSemanticReaders = new Set<Code>();
   private readonly resourceVariableScopes = new Set<Type>();
 
@@ -105,6 +113,52 @@ export class Code {
       this.literalTypes.set(site, type);
     }
     return type as Type<T>;
+  }
+
+  /** @internal Functions whose inferred return facts originate in this file. */
+  rememberFunctionType(site: object, type: Type<'Function'>) {
+    this.functionTypes.set(site, type);
+  }
+
+  /** @internal A body owns its callable; aliases must not lend a shared type. */
+  functionTypeAt(site: object) {
+    return this.functionTypes.get(site);
+  }
+
+  /** @internal Withdraw old inferred facts before an affected region is solved. */
+  invalidateSemanticInference() {
+    for (const type of this.functionTypes.values()) {
+      const owner = type.signifier;
+      if (owner?.native || (owner?.def?.file && owner.def.file !== this))
+        continue;
+      if (type.returns) type.returns.type = [];
+    }
+    const cleared = new Set<Signifier>();
+    for (const ref of this._refs) {
+      const symbol = ref.item;
+      if (symbol.def?.file !== this || cleared.has(symbol)) continue;
+      symbol.type.type = [];
+      cleared.add(symbol);
+    }
+    this.functionTypes.clear();
+    this.semanticTree = undefined;
+    this.previousLocalSemanticSignature = undefined;
+  }
+
+  private finishProvisionalDefinitions() {
+    for (const symbol of this.provisionalDefinitions) {
+      pendingDefinitions.delete(symbol);
+      if (symbol.def) continue;
+      symbol.placeholder = true;
+      symbol.type.type = [];
+      if (
+        !symbol.refs.size &&
+        !symbol.resourceDefinition &&
+        symbol.parent.getMember(symbol.name, true) === symbol
+      )
+        symbol.parent.removeMember(symbol.name);
+    }
+    this.provisionalDefinitions.clear();
   }
 
   get isRetired() {
@@ -447,15 +501,18 @@ export class Code {
   /** @internal Re-expand a collected buffer without reading over an open editor. */
   parseCollected() {
     this.clearAllDiagnostics();
+    const previousText = this.preprocessed?.text;
     this.preprocessed = this.project.macros.preprocess(this);
     this.analysisLines = undefined;
     this.sourceMapping = this.preprocessed.sourceMap
       ? this.project.macros.mapping(this.preprocessed.sourceMap)
       : undefined;
-    this._parsed = parser.parse(
-      this.preprocessed.text,
-      this.preprocessed.lexed,
-    );
+    if (!this._parsed || previousText !== this.preprocessed.text) {
+      this._parsed = parser.parse(
+        this.preprocessed.text,
+        this.preprocessed.lexed,
+      );
+    }
     for (const error of this._parsed.lexed.errors) {
       const start = error.offset;
       const end = start + Math.max(1, error.length) - 1;
@@ -597,7 +654,8 @@ export class Code {
     this.scopes.push(new Scope(position, local, self));
   }
 
-  protected reset() {
+  protected reset(reuseInference = false) {
+    this.finishProvisionalDefinitions();
     for (const reader of semanticReaders(this))
       this.previousSemanticReaders.add(reader);
     this.initializeScopeRanges();
@@ -619,6 +677,13 @@ export class Code {
         if (signifier.resourceDefinition)
           this.resourceVariableScopes.add(signifier.parent);
         signifier.unsetDef();
+        pendingDefinitions.add(signifier);
+        this.provisionalDefinitions.add(signifier);
+        if (reuseInference) {
+          // Forward reads may use this round's previous type, but navigation
+          // still requires a definition republished by the current traversal.
+          signifier.placeholder = false;
+        }
       }
       // Remove all references to this symbol found in this file.
       // Flag all other files as being dirty so they get reprocessed.
@@ -633,6 +698,7 @@ export class Code {
       if (
         !signifier.refs.size &&
         !signifier.resourceDefinition &&
+        !pendingDefinitions.has(signifier) &&
         (isDefinedInThisFile || !signifier.def) &&
         signifier.parent.getMember(signifier.name, true) === signifier
       ) {
@@ -853,7 +919,8 @@ export class Code {
   }
 
   updateGlobals() {
-    this.reset();
+    this.reset(this.semanticTree === this._parsed);
+    this.semanticTree = this._parsed;
     this.project.macros.registerSymbols(this, this.preprocessed);
     const globals = registerGlobals(this);
     this.updateEventInheritance();
@@ -864,8 +931,11 @@ export class Code {
   /** Retire semantic contributions without changing any project files. */
   retire() {
     if (this.retired) return;
+    const affected = this.project.prepareSemanticFiles([this]);
     this.retired = true;
+    for (const code of affected) this.project.queueSemanticFileUpdate(code);
     this.reset();
+    this.finishProvisionalDefinitions();
     if (this.isCreateEvent && this.asset.parent) {
       this.asset.variables!.extends = this.asset.parent.variables;
       for (const code of this.asset.gmlFilesArray)
@@ -881,6 +951,7 @@ export class Code {
 
   updateAllSymbols() {
     registerSignifiers(this);
+    this.finishProvisionalDefinitions();
     this.project.completeSemanticFileUpdate(this);
     for (const ref of this.refs) {
       if (ref.item.resourceDefinition && ref.item.def?.file === this)
@@ -896,5 +967,18 @@ export class Code {
       this.previousSemanticSignature = signature;
     }
     this.previousSemanticReaders.clear();
+    const forwardRead = this._refs.some(
+      (ref) =>
+        !ref.isDef &&
+        ref.item.def?.file === this &&
+        ref.start.offset < ref.item.def.start.offset,
+    );
+    const localSignature = forwardRead
+      ? semanticSignature(this, true)
+      : undefined;
+    if (localSignature !== this.previousLocalSemanticSignature) {
+      this.previousLocalSemanticSignature = localSignature;
+      if (forwardRead) this.project.queueSemanticFileUpdate(this);
+    }
   }
 }

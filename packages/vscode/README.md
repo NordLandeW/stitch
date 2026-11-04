@@ -37,7 +37,7 @@ JSDoc recovery retains recognizable types around a local error and preserves lat
 
 #### Cross-file updates and object variables
 
-Editing a function's returned structure refreshes its existing callers, including aliases in other scripts and object events. Member types, definition locations and diagnostics follow the updated declaration without requiring an edit in each caller. Selecting an already active configuration preserves the current analysis.
+Forward calls resolve declarations and returned members later in the same file. Editing or removing a function's returned structure refreshes its existing callers, including aliases in other scripts and object events. Member types, definition locations and diagnostics follow the updated declaration without requiring an edit in each caller. Selecting an already active configuration preserves the current analysis.
 
 Variables declared in an object's YY **Variable Definitions** are available before its Create event. Child objects inherit these declarations even when they omit `event_inherited()`. Numeric, string and boolean metadata provide their corresponding types; expression values and asset selections remain `Any` until GML declarations or annotations supply more information. Inheriting the parent's Create event also makes its GML-inferred types available. Child assignments to these YY-backed variables keep their own definitions; removing them restores the inherited type or metadata fallback. Metadata-backed names are protected from GML-only Rename operations, which would leave the YY declaration unchanged.
 

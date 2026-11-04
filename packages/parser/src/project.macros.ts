@@ -367,14 +367,10 @@ export class ProjectMacros {
 
   /** Synchronous publication: no other buffer can interleave between these passes. */
   flush() {
-    const codes = this.preparePending();
+    const pending = this.preparePending();
+    const codes = this.project.prepareSemanticFiles(pending);
     for (const code of codes) code.updateGlobals();
     for (const code of codes) code.updateAllSymbols();
-    if (codes.length > 1)
-      for (const code of codes) {
-        code.updateGlobals();
-        code.updateAllSymbols();
-      }
     this.complete(codes);
     this.project.refreshSemanticFiles();
     for (const code of codes) code.updateDiagnostics();

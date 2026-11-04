@@ -117,7 +117,7 @@ export function assignVariable(
     ref = signifier.addRef(variable.range);
     // If this is the first time we've seen it, and it wouldn't have
     // an unambiguous declaration, add its definition
-    if (!signifier.def || wasUndeclared) {
+    if (isSelfOwned && (!signifier.def || wasUndeclared)) {
       if (wasUndeclared) signifier.unsetDef();
       wasUndeclared = true;
       signifier.definedAt(variable.range);

@@ -75,10 +75,18 @@ export function visitFunctionExpression(
     }
   }
 
-  // Get or create the function type. Use the existing type if there is one.
+  // Reuse this body's callable, or its own forward-declared global type.
+  // A variable may previously alias a native or another function: assigning a
+  // new body must not mutate that borrowed callable or its return store.
   signifier?.describe(docs?.jsdoc.description);
   const functionType =
-    signifier?.getTypeByKind('Function') ||
+    this.FILE.functionTypeAt(children) ||
+    (isFunctionStatement &&
+    !assignedTo &&
+    !signifier?.native &&
+    signifier?.def?.file === this.FILE
+      ? signifier.getTypeByKind('Function')
+      : undefined) ||
     getTypeOfKind(ctx.type, 'Function')?.derive() ||
     new Type('Function').named(functionName);
   signifier?.setType(functionType);
@@ -96,6 +104,7 @@ export function visitFunctionExpression(
     functionType.self?.named(functionName);
   }
   functionType.returns ||= new TypeStore();
+  this.FILE.rememberFunctionType(children, functionType);
 
   // Determine the function context.
   let docContextRaw =

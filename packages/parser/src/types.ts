@@ -527,6 +527,29 @@ export class Type<T extends PrimitiveName = PrimitiveName> {
     return derived;
   }
 
+  /** Comparison identity of a view adding no members, bindings or type arguments.
+   * Live unions retain the view: later writes may give it independent members. */
+  get inferenceIdentity(): Type {
+    let root: Type = this;
+    while (
+      root.kind !== 'Function' &&
+      root.extends &&
+      root.kind === root.extends.kind &&
+      root.name === root.extends.name &&
+      root.description === root.extends.description &&
+      root.flags === root.extends.flags &&
+      !root._signifier &&
+      !root._members?.size &&
+      root.items === root.extends.items &&
+      !root.local &&
+      !root.returns &&
+      !root.self
+    ) {
+      root = root.extends;
+    }
+    return root;
+  }
+
   named(name: string | undefined): this {
     this.name = name;
     return this;
