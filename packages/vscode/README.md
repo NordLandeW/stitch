@@ -31,9 +31,11 @@ Stitch provides Intellisense (auto-complete, hovertext, function signature helpe
 
 #### Background analysis and live updates
 
-Each loaded project has a persistent language worker. Parsing, macro expansion and type/dependency updates run there; the extension host presents immutable query results and manages resource files. Pending edits are coalesced using `stitch.editing.reprocessOnTypeDelay`. An in-progress transaction finishes before newer inputs run, and obsolete results are discarded. Cancelling a language request releases its waiter while shared analysis continues.
+Each loaded project has a persistent language worker. Parsing, macro expansion and type/dependency updates run there; the extension host presents immutable query results and manages resource files. Pending edits are coalesced using `stitch.editing.reprocessOnTypeDelay`. An in-progress transaction finishes before newer inputs run, and obsolete precise-query results are discarded. Cancelling a language request releases its waiter while shared analysis continues.
 
-Precise member completion, hover, signatures, navigation and rename wait for current project inputs. During a source update, completion for a bare identifier at the start of a line can immediately offer an incomplete list labelled **Analysis updating · built-in candidate**. These suggestions contain built-in names rather than receiver-specific members. Configuration, resource and native-spec changes invalidate this fallback. Semantic highlighting and document outlines join the normal edit debounce.
+During source updates, completion can immediately reuse analyzed project names, local variables and receiver members at compatible source locations, including while GML save notifications are pending. These incomplete lists are labelled **Analysis updating · last analyzed result**. Identifier-prefix edits and new simple receiver access preserve usable contexts; structural edits, changed receivers and new complex expressions wait for current analysis when no compatible context exists. A bare identifier can still receive a labelled built-in-only fallback before a contextual snapshot is available. Configuration, resource and native-spec changes invalidate reused analysis.
+
+When current analysis commits, Stitch requests a refresh of a still-relevant incomplete suggestion session. This uses VS Code's provider registry, leaving the active-session check to the editor. Hover, navigation and rename require current inputs. Signature help, caret status, semantic highlighting and document outlines join the normal edit debounce.
 
 Open buffers take precedence over disk contents. Closing a buffer restores the saved file; YY/YYP, selected run configuration, native-spec and analysis-setting changes are synchronized with the worker. If a worker fails, precise language features stop and the error notification offers **Retry analysis**, which rebuilds a fresh session from current files and open buffers. Resource browsing remains available. Moving analysis off the extension host improves responsiveness during CPU work; it does not eliminate that work or guarantee a shorter total analysis time.
 
@@ -154,7 +156,7 @@ JSDoc-shaped comments can appear within expressions without splitting the code o
     added_variable = 42;
   }
   ```
-- **JSDoc Autocompletes:** Stitch provides autocompletes and syntax highlighting for Feather types within JSDoc comments.
+- **JSDoc Autocompletes:** Documentation comments offer tag templates such as `@returns` and type candidates inside type annotations, including generic and union positions. Qualified names such as `Struct.Player` replace the complete typed name; annotations that require braces insert them when missing. Type candidates include templates declared in the current documentation block. Parameter-name and description positions retain ordinary text editing. Tags are available locally, and type suggestions can reuse the last analyzed project type names during background updates.
 - **JSDoc helpers:** Stitch provides snippets for JSDoc tags, and context menus to copy the Feather type of a symbol to your clipboard.
 
 ### 📄 Included Files ("Datafiles")

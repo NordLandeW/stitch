@@ -9,6 +9,11 @@ import {
   type Type,
 } from '@bscotch/gml-parser';
 import { pathy } from '@bscotch/pathy';
+import { completionAnchor } from './completion-context.mjs';
+import {
+  documentationCompletions,
+  documentationContext,
+} from './documentation-context.mjs';
 import {
   collectGmlDocumentSymbols,
   type GmlDocumentSymbol,
@@ -137,41 +142,50 @@ function completions(
   offset: number,
   trigger?: string,
 ): Completion[] | undefined {
-  if (file.getJsdocAt(offset)) {
-    if (trigger === '.') return;
-    return [...new Set([...file.project.types.keys(), ...primitiveNames])].map(
-      (name) => ({ name, kind: 'interface' }),
+  const documentation = documentationContext(file.content, offset);
+  if (documentation)
+    return documentationCompletions(
+      documentation,
+      completionTypeNames(file.project),
     );
-  }
+  offset = completionAnchor(file.content, offset);
+  if (file.getJsdocAt(offset)) return [];
   if (trigger && trigger !== '.') return;
-  const items =
-    file.getStructNewMemberRangeAt(offset)?.type.listMembers() ||
-    file.getInScopeSymbolsAt(offset);
-  return items
+  return completionSymbols(file, offset)
     .filter((item) => item.name)
-    .map((item): Completion => {
-      const fn = item.getTypeByKind('Function');
-      return {
-        name: item.name!,
-        kind: item.getTypeByKind('Enum')
-          ? 'enum'
-          : fn?.isConstructor
-            ? 'constructor'
-            : fn
-              ? 'function'
-              : 'variable',
-        definitionPath: item.def?.file?.path.absolute,
-        detail: [
-          item.type.toFeatherString(),
-          item.native && 'native',
-          item.global && 'global',
-          item.local && 'local',
-          item.parameter && 'parameter',
-        ]
-          .filter(Boolean)
-          .join(' '),
-      };
-    });
+    .map(completionValue);
+}
+export function completionTypeNames(project: Project): string[] {
+  return [...new Set([...project.types.keys(), ...primitiveNames])];
+}
+export function completionSymbols(file: Code, offset: number): Signifier[] {
+  return (
+    file.getStructNewMemberRangeAt(offset)?.type.listMembers() ||
+    file.getInScopeSymbolsAt(offset)
+  );
+}
+export function completionValue(item: Signifier): Completion {
+  const fn = item.getTypeByKind('Function');
+  return {
+    name: item.name!,
+    kind: item.getTypeByKind('Enum')
+      ? 'enum'
+      : fn?.isConstructor
+        ? 'constructor'
+        : fn
+          ? 'function'
+          : 'variable',
+    definitionPath: item.def?.file?.path.absolute,
+    detail: [
+      item.type.toFeatherString(),
+      item.native && 'native',
+      item.global && 'global',
+      item.local && 'local',
+      item.parameter && 'parameter',
+    ]
+      .filter(Boolean)
+      .join(' '),
+  };
 }
 function renameReference(file: Code, offset: number): Reference {
   const ref =
@@ -470,12 +484,10 @@ function execute(project: Project, query: Query): unknown {
         label: args.type.code,
         description: args.type.description,
         activeParameter: args.param.idx!,
-        parameters: args.type
-          .listParameters()
-          .map((param) => ({
-            name: param?.name || 'unknown',
-            description: param?.description,
-          })),
+        parameters: args.type.listParameters().map((param) => ({
+          name: param?.name || 'unknown',
+          description: param?.description,
+        })),
       };
     }
     case 'tokens':

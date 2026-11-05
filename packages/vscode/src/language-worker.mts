@@ -53,6 +53,7 @@ port.on('message', (request: WorkerRequest) => {
           revision,
           value: undefined,
           diagnostics: engine.diagnostics(),
+          completions: engine.completions(),
           nativeCandidates: engine.nativeCandidates(),
         });
         return;
@@ -71,6 +72,7 @@ port.on('message', (request: WorkerRequest) => {
           revision,
           value: undefined,
           diagnostics: engine.diagnostics(),
+          completions: engine.completions(),
           nativeCandidates: request.inputs.some(
             (input) => !['document', 'close', 'disk'].includes(input.kind),
           )

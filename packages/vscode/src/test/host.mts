@@ -101,6 +101,7 @@ async function compileSubjects(): Promise<string> {
     import { GameMakerProject } from ${JSON.stringify(source('extension.project.mts'))};
     import { StitchWorkspace } from ${JSON.stringify(source('extension.workspace.mts'))};
     import { TestLanguageService } from ${JSON.stringify(source('test/language.mts'))};
+    export const createWorkerLanguageService = StitchWorkspace.prototype.createLanguageService;
     StitchWorkspace.prototype.createLanguageService = function(project) { return new TestLanguageService(project); };
     export { StitchWorkspace };
     export { activateStitchExtension } from ${JSON.stringify(source('extension.activate.mts'))};
@@ -492,6 +493,9 @@ export async function createHost() {
     Position,
     Range,
     Location,
+    SnippetString: class {
+      constructor(readonly value: string) {}
+    },
     WorkspaceEdit,
     RelativePattern,
     Disposable,
@@ -577,6 +581,7 @@ export async function createHost() {
       Function: 3,
       Variable: 4,
       Interface: 5,
+      Keyword: 6,
     },
     SymbolInformation: class {
       constructor(

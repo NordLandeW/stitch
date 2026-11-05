@@ -134,6 +134,17 @@ test(
             item.detail.includes('Analysis updating'),
         ),
       );
+      const updating = await new host.subject.StitchCompletionProvider(
+        workspace,
+      ).provideCompletionItems(
+        consumer,
+        consumer.positionAt(use.length),
+        token,
+        { triggerCharacter: '.' },
+      );
+      assert.equal(updating.isIncomplete, true);
+      assert(updating.items.some((item: any) => item.label === 'member'));
+      await f.service.flush();
       const updated = await new host.subject.StitchCompletionProvider(
         workspace,
       ).provideCompletionItems(

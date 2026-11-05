@@ -1,5 +1,6 @@
 import { Project, type ProjectOptions } from '@bscotch/gml-parser';
 import { pathy } from '@bscotch/pathy';
+import { completionPublication } from './completion-snapshot.mjs';
 import type {
   DiagnosticSnapshot,
   Initialization,
@@ -155,6 +156,10 @@ export class LanguageEngine {
 
   nativeCandidates() {
     return nativeCandidates(this.project);
+  }
+
+  completions() {
+    return completionPublication(this.project, this.overlays.values());
   }
 
   async query<K extends QueryKind>(query: Query<K>): Promise<QueryResults[K]> {

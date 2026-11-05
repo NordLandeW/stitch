@@ -13,10 +13,35 @@ export interface Location extends Span {
 }
 export interface Completion {
   name: string;
-  kind: 'enum' | 'constructor' | 'function' | 'variable' | 'interface';
+  kind:
+    | 'enum'
+    | 'constructor'
+    | 'function'
+    | 'variable'
+    | 'interface'
+    | 'keyword';
+  insertText?: string;
+  snippet?: boolean;
   detail?: string;
   definitionPath?: string;
-  fallback?: 'native';
+  fallback?: 'native' | 'snapshot';
+}
+/** Immutable display values, pooled across the currently open documents. */
+export interface CompletionPublication {
+  candidates: Completion[];
+  /** Preprocessor spellings can change syntax, rather than only a prefix. */
+  macroNames: string[];
+  typeNames: string[];
+  groups: {
+    /** Lossless consecutive candidate-ID spans, in the original query order. */
+    spans: { start: number; count: number }[];
+    /** Negative IDs shadow a shared receiver with a non-dottable binding. */
+    receivers?: Record<string, number>;
+    receiverBase?: number;
+  }[];
+  documents: (Overlay & {
+    regions: { start: number; end: number; group: number; member: boolean }[];
+  })[];
 }
 export interface Hover {
   code: string[];
@@ -171,6 +196,7 @@ export type WorkerResponse =
       value: unknown;
       diagnostics?: DiagnosticSnapshot[];
       nativeCandidates?: Completion[];
+      completions?: CompletionPublication;
     }
   | { id: number; session: string; ok: false; error: string }
   | { session: string; event: 'progress'; increment: number; message?: string }
@@ -188,6 +214,9 @@ export interface LanguageService {
   readonly revision: number;
   readonly isCurrent: boolean;
   update(input: Input, immediate?: boolean): void;
+  /** Display-only lookup; never waits for or starts a language transaction. */
+  completion?(query: Query<'completion'>): Completion[] | undefined;
+  invalidateCompletions?(): void;
   flush(token?: Cancellation): Promise<boolean>;
   query<K extends QueryKind>(
     query: Query<K>,

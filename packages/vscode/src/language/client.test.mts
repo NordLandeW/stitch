@@ -384,3 +384,108 @@ test('a synchronous worker-spawn failure is reported once and leaves queries saf
   assert.equal(errors.length, 1);
   client.dispose();
 });
+
+test('display snapshots survive source work but cannot be resurrected through metadata, reopen or failure', async () => {
+  const { client, endpoint } = await setup();
+  const overlay = document('box.member');
+  const query = {
+    kind: 'completion' as const,
+    path: overlay.path,
+    offset: overlay.text.length,
+  };
+  const publish = (request: WorkerRequest, name: string, generation = 1) =>
+    endpoint.emit('message', {
+      id: request.id,
+      session: request.session,
+      ok: true,
+      revision: 'revision' in request ? request.revision : 0,
+      completions: {
+        candidates: [{ name, kind: 'variable' }],
+        macroNames: [],
+        typeNames: [],
+        groups: [{ spans: [{ start: 0, count: 1 }] }],
+        documents: [
+          {
+            ...overlay,
+            generation,
+            regions: [
+              {
+                start: 0,
+                end: overlay.text.length + 1,
+                group: 0,
+                member: true,
+              },
+            ],
+          },
+        ],
+      },
+    });
+  try {
+    client.update(overlay, true);
+    publish(await endpoint.next('update'), 'member');
+    await client.flush();
+    client.update(
+      { ...document('upstream'), path: '/project/scripts/Other/Other.gml' },
+      true,
+    );
+    const busy = await endpoint.next('update');
+    const first = await client.query(query);
+    assert.equal(first?.[0].name, 'member');
+    assert.equal(first?.[0].fallback, 'snapshot');
+    assert.equal(endpoint.requests.length, 0);
+    client.invalidateCompletions();
+    client.update({ kind: 'asset', name: 'Other' });
+    publish(busy, 'obsolete');
+    const barrier = await endpoint.next('update');
+    assert.equal(
+      client.completion(query),
+      undefined,
+      'An older commit must not undo metadata invalidation',
+    );
+    publish(barrier, 'current');
+    await client.flush();
+    assert.equal(client.completion(query)?.[0].name, 'current');
+    client.update({ kind: 'close', path: overlay.path, generation: 1 });
+    client.update({ ...overlay, generation: 2 }, true);
+    assert.equal(client.completion(query), undefined);
+    publish(await endpoint.next('update'), 'reopened', 2);
+    await client.flush();
+    const revision = client.revision;
+    client.update({ kind: 'close', path: overlay.path, generation: 1 });
+    assert.equal(client.revision, revision);
+    assert.equal(client.completion(query)?.[0].name, 'reopened');
+    endpoint.emit('error', new Error('worker gone'));
+    assert.equal(client.completion(query), undefined);
+    assert.equal(endpoint.terminated, true);
+  } finally {
+    client.dispose();
+  }
+});
+
+test('selection and signature display wait for debounce without starting queued analysis', async () => {
+  const { client, endpoint } = await setup();
+  try {
+    client.update(document('pending'));
+    const selectionToken = cancellation(),
+      signatureToken = cancellation();
+    const selection = client.query(
+      { kind: 'selection', path: 'A.gml' },
+      selectionToken,
+    );
+    const signature = client.query(
+      { kind: 'signature', path: 'A.gml' },
+      signatureToken,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(endpoint.requests.length, 0);
+    selectionToken.cancel();
+    signatureToken.cancel();
+    assert.equal(await selection, undefined);
+    assert.equal(await signature, undefined);
+    const flushed = client.flush();
+    endpoint.reply(await endpoint.next('update'));
+    assert.equal(await flushed, true);
+  } finally {
+    client.dispose();
+  }
+});

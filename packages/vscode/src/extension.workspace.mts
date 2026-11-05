@@ -54,6 +54,8 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
   );
   readonly diagnosticCollection = diagnosticCollection;
   readonly externalChangeTracker = new ChangeTracker(this);
+  private readonly completionUpdates = new vscode.EventEmitter<void>();
+  readonly onDidCommitLanguage = this.completionUpdates.event;
 
   projects: GameMakerProject[] = [];
 
@@ -106,8 +108,11 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     Map<string, DiagnosticSnapshot>
   >();
 
-  markExternalChange() {
+  markExternalChange(invalidateCompletions = true) {
     this.resourceRevision++;
+    if (invalidateCompletions)
+      for (const service of this.languages.values())
+        service.invalidateCompletions?.();
   }
 
   publishPendingDiagnostics() {
@@ -146,6 +151,9 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
             pending.set(snapshot.path, snapshot);
           this.publishPendingDiagnostics();
           this.semanticHighlightProvider.refresh();
+          const active = vscode.window.activeTextEditor?.document;
+          if (active && this.getProject(active) === project)
+            this.completionUpdates.fire();
         },
         onError: (error) => {
           logger.error(error);
@@ -579,6 +587,27 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     )
       return;
     if (
+      query.kind === 'completion' &&
+      project.sourcesCurrent &&
+      this.externalChangeTracker.allowsCompletionReuse
+    ) {
+      this.syncBuffers(project);
+      const service = this.language(project);
+      const value = service.completion?.(query as Query<'completion'>);
+      if (
+        value !== undefined &&
+        (value.length || !this.externalChangeTracker.hasPending)
+      ) {
+        // Pending GML save notifications must not block a valid display snapshot.
+        // Metadata/configuration events invalidate this route at arrival instead.
+        return (
+          this.externalChangeTracker.hasPending
+            ? value.map((item) => ({ ...item, fallback: 'snapshot' as const }))
+            : value
+        ) as QueryResults[K];
+      }
+    }
+    if (
       (await cancellable(
         this.externalChangeTracker.flushPending().then(() => true),
         token,
@@ -863,6 +892,7 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     this.disposed = true;
     this.clearProjects();
     this.externalChangeTracker.dispose();
+    this.completionUpdates.dispose();
     this.semanticHighlightProvider.dispose();
   }
 

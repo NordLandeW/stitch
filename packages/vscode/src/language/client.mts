@@ -1,8 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
+import { snapshotCompletion } from './completion-context.mjs';
+import {
+  documentationCompletions,
+  documentationContext,
+} from './documentation-context.mjs';
 import type {
   Cancellation,
   Completion,
+  CompletionPublication,
+  Overlay,
   DiagnosticSnapshot,
   Initialization,
   Input,
@@ -14,6 +21,7 @@ import type {
   WorkerResponse,
 } from './protocol.mjs';
 
+const sourceKey = (value: string) => value.replaceAll('\\', '/').toLowerCase();
 type Reply = Extract<WorkerResponse, { ok: true }>;
 type Request = WorkerRequest extends infer R
   ? R extends WorkerRequest
@@ -94,6 +102,13 @@ export class WorkerLanguageService implements LanguageService {
   private readonly cache = new Map<string, unknown>();
   private nativeCandidates?: Completion[];
   private nativeInvalidatedAt = 0;
+  private completionValues?: CompletionPublication;
+  private completionInvalidatedAt = 0;
+  private readonly overlays = new Map<string, Overlay>();
+  private readonly completionDocuments = new Map<
+    string,
+    CompletionPublication['documents'][number]
+  >();
   private readonly idleWaiters = new Set<{
     resolve(value: boolean): void;
     reject(error: Error): void;
@@ -144,8 +159,68 @@ export class WorkerLanguageService implements LanguageService {
     );
   }
 
+  invalidateCompletions() {
+    this.completionValues = undefined;
+    this.completionDocuments.clear();
+    this.completionInvalidatedAt = this.inputRevision + 1;
+    this.nativeCandidates = undefined;
+    this.nativeInvalidatedAt = this.inputRevision + 1;
+  }
+
+  completion(query: Query<'completion'>): Completion[] | undefined {
+    if (this.disposed || this.failure) return;
+    const key = sourceKey(query.path || '');
+    const current = this.overlays.get(key),
+      document = this.completionDocuments.get(key);
+    const documentation =
+      current && documentationContext(current.text, query.offset || 0);
+    if (documentation) {
+      if (documentation.kind !== 'type')
+        return documentationCompletions(documentation, []);
+      if (!this.completionValues) return;
+      const values = documentationCompletions(
+        documentation,
+        this.completionValues.typeNames,
+      );
+      return this.isCurrent
+        ? values
+        : values.map((value) => ({ ...value, fallback: 'snapshot' as const }));
+    }
+    if (this.completionValues && current && document) {
+      const value = snapshotCompletion(
+        this.completionValues,
+        document,
+        current,
+        query,
+        !this.isCurrent,
+      );
+      if (value !== undefined) return value;
+    }
+    if (!this.isCurrent && query.allowNativeFallback && query.trigger !== '.')
+      return this.nativeCandidates;
+    return undefined;
+  }
+
   update(input: Input, immediate = false): void {
     if (this.disposed || this.failure) return;
+    if (input.kind === 'document') {
+      const key = sourceKey(input.path),
+        previous = this.overlays.get(key);
+      if (
+        previous &&
+        (previous.generation > input.generation ||
+          (previous.generation === input.generation &&
+            previous.version >= input.version))
+      )
+        return;
+      this.overlays.set(key, input);
+    } else if (input.kind === 'close') {
+      const key = sourceKey(input.path),
+        previous = this.overlays.get(key);
+      if (previous && previous.generation !== input.generation) return;
+      this.overlays.delete(key);
+      this.completionDocuments.delete(key);
+    }
     // Coalesce only adjacent source updates. Metadata/close/config are barriers.
     if (input.kind === 'document') {
       for (let i = this.queued.length - 1; i >= 0; i--) {
@@ -166,6 +241,9 @@ export class WorkerLanguageService implements LanguageService {
     if (!['document', 'close', 'disk'].includes(input.kind)) {
       this.nativeCandidates = undefined;
       this.nativeInvalidatedAt = this.inputRevision;
+      this.completionValues = undefined;
+      this.completionDocuments.clear();
+      this.completionInvalidatedAt = this.inputRevision;
     }
     this.queued.push(input);
     clearTimeout(this.timer);
@@ -238,19 +316,16 @@ export class WorkerLanguageService implements LanguageService {
     query: Query<K>,
     token?: Cancellation,
   ): Promise<QueryResults[K] | undefined> {
-    if (
-      !this.disposed &&
-      !this.failure &&
-      !token?.isCancellationRequested &&
-      !this.isCurrent &&
-      query.kind === 'completion' &&
-      query.allowNativeFallback &&
-      query.trigger !== '.' &&
-      this.nativeCandidates?.length
-    )
-      return this.nativeCandidates as QueryResults[K];
-    const background =
-      query.kind === 'tokens' || query.kind === 'documentSymbols';
+    if (query.kind === 'completion' && !token?.isCancellationRequested) {
+      const value = this.completion(query as Query<'completion'>);
+      if (value !== undefined) return value as QueryResults[K];
+    }
+    const background = [
+      'tokens',
+      'documentSymbols',
+      'selection',
+      'signature',
+    ].includes(query.kind);
     if (!(await (background ? this.waitCurrent(token) : this.flush(token))))
       return;
     const revision = this.inputRevision;
@@ -338,6 +413,12 @@ export class WorkerLanguageService implements LanguageService {
     this.committedRevision = reply.revision;
     if (reply.nativeCandidates && reply.revision >= this.nativeInvalidatedAt)
       this.nativeCandidates = immutable(reply.nativeCandidates);
+    if (reply.completions && reply.revision >= this.completionInvalidatedAt) {
+      this.completionValues = immutable(reply.completions);
+      this.completionDocuments.clear();
+      for (const document of reply.completions.documents)
+        this.completionDocuments.set(sourceKey(document.path), document);
+    }
     // A stale transaction may have changed a different file. Accumulate its
     // values privately and publish only once the latest input is committed.
     for (const snapshot of reply.diagnostics || [])
@@ -357,6 +438,9 @@ export class WorkerLanguageService implements LanguageService {
     this.queued = [];
     this.cache.clear();
     this.diagnostics.clear();
+    this.completionValues = undefined;
+    this.completionDocuments.clear();
+    this.overlays.clear();
     for (const call of this.calls.values()) call.reject(this.failure);
     this.calls.clear();
     for (const waiter of this.idleWaiters) waiter.reject(this.failure);
@@ -373,6 +457,9 @@ export class WorkerLanguageService implements LanguageService {
     this.queued = [];
     this.cache.clear();
     this.diagnostics.clear();
+    this.completionValues = undefined;
+    this.completionDocuments.clear();
+    this.overlays.clear();
     for (const call of this.calls.values())
       call.reject(new Error('Language service disposed'));
     this.calls.clear();

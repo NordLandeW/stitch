@@ -390,18 +390,25 @@ export class Code {
   getInScopeSymbolsAt(
     offset: number | LinePosition,
     column?: number,
+    options: { includeGlobals?: boolean } = {},
   ): Signifier[] {
     const matches = new Set<Signifier>();
     for (const context of this.queryContexts(offset, column)) {
       const scope = context.code.getAnalysisScopeAt(context.offset);
       if (scope)
-        for (const symbol of context.code.symbolsInScope(scope))
+        for (const symbol of context.code.symbolsInScope(
+          scope,
+          options.includeGlobals !== false,
+        ))
           matches.add(symbol);
     }
     return [...matches];
   }
 
-  private symbolsInScope(scopeRange: Scope): Signifier[] {
+  private symbolsInScope(
+    scopeRange: Scope,
+    includeGlobals = true,
+  ): Signifier[] {
     if (scopeRange.isDotAccessor) {
       // Then only return self variables
       // Filter out those that cannot be dot-accessed on global
@@ -428,8 +435,8 @@ export class Code {
       ...((scopeRange.self !== this.project.self
         ? scopeRange.self.listMembers()
         : []) || []),
-      // Project globals
-      ...(this.project.self.listMembers() || []),
+      // Display projections can share this common tail across many scopes.
+      ...(includeGlobals ? this.project.self.listMembers() : []),
     ];
 
     // Signifiers were added in order of precedence, so we can remove

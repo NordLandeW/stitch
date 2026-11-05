@@ -15,6 +15,10 @@ export class ChangeTracker {
   protected timeout: NodeJS.Timeout | undefined;
   private flushing?: Promise<void>;
   private failure?: unknown;
+  private metadataPending = false;
+  get allowsCompletionReuse() {
+    return !this.disposed && !this.failure && !this.metadataPending;
+  }
   get hasPending() {
     return !!this.flushing || !!this.queue.length || !!this.failure;
   }
@@ -44,7 +48,12 @@ export class ChangeTracker {
 
   addChange(event: ChangeEvent) {
     if (this.disposed) return;
-    this.provider.markExternalChange();
+    const file = event.uri.path.toLowerCase();
+    const metadata = file.endsWith('.gml')
+      ? event.type !== 'change'
+      : /\.(?:yy|yyp)$|\/options\/|\/stitch\.config\.json$/.test(file);
+    this.metadataPending ||= metadata;
+    this.provider.markExternalChange(metadata);
     this.failure = undefined;
     const duplicate =
       event.type === 'change' &&
@@ -93,6 +102,7 @@ export class ChangeTracker {
       })
       .finally(() => {
         this.flushing = undefined;
+        if (!this.failure && !this.queue.length) this.metadataPending = false;
         if (!this.disposed && !this.failure)
           this.provider.publishPendingDiagnostics();
       });
