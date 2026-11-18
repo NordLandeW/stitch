@@ -201,7 +201,8 @@ export const gmlSpecSchema = z
     GameMakerLanguageSpec: z
       .strictObject({
         $: z.object({
-          RuntimeVersion: z.string(),
+          // GameMaker 2026.1 omits this attribute in Base and platform specs.
+          RuntimeVersion: z.string().optional(),
           Module: z.string().default('Unknown'),
         }),
         // Should have length 0 or 1

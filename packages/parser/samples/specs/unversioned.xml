@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<GameMakerLanguageSpec Module="Platform">
+  <Constants>
+    <Constant Name="platform_ready" Type="Bool">Platform availability.</Constant>
+  </Constants>
+</GameMakerLanguageSpec>

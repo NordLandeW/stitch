@@ -74,6 +74,16 @@ describe('Project', function () {
     expect(scriptExecuteType.listParameters()![1]!.name).to.equal('...');
   });
 
+  it('loads native declarations from specs without a runtime version', async function () {
+    const spec = await Native.parse('samples/specs/unversioned.xml');
+    expect(spec.runtime).to.be.undefined;
+    expect(spec.constants[0]).to.include({
+      module: 'Platform',
+      name: 'platform_ready',
+      type: 'Bool',
+    });
+  });
+
   it('can use fallback GmlSpec', async function () {
     await Project.fallbackGmlSpecPath.exists({ assert: true });
   });
