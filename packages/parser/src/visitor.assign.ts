@@ -163,7 +163,10 @@ export function assignVariable(
       visitor.PROCESSOR.project.types,
     );
     const forceOverride = info.docs?.jsdoc.kind === 'type';
-    if (signifier && (!signifier.isTyped || wasUndeclared || forceOverride)) {
+    if (
+      signifier &&
+      (!signifier.isTyped || wasUndeclared || ref?.isDef || forceOverride)
+    ) {
       if (info.docs) {
         signifier.describe(info.docs.jsdoc.description);
         signifier.setType(
@@ -195,10 +198,10 @@ export function ensureDefinitive(
   const inDefinitiveSelf = currentDefinitiveSelf === self;
   const isSelfOwned = self.getMember(member.name, true) === member;
   if (isSelfOwned && !member.definitive && inDefinitiveSelf) {
-    member.definitive = true;
-    // Ensure the definition is HERE
+    // The priority belongs to the new definition, not the one being retired.
     member.unsetDef();
     member.definedAt(ref);
+    member.definitive = true;
     for (const otherRef of member.refs) {
       otherRef.isDef = false; // Unset all other definitions
     }

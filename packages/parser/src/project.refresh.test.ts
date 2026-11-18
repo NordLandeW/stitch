@@ -93,6 +93,36 @@ describe('same-file semantic refresh', function () {
     `function RefreshFactory(){return {member:${value}};}\n` +
     'var observed=RefreshUse();';
 
+  it('keeps a Create declaration and its type ahead of ordinary writes across a batch', async () => {
+    const create = project
+      .getAssetByName('o_object')!
+      .getEventByName('Create_0')!;
+    const declaration = 'pending = 1;';
+    const writer =
+      'function change_pending(){ o_object.pending = "external"; return o_object.pending; }';
+    const check = (owner: Code, definition: string, type: string) => {
+      const item = reference(
+        code,
+        'return o_object.pending',
+        'return o_object.'.length,
+      ).item;
+      assert.equal(item.def?.file, owner);
+      assert.equal(item.def.start.offset, owner.content.indexOf(definition));
+      assert.equal(item.type.toFeatherString(), type);
+    };
+    await create.reload(declaration);
+    await code.reload(writer);
+    check(create, 'pending =', 'Real');
+    await code.parse('// writer first\n' + writer);
+    await create.parse('// moved declaration\n' + declaration);
+    project.macros.flush();
+    check(create, 'pending =', 'Real');
+    await create.reload('// declaration removed');
+    check(code, 'pending =', 'String');
+    await create.reload(declaration);
+    check(create, 'pending =', 'Real');
+  });
+
   it('publishes a forward returned member and its transitive return and assignment types', async () => {
     await code.reload(source());
     memberAndResult('Real');

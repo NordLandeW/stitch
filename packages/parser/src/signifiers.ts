@@ -82,6 +82,7 @@ export class Signifier extends Flags {
   unsetDef() {
     assert(!this.native, 'Cannot unset def on a native entity');
     this._def = undefined;
+    this.definitive = false;
     this.declaration = undefined;
     this.placeholder = true;
   }
