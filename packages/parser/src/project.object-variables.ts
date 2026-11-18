@@ -4,6 +4,7 @@ import {
   type YyObjectProperty,
 } from '@bscotch/yy';
 import type { Asset } from './project.asset.js';
+import { pendingDefinitions } from './project.dependencies.js';
 import { Signifier } from './signifiers.js';
 import { Type } from './types.js';
 
@@ -157,8 +158,12 @@ export class ObjectVariables {
         asset.variables.addMember(symbol, { override: true });
       }
       if (symbol.native) continue;
+      // Restore a missing definition after its GML owner finishes, not during
+      // reset: publishing the transient YY fallback wakes unchanged readers.
       const changed =
-        previous?.key !== key || previous.symbol !== symbol || !symbol.def;
+        previous?.key !== key ||
+        previous.symbol !== symbol ||
+        (!symbol.def && !pendingDefinitions.has(symbol));
       this.bind(name, symbol, key, { path: owner.yyPath.absolute, name });
       if (changed) {
         if (!symbol.def) symbol.def = {};

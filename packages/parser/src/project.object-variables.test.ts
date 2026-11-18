@@ -427,6 +427,46 @@ describe('Object variable declarations', function () {
     ).to.equal('Bool');
   });
 
+  it('publishes final property types between events that read each other’s GML definitions', async function () {
+    const project = await Project.initialize('samples/project');
+    const object = project.getAssetByName('o_object')!;
+    (object.yy as YyObject).properties = ['first_prop', 'second_prop'].map(
+      (name) => property(name, YyObjectPropertyVarType.String),
+    );
+    object.refreshObjectVariables();
+    const create = object.getEventByName('Create_0')!;
+    const step = object.getEventByName('Step_0')!;
+    const source = 'first_prop = 1; var from_step = second_prop;';
+    const read = () =>
+      step.refs.find((ref) => ref.item.name === 'from_create')!.item;
+    await create.reload(source, { reloadDirty: true });
+    await step.reload('second_prop = true; var from_create = first_prop;', {
+      reloadDirty: true,
+    });
+    await create.reload('// same definitions\n' + source, {
+      reloadDirty: true,
+    });
+    expect(
+      create.refs
+        .find((ref) => ref.item.name === 'from_step')!
+        .item.type.toFeatherString(),
+    ).to.equal('Bool');
+    expect(read().type.toFeatherString()).to.equal('Real');
+    expect(
+      step.refs.find((ref) => ref.item.name === 'first_prop')!.item.def
+        ?.file === create,
+    ).to.equal(true);
+    await create.reload('var from_step = second_prop;', { reloadDirty: true });
+    expect(read().type.toFeatherString()).to.equal('String');
+    const fallback = step.refs.find(
+      (ref) => ref.item.name === 'first_prop',
+    )!.item;
+    expect(fallback.def?.file).to.equal(undefined);
+    expect(fallback.resourceDefinition?.path).to.equal(object.yyPath.absolute);
+    await create.reload(source, { reloadDirty: true });
+    expect(read().type.toFeatherString()).to.equal('Real');
+  });
+
   it('preserves GML assignments and explicit types for metadata-backed variables', async function () {
     const project = await Project.initialize('samples/project');
     const object = project.getAssetByName('o_object')!;

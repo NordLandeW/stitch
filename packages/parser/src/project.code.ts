@@ -36,13 +36,10 @@ import { registerGlobals } from './visitor.globals.js';
 import { registerSignifiers } from './visitor.js';
 import {
   identifyLiteral,
+  pendingDefinitions,
   semanticReaders,
   semanticSignature,
 } from './project.dependencies.js';
-
-// A different file may reset its last read while the defining file is between
-// globals and symbols. Keep that binding reserved until its owner publishes.
-const pendingDefinitions = new WeakSet<Signifier>();
 
 /** Represenation of a GML code file. */
 export class Code {
@@ -142,6 +139,9 @@ export class Code {
     }
     this.functionTypes.clear();
     this.semanticTree = undefined;
+    // Readers in this batch can see withdrawn types before their owner runs.
+    // Republish once even when the result equals the previous batch's result.
+    this.previousSemanticSignature = undefined;
     this.previousLocalSemanticSignature = undefined;
   }
 

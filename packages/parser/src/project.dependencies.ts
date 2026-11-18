@@ -2,6 +2,10 @@ import type { Code } from './project.code.js';
 import type { Signifier } from './signifiers.js';
 import type { Type } from './types.js';
 
+// A GML declaration is temporarily absent between the globals and symbols
+// passes. Reserve its binding until the defining file finishes publishing.
+export const pendingDefinitions = new WeakSet<Signifier>();
+
 // Anonymous literals have identity within one parsed syntax tree. Derived call
 // results must compare through that identity, not their temporary wrappers.
 const literalIds = new WeakMap<Type, number>();
