@@ -30,7 +30,7 @@ const bundles = new Map<string, Promise<string>>();
 
 // Only UI/resource/build boundaries are doubled. All GML consumers and the
 // current parser/visitor, source mapping, queues and macro lifecycle run unchanged.
-async function compileSubjects(): Promise<string> {
+async function compileSubjects(resourceTree: boolean): Promise<string> {
   const esbuild = localRequire('esbuild') as typeof import('esbuild');
   const hostImport = `import host from ${JSON.stringify(boundary)};\n`;
   const stubs = new Map<string, string>();
@@ -57,6 +57,14 @@ async function compileSubjects(): Promise<string> {
   );
   stubs.set('extension.formatting', 'export class StitchYyFormatProvider {}');
   stubs.set('tree.folder', 'export class GameMakerFolder {}');
+  if (resourceTree) {
+    stubs.delete('tree');
+    stubs.delete('tree.folder');
+    stubs.set(
+      '@bscotch/sprite-source',
+      'export class SpriteDir {} export function applySpriteAction() { throw new Error("Unexpected sprite import"); }',
+    );
+  }
   stubs.set(
     'extension.projectSelection',
     `${hostImport}export const chooseGameMakerProject = (...args) => host.chooseProject(...args);`,
@@ -85,7 +93,8 @@ async function compileSubjects(): Promise<string> {
     `
     export { Project, setLogger } from ${JSON.stringify(parserSource('project.ts'))};
     export { Code } from ${JSON.stringify(parserSource('project.code.ts'))};
-    export { Asset, isAssetOfKind } from ${JSON.stringify(parserSource('project.asset.ts'))};
+    export { objectEvents, getEventFromFilename } from ${JSON.stringify(parserSource('lib.objects.ts'))};
+    export { Asset, isAssetOfKind, assertIsAssetOfKind } from ${JSON.stringify(parserSource('project.asset.ts'))};
     export { Reference, Range, Position } from ${JSON.stringify(parserSource('project.location.ts'))};
     export { Type } from ${JSON.stringify(parserSource('types.ts'))};
     export { Signifier } from ${JSON.stringify(parserSource('signifiers.ts'))};
@@ -119,6 +128,7 @@ async function compileSubjects(): Promise<string> {
     export { GameMakerSemanticTokenProvider, semanticTokensLegend } from ${JSON.stringify(source('extension.highlighting.mts'))};
     // Project discovery is the only analysis-side seam. The native spec is real;
     // tests supply independent source text and use real Code/Asset entry points.
+    export const initializeProject = GameMakerProject.prototype.initialize;
     GameMakerProject.prototype.initialize = function() { return host.initializeProject(this); };
     export async function seedProject(project) {
       project.options.analysis = 'full';
@@ -342,7 +352,7 @@ class RelativePattern {
   ) {}
 }
 
-export async function createHost() {
+export async function createHost({ resourceTree = false } = {}) {
   const resources: {
     label: string;
     disposed: boolean;
@@ -757,10 +767,11 @@ export async function createHost() {
     ]),
   );
   const module = { exports: {} };
-  let compiled = bundles.get('providers');
+  const subjects = resourceTree ? 'resourceTree' : 'providers';
+  let compiled = bundles.get(subjects);
   if (!compiled) {
-    compiled = compileSubjects();
-    bundles.set('providers', compiled);
+    compiled = compileSubjects(resourceTree);
+    bundles.set(subjects, compiled);
   }
   const code = await compiled;
   const schedule = (callback: () => void) => {

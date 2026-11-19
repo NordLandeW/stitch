@@ -42,10 +42,13 @@ export async function buildTestWorker(directory: string): Promise<string> {
   return output;
 }
 
-export async function workerFixture(sources: Record<string, string>) {
+export async function workerProject(sources: Record<string, string>) {
   const directory = await mkdtemp(
     path.join(os.tmpdir(), 'stitch-language-worker-'),
   );
+  // Windows can briefly report ENOTEMPTY while recursive deletes finish.
+  const dispose = () =>
+    rm(directory, { recursive: true, force: true, maxRetries: 3 });
   try {
     const yyp = await Yy.read(
       path.join(parserRoot, 'samples/project/project.yyp'),
@@ -76,14 +79,32 @@ export async function workerFixture(sources: Record<string, string>) {
       files[name] = pathy(file).absolute;
     }
     await writeFile(yypPath, Yy.stringify(yyp));
-    const workerPath = await buildTestWorker(directory);
-    const diagnostics = new Map<string, DiagnosticSnapshot>();
-    const errors: Error[] = [];
     const input: Initialization = {
       yypPath,
       configuration: 'Default',
       nativeSpecFiles: [path.join(parserRoot, 'assets/GmlSpec.xml')],
     };
+    return {
+      directory,
+      yyp,
+      yypPath,
+      files,
+      input,
+      dispose,
+    };
+  } catch (error) {
+    await dispose();
+    throw error;
+  }
+}
+
+export async function workerFixture(sources: Record<string, string>) {
+  const project = await workerProject(sources);
+  const { directory, files, input } = project;
+  try {
+    const workerPath = await buildTestWorker(directory);
+    const diagnostics = new Map<string, DiagnosticSnapshot>();
+    const errors: Error[] = [];
     let worker!: Worker;
     const service = new WorkerLanguageService(input, workerPath, {
       delay: () => 50,
@@ -96,15 +117,11 @@ export async function workerFixture(sources: Record<string, string>) {
     });
     let version = 0;
     return {
-      directory,
-      yyp,
-      yypPath,
-      files,
+      ...project,
       workerPath,
       service,
       diagnostics,
       errors,
-      input,
       get worker() {
         return worker;
       },
@@ -127,14 +144,14 @@ export async function workerFixture(sources: Record<string, string>) {
       async dispose() {
         service.dispose();
         await worker.terminate();
-        await rm(directory, { recursive: true, force: true });
+        await project.dispose();
       },
       async diskText(name: string) {
         return readFile(files[name], 'utf8');
       },
     };
   } catch (error) {
-    await rm(directory, { recursive: true, force: true });
+    await project.dispose();
     throw error;
   }
 }

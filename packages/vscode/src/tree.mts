@@ -641,14 +641,17 @@ export class GameMakerTreeProvider
 
     // NOTE: At this point we've bypassed the parser, so we'll need to
     // register the asset manually.
-    const assetInfo = await project.addAssetToYyp(
-      dest.join(`${name}.yy`).absolute,
-    );
-    const asset = await Asset.from(project, assetInfo);
-    assertLoudly(asset, 'Failed to create sprite asset.');
-    project.registerAsset(asset);
-    await project.createFolder(folder.path);
-    await asset.moveToFolder(folder.path);
+    const asset = await project.serializeResourceOperation(async () => {
+      await project.createFolder(folder.path, { skipSave: true });
+      const info = await project.addAssetToYyp(
+        dest.join(`${name}.yy`).absolute,
+      );
+      const asset = await Asset.from(project, info);
+      assertLoudly(asset, 'Failed to create sprite asset.');
+      project.registerAsset(asset);
+      await asset.moveToFolder(folder.path);
+      return asset;
+    });
     this.afterNewAssetCreated(asset, folder, where);
   }
 

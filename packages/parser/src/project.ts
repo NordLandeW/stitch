@@ -128,6 +128,18 @@ export interface ProjectOptions {
   };
 }
 
+/** Keep a whole asset creation, including registration, ordered with YYP reloads. */
+function createsAsset<A extends unknown[], R>(
+  _target: Project,
+  _key: string,
+  descriptor: TypedPropertyDescriptor<(...args: A) => Promise<R>>,
+) {
+  const create = descriptor.value!;
+  descriptor.value = function (this: Project, ...args: A) {
+    return this.serializeResourceOperation(() => create.apply(this, args));
+  };
+}
+
 export class Project {
   yyp!: Yyp;
   /** Until this resolves, assume that this.yyp is not yet read */
@@ -140,9 +152,8 @@ export class Project {
   private readonly sourceUpdates = new Set<Promise<unknown>>();
   private resourceOperations: Promise<void> = Promise.resolve();
 
-  private serializeResourceOperation<T>(
-    operation: () => Promise<T>,
-  ): Promise<T> {
+  /** Run a top-level resource transaction without interleaving other registered operations. */
+  serializeResourceOperation<T>(operation: () => Promise<T>): Promise<T> {
     const prior = this.resourceOperations;
     const result = this.withSourceUpdate(() => prior.then(operation));
     this.resourceOperations = result.then(
@@ -875,7 +886,8 @@ export class Project {
         'utf8',
       );
     const reload = async () => {
-      await this.reloadYyp();
+      // The outer rename transaction already owns the resource queue.
+      await this.reloadProjectSources();
       for (const asset of this.assets.values()) await asset.reload();
       // Publish actual disk contents after both success and rollback. Collect
       // every surviving physical source before expanding its macro consumers.
@@ -1086,7 +1098,7 @@ export class Project {
     return planAssetImport(source, this, options);
   }
 
-  @sequential
+  @createsAsset
   async duplicateAsset(sourceName: string, newPath: string) {
     const source = this.getAssetByName(sourceName, { assertExists: true });
     const parsed = await this.parseNewAssetPath(newPath);
@@ -1142,7 +1154,7 @@ export class Project {
    * @param fromFile The path to the source sound file to copy into the new asset's directory.
    * @example project.createSound('folder/of/sounds/snd_my_new_sound', 'path/to/sound.mp3');
    */
-  @sequential
+  @createsAsset
   async createSound(newSoundPath: string, fromFile: string | Pathy) {
     // Create the yy file
     const parsed = await this.parseNewAssetPath(newSoundPath);
@@ -1196,7 +1208,7 @@ export class Project {
    * @param newRoomPath The POSIX-style path within the asset tree where you want this asset to be created, where the last component is the name of the asset.
    * @example project.createRoom('folder/of/rooms/rm_my_room');
    */
-  @sequential
+  @createsAsset
   async createRoom(newRoomPath: string): Promise<Asset<'rooms'> | undefined> {
     const parsed = await this.parseNewAssetPath(newRoomPath);
     if (!parsed) {
@@ -1240,7 +1252,7 @@ export class Project {
    * @param fromImageFile Path to a source PNG image to use as the first frame of the sprite.
    * @example project.createSprite('folder/of/sprites/sp_my_sprite', 'path/to/sprite.png');
    */
-  @sequential
+  @createsAsset
   async createSprite(
     newSpritePath: string,
     fromImageFile: string | Pathy,
@@ -1303,7 +1315,7 @@ export class Project {
    * in which case folders will be ensured up to the final component.
    * @param newObjectName The POSIX-style path within the asset tree where you want this asset to be created, where the last component is the name of the asset.
    */
-  @sequential
+  @createsAsset
   async createObject(
     newObjectName: string,
   ): Promise<Asset<'objects'> | undefined> {
@@ -1345,7 +1357,7 @@ export class Project {
     return asset as Asset<'objects'>;
   }
 
-  @sequential
+  @createsAsset
   async createShader(path: string): Promise<Asset<'shaders'> | undefined> {
     // Create the yy file
     const parsed = await this.parseNewAssetPath(path);
@@ -1390,7 +1402,7 @@ export class Project {
    * Add a script to the yyp file. The path string can include separators,
    * in which case folders will be ensured up to the final component.
    */
-  @sequential
+  @createsAsset
   async createScript(path: string): Promise<Asset<'scripts'> | undefined> {
     // Create the yy file
     const parsed = await this.parseNewAssetPath(path);
@@ -1449,7 +1461,8 @@ export class Project {
       logger.error(`Adding scripts to the root directory is not supported.`);
       return;
     }
-    const folder = (await this.createFolder(parts))!;
+    // Publish the folder and the new asset in the same YYP write.
+    const folder = (await this.createFolder(parts, { skipSave: true }))!;
     return { folder, name };
   }
 
@@ -1823,7 +1836,7 @@ export class Project {
    * on disk) and add/remove any resources.
    */
   reloadYyp() {
-    return this.withSourceUpdate(() => this.reloadProjectSources());
+    return this.serializeResourceOperation(() => this.reloadProjectSources());
   }
 
   private async reloadProjectSources() {
