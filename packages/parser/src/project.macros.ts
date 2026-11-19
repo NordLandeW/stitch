@@ -173,6 +173,11 @@ export class ProjectMacros {
     return this.families.has(name);
   }
 
+  /** Includes identifiers introduced by expansion in their consuming file. */
+  identifierUsers(name: string): Iterable<Code> {
+    return this.users.get(name) || [];
+  }
+
   hasIdentifier(name: string): boolean {
     return !!this.users.get(name)?.size;
   }

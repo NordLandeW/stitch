@@ -150,7 +150,10 @@ export class GmlSignifierVisitor extends GmlVisitorBase {
         ? undefined
         : this.FIND_GLOBAL_BY_NAME(name, options),
     ].filter((i) => i !== undefined) as Signifier[];
-    return matches.find((i) => i.def) || matches[0];
+    const item = matches.find((i) => i.def) || matches[0];
+    if (!item?.def && !options?.excludeGlobal)
+      this.FILE.unresolvedNames.add(name);
+    return item;
   }
 
   protected FIND_GLOBAL_BY_NAME(

@@ -50,6 +50,8 @@ export class Code {
   readonly jsdocs: JsdocSummary[] = [];
   /** Fixed scope-keyword roles in analysis coordinates, including unbound uses. */
   readonly scopeKeywordOffsets = new Set<number>();
+  /** Bare names that a subsequently declared global could resolve. */
+  readonly unresolvedNames = new Set<string>();
 
   protected diagnostics!: DiagnosticCollections;
   /** List of all symbol references in this file, in order of appearance. */
@@ -730,6 +732,7 @@ export class Code {
     // Reset this file's refs list
     this._refs = [];
     this.scopeKeywordOffsets.clear();
+    this.unresolvedNames.clear();
     this._functionArgRanges = [];
     this._structNewMemberRanges = [];
     this._functionCalls = [];

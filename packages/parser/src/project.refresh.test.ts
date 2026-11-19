@@ -123,6 +123,28 @@ describe('same-file semantic refresh', function () {
     check(create, 'pending =', 'Real');
   });
 
+  it('resolves previously missing names when another script adds their declarations', async () => {
+    await code.reload(
+      'var observed = RefreshNew(); var kind = RefreshKind.Value;',
+    );
+    assert(code.getDiagnostics().UNDECLARED_GLOBAL_REFERENCE.length);
+    const shorthand = new Code(code.asset, project.dir.join('shorthand.gml'));
+    await shorthand.reload('var table = {RefreshNew};');
+    assert(shorthand.getDiagnostics().INVALID_OPERATION.length);
+    await other.reload(
+      'function RefreshNew(){return 1;} enum RefreshKind { Value }',
+    );
+    assert.equal(reference(code, 'RefreshNew').item.def?.file, other);
+    assert.equal(reference(code, 'Value').item.def?.file, other);
+    assert.equal(
+      reference(code, 'observed').item.type.toFeatherString(),
+      'Real',
+    );
+    assert.deepEqual(code.getDiagnostics().UNDECLARED_GLOBAL_REFERENCE, []);
+    assert.equal(reference(shorthand, 'RefreshNew').item.def?.file, other);
+    assert.deepEqual(shorthand.getDiagnostics().INVALID_OPERATION, []);
+  });
+
   it('publishes a forward returned member and its transitive return and assignment types', async () => {
     await code.reload(source());
     memberAndResult('Real');

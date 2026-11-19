@@ -137,6 +137,14 @@ export class GmlGlobalDeclarationsVisitor extends GmlVisitorBase {
     const symbol = this.DISCOVER_GLOBAL(name);
     // Ensure it's defined here.
     if (!isNotDef && !symbol.native) {
+      if (!symbol.def) {
+        // A previously unknown bare use has no reference edge to this symbol.
+        const project = this.PROCESSOR.project;
+        for (const reader of project.macros.identifierUsers(name)) {
+          if (reader.unresolvedNames.delete(name))
+            project.queueSemanticFileUpdate(reader);
+        }
+      }
       symbol.definedAt(range);
     } else if (!isNotDef) {
       this.PROCESSOR.file.addDiagnostic(
