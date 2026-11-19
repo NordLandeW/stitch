@@ -27,6 +27,7 @@ function createFixture() {
   const file = {
     refs,
     sourceRefs: refs,
+    regionMarkers: [],
     project: { macros: { declarationsIn: () => [] } },
   } as unknown as Code;
   const rootContainer = {

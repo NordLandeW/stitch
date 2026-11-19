@@ -12,6 +12,7 @@ const symbolKinds = {
   field: vscode.SymbolKind.Field,
   function: vscode.SymbolKind.Function,
   method: vscode.SymbolKind.Method,
+  region: vscode.SymbolKind.Module,
   struct: vscode.SymbolKind.Struct,
   variable: vscode.SymbolKind.Variable,
 } as const;

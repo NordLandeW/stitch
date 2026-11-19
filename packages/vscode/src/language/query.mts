@@ -302,7 +302,7 @@ function documentSymbol(symbol: GmlDocumentSymbol): DocumentSymbol {
     kind: symbol.kind,
     range: spanOf(symbol.range),
     selectionRange: spanOf(symbol.selectionRange),
-    deprecated: !!symbol.item.deprecated,
+    deprecated: !!symbol.item?.deprecated,
     children: symbol.children.map(documentSymbol),
   };
 }

@@ -1,5 +1,6 @@
 import type { Project } from './project.js';
 import type { YypConfig } from '@bscotch/yy';
+import type { ILexingResult } from 'chevrotain';
 import type { Code } from './project.code.js';
 import { Position, Range, type SourceMapping } from './project.location.js';
 import { Signifier } from './signifiers.js';
@@ -93,10 +94,10 @@ export class ProjectMacros {
     this.reparse.add(code);
   }
 
-  collect(code: Code, text: string) {
+  collect(code: Code, text: string, lexed: ILexingResult) {
     const uri = code.path.absolute;
     const old = this.sources.get(uri);
-    const collected = collectMacros({ uri, text });
+    const collected = collectMacros({ uri, text }, lexed);
     const collection =
       old?.collection.key === collected.key
         ? { ...collected, definitions: old.collection.definitions }

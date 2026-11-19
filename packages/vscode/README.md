@@ -249,7 +249,7 @@ Stitch provides a tree view that mirrors the project resources in the GameMaker 
 
 Stitch also provides support for symbol search <kbd><kbd>Ctrl</kbd>+<kbd>T</kbd></kbd> via the command palette, which finds where all of your project's globals are defined. It will also pull up your asset and your object events, so you can find everything in one place.
 
-Finally, the Intellisense features (go-to-definition, find-references, etc) make it easy to navigate the code in your project.
+In the GML Outline, `#region Title` and `#endregion` group the declarations and nested regions between them. Select a region to jump to its heading. An unnamed region appears as `#region`; a heading without a matching footer remains a navigation target while you edit.
 
 #### Selecting a GameMaker project
 

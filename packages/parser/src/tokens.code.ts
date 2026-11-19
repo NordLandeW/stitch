@@ -334,13 +334,13 @@ export const codeTokens = [
   createToken({
     name: 'Region',
     pattern: /#region\b[^\n]*/,
-    group: Lexer.SKIPPED,
+    group: 'regions',
     categories: [c.Keyword, c.Comment],
   }),
   createToken({
     name: 'EndRegion',
     pattern: /#endregion[^\n]*/,
-    group: Lexer.SKIPPED,
+    group: 'regions',
     categories: [c.Keyword, c.Comment],
   }),
   createToken({ name: 'Self', pattern: /\bself\b/, categories: [c.Keyword] }),

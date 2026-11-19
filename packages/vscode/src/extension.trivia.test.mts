@@ -123,7 +123,8 @@ test('comment trivia preserves annotated hover, signatures, navigation, rename, 
       /Input documentation/,
     );
     const symbols = await outline.provideDocumentSymbols(doc, token);
-    assert(symbols.some((symbol: any) => symbol.name === 'Commented'));
+    const region = symbols.find((symbol: any) => symbol.name === 'title !!!');
+    assert(region?.children.some((symbol: any) => symbol.name === 'Commented'));
     for (const symbol of symbols) {
       validRange(doc, symbol.range);
       validRange(doc, symbol.selectionRange);
@@ -149,6 +150,94 @@ test('comment trivia preserves annotated hover, signatures, navigation, rename, 
     );
     assert.equal(diagnostics(doc).length, 0);
   }
+});
+
+test('Outline groups authored regions and selects their titles across unsaved edits', async () => {
+  const { doc } = await document('RegionOutline', '');
+  const outline = new host.subject.StitchDocumentSymbolProvider(workspace);
+  const hover = new host.subject.StitchHoverProvider(workspace);
+  const lines = [
+    '#macro LONG_VALUE 7',
+    'var sample = LONG_VALUE;',
+    'var note = @"text',
+    '#region string',
+    '";',
+    '/*',
+    '#region comment',
+    '*/',
+    '#endregion stray',
+    '  #region  外层 😀  ',
+    'function RegionOwner() {',
+    '  #region',
+    '  function RegionInner() {}',
+    '  #endregion',
+    '}',
+    '#region Empty',
+    '#endregion',
+    '#endregion outer footer',
+    '#region Unfinished',
+    'function RegionAfter() {}',
+  ];
+  const tree = (symbols: any[]): any[] =>
+    symbols.map((s) => [s.name, tree(s.children)]);
+  for (const title of ['外层 😀', 'Edited']) {
+    const source = lines.join('\r\n').replace('外层 😀', title);
+    doc.setText(source);
+    await hover.provideHover(
+      doc,
+      doc.positionAt(source.indexOf('sample')),
+      token,
+    );
+    const symbols = await outline.provideDocumentSymbols(doc, token);
+    const outer = symbols.find((symbol: any) => symbol.name === title);
+    assert(outer);
+    assert.deepEqual(tree(symbols.filter((s: any) => s.kind === outer.kind)), [
+      [
+        title,
+        [
+          ['RegionOwner', [['#region', [['RegionInner', []]]]]],
+          ['Empty', []],
+        ],
+      ],
+      ['Unfinished', []],
+    ]);
+    assert(symbols.some((s: any) => s.name === 'RegionAfter'));
+    assert.equal(doc.getText(outer.selectionRange), title);
+    assert.equal(
+      doc.offsetAt(outer.range.start),
+      source.indexOf('#region  ' + title),
+    );
+    assert.equal(
+      doc.offsetAt(outer.range.end),
+      source.indexOf('#endregion outer footer') +
+        '#endregion outer footer'.length,
+    );
+    assert.equal(
+      doc.getText(outer.children[0].children[0].selectionRange),
+      '#region',
+    );
+  }
+});
+
+test('a region crossing a constructor boundary does not detach its fields', async () => {
+  const source = [
+    'function RegionCtor() constructor {',
+    '  #region Cross',
+    '  outline_member = 7;',
+    '}',
+    'function RegionPeer() {}',
+    '#endregion',
+  ].join('\n');
+  const { doc } = await document('CrossingRegion', source);
+  const outline = new host.subject.StitchDocumentSymbolProvider(workspace);
+  const symbols = await outline.provideDocumentSymbols(doc, token);
+  assert.deepEqual(
+    symbols.map((s: any) => [s.name, s.children.map((c: any) => c.name)]),
+    [
+      ['RegionCtor', ['outline_member']],
+      ['Cross', ['RegionPeer']],
+    ],
+  );
 });
 
 test('comment close, inline annotations and source repair refresh consumers without stale neighboring documentation', async () => {

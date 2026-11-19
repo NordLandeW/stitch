@@ -1,7 +1,9 @@
 import type { Pathy } from '@bscotch/pathy';
 import { sequential } from '@bscotch/utility';
 import { YyObject } from '@bscotch/yy';
+import type { IToken } from 'chevrotain';
 import MagicString from 'magic-string';
+import { GmlLexer } from './lexer.js';
 import type { JsdocSummary } from './jsdoc.js';
 import { ObjectEvent, getEventFromFilename } from './lib.objects.js';
 import { logger } from './logger.js';
@@ -63,6 +65,8 @@ export class Code {
   protected _functionCalls: FunctionArgRange[][] = [];
   protected _rangesAreSorted = false;
   content!: string;
+  /** Directive tokens from physical source, before macro expansion. */
+  regionMarkers: readonly IToken[] = [];
   protected _parsed!: GmlParsed;
   /** Internal analysis ranges retain this immutable source-projection snapshot. */
   sourceMapping?: SourceMapping;
@@ -222,6 +226,12 @@ export class Code {
   /** UTF-16 cursor boundary in the current analysis text, including EOF. */
   get analysisLength() {
     return this.preprocessed?.text.length ?? this.content?.length ?? 0;
+  }
+
+  /** Position in the authored document, independent of lexer modes or expansion. */
+  sourcePositionAt(offset: number): Position {
+    const point = this.sourceLines.position(offset);
+    return new Position(this, point.offset, point.line, point.column);
   }
 
   analysisPositionAt(offset: number): Position {
@@ -502,7 +512,9 @@ export class Code {
     this.content = content;
     if (!this.project.analysisEnabled) return;
     this.sourceLines = new SourceLines(content);
-    this.project.macros.collect(this, content);
+    const lexed = GmlLexer.tokenize(content);
+    this.regionMarkers = lexed.groups.regions;
+    this.project.macros.collect(this, content, lexed);
     this.parseCollected();
   }
 

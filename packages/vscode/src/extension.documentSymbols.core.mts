@@ -1,18 +1,15 @@
-import { Range, type Code, type Signifier } from '@bscotch/gml-parser';
+import {
+  Position,
+  Range,
+  type Code,
+  type Signifier,
+} from '@bscotch/gml-parser';
+import type { DocumentSymbol } from './language/protocol.mjs';
 
-export type GmlDocumentSymbolKind =
-  | 'constant'
-  | 'constructor'
-  | 'enum'
-  | 'enumMember'
-  | 'field'
-  | 'function'
-  | 'method'
-  | 'struct'
-  | 'variable';
+export type GmlDocumentSymbolKind = DocumentSymbol['kind'];
 
 export interface GmlDocumentSymbol {
-  readonly item: Signifier;
+  readonly item?: Signifier;
   readonly name: string;
   readonly detail: string;
   readonly kind: GmlDocumentSymbolKind;
@@ -113,6 +110,62 @@ function contains(parent: Range, child: Range) {
   );
 }
 
+function regionSymbols(file: Code): GmlDocumentSymbol[] {
+  const result: GmlDocumentSymbol[] = [];
+  const open: GmlDocumentSymbol[] = [];
+  for (const marker of file.regionMarkers) {
+    const offset = marker.startOffset;
+    const { line: lineNumber, column } = file.sourcePositionAt(offset);
+    // Match the line-leading directives used by editor folding.
+    if (
+      column > 1 &&
+      /\S/.test(file.content.slice(offset - column + 1, offset))
+    )
+      continue;
+    const line = marker.image.split('\r', 1)[0].trimEnd();
+    const at = (index: number) =>
+      new Position(file, offset + index, lineNumber, column + index);
+    if (marker.tokenType.name === 'EndRegion') {
+      if (/^#endregion\b/.test(line)) {
+        const previous = open.pop();
+        if (previous) previous.range.end = at(line.length - 1);
+      }
+      continue;
+    }
+    const title = line.slice('#region'.length).trimStart();
+    const end = at(line.length - 1);
+    const range = Range.physical(at(0), end);
+    const symbol: GmlDocumentSymbol = {
+      name: title || '#region',
+      detail: '',
+      kind: 'region',
+      range,
+      selectionRange: Range.physical(
+        title ? at(line.length - title.length) : range.start,
+        end,
+      ),
+      children: [],
+    };
+    // While the footer is missing, keep the heading navigable without
+    // moving the rest of the document into an unfinished section.
+    result.push(symbol);
+    open.push(symbol);
+  }
+  return result;
+}
+
+function enclosing(parents: GmlDocumentSymbol[], range: Range) {
+  while (
+    parents.length &&
+    parents.at(-1)!.range.end.offset < range.start.offset
+  )
+    parents.pop();
+  for (let i = parents.length - 1; i >= 0; i--) {
+    if (contains(parents[i].range, range)) return parents[i];
+  }
+  return undefined;
+}
+
 /**
  * Collect parser-backed symbols defined by one GML document and arrange them
  * into their lexical hierarchy.
@@ -174,6 +227,7 @@ export function collectGmlDocumentSymbols(file: Code): GmlDocumentSymbol[] {
         children: [],
       })),
     )
+    .concat(regionSymbols(file))
     .sort(
       (a, b) =>
         a.range.start.offset - b.range.start.offset ||
@@ -182,18 +236,25 @@ export function collectGmlDocumentSymbols(file: Code): GmlDocumentSymbol[] {
     );
 
   const roots: GmlDocumentSymbol[] = [];
-  const parents: GmlDocumentSymbol[] = [];
+  const declarations: GmlDocumentSymbol[] = [];
+  const regions: GmlDocumentSymbol[] = [];
   for (const symbol of symbols) {
-    while (parents.length && !contains(parents.at(-1)!.range, symbol.range)) {
-      parents.pop();
-    }
-    const parent = parents.at(-1);
+    // Region boundaries can cross declarations. Keep both stacks alive and
+    // preserve the declaration owner if neither container contains the other.
+    const declaration = enclosing(declarations, symbol.range);
+    const region = enclosing(regions, symbol.range);
+    const parent =
+      region && (!declaration || contains(declaration.range, region.range))
+        ? region
+        : declaration;
     if (parent) {
       parent.children.push(symbol);
     } else {
       roots.push(symbol);
     }
-    if (
+    if (symbol.kind === 'region') {
+      regions.push(symbol);
+    } else if (
       symbol.range.start.offset < symbol.range.end.offset &&
       (symbol.kind === 'constructor' ||
         symbol.kind === 'enum' ||
@@ -201,7 +262,7 @@ export function collectGmlDocumentSymbols(file: Code): GmlDocumentSymbol[] {
         symbol.kind === 'method' ||
         symbol.kind === 'struct')
     ) {
-      parents.push(symbol);
+      declarations.push(symbol);
     }
   }
   return roots;

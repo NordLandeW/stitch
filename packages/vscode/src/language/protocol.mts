@@ -76,6 +76,7 @@ export interface DocumentSymbol {
     | 'field'
     | 'function'
     | 'method'
+    | 'region'
     | 'struct'
     | 'variable';
   range: Span;
