@@ -222,3 +222,109 @@ test(
     }
   },
 );
+
+test('precise providers keep the working text when another model addresses its path', async () => {
+  const old = 'show_debug_message(1);';
+  const live =
+    'if (true) {\n\tvar label = "working";\n\tshow_debug_message(label);\n}';
+  const f = await workerFixture({ Draw: old });
+  const host = await createHost();
+  const workspace = host.newWorkspace();
+  try {
+    const project = new host.subject.GameMakerProject(
+      host.vscode.Uri.file(f.yypPath),
+      { analysis: 'resources' },
+    );
+    project.yyp = f.yyp;
+    project.config = {};
+    workspace.projects.push(project);
+    workspace.createLanguageService = () => f.service;
+    const doc = (name: string, text: string) =>
+      host.document({ path: { absolute: name } }, text);
+    const working = doc(f.files.Draw, old);
+    const alternate = doc(f.files.Draw.replace('/Draw/', '/draw/'), old);
+    const preview = doc(f.files.Draw, old);
+    Object.assign(preview.uri, { query: 'revision=before' });
+    const token = { isCancellationRequested: false };
+    const tokens = (d: typeof working) =>
+      workspace.semanticHighlightProvider.provideDocumentSemanticTokens(
+        d,
+        token,
+      );
+    const hover = (d: typeof working) =>
+      workspace.query(d, {
+        kind: 'hover',
+        offset: d.getText().indexOf('label'),
+      });
+    const expectWorking = async () => {
+      const result = await tokens(working);
+      assert(
+        result?.entries.some(
+          (entry: any) =>
+            entry.range.start.line === 2 &&
+            working.getText(entry.range) === 'show_debug_message',
+        ),
+      );
+      assert((await hover(working))?.code.includes('String'));
+    };
+    host.documents.push(working);
+    workspace.onChangeDoc(working);
+    await tokens(working);
+    working.setText(live);
+    workspace.onChangeDoc({
+      document: working,
+      contentChanges: [{ text: 'if (true) {' }, { text: '\t' }],
+    });
+    await expectWorking();
+    working.setText(live + '\n');
+    workspace.onChangeDoc({
+      document: working,
+      contentChanges: [{ text: '\n' }],
+    });
+    host.documents.push(alternate, preview);
+    workspace.onChangeDoc(alternate);
+    workspace.onChangeDoc(preview);
+    await expectWorking();
+    assert.equal(
+      await tokens(alternate),
+      undefined,
+      'Never draw working ranges on a divergent, non-owning document',
+    );
+    assert.equal(await tokens(preview), undefined);
+    const rename = () =>
+      new host.subject.StitchRenameProvider(workspace).provideRenameEdits(
+        working,
+        working.positionAt(live.indexOf('label')),
+        'renamed',
+        token,
+      );
+    assert.equal(
+      await rename(),
+      undefined,
+      'A physical edit plan cannot be applied to divergent aliases',
+    );
+    // Editing the other real model transfers ownership even if its local version is lower.
+    alternate.setText('var next = 42;');
+    workspace.onChangeDoc({
+      document: alternate,
+      contentChanges: [{ text: '42' }],
+    });
+    assert(
+      (await tokens(alternate))?.entries.some(
+        (entry: any) => alternate.getText(entry.range) === 'next',
+      ),
+    );
+    assert.equal(await tokens(working), undefined);
+    alternate.isClosed = true;
+    await workspace.onCloseDoc(alternate);
+    // Disk is still old. The surviving open text must be restored without another edit.
+    await expectWorking();
+    await workspace.onChangeFile(alternate.uri);
+    await expectWorking();
+    assert.equal((await rename())?.operations.length, 2);
+    assert.equal(await f.diskText('Draw'), old);
+  } finally {
+    host.dispose();
+    await f.dispose();
+  }
+});

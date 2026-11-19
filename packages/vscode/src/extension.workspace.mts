@@ -18,7 +18,11 @@ import {
 import { stitchEvents } from './events.mjs';
 import { activateStitchExtension } from './extension.activate.mjs';
 import { completionTriggerCharacters } from './extension.completions.mjs';
-import { WorkerLanguageService, cancellable } from './language/client.mjs';
+import {
+  WorkerLanguageService,
+  cancellable,
+  sourceKey,
+} from './language/client.mjs';
 import type {
   DiagnosticSnapshot,
   LanguageService,
@@ -42,6 +46,18 @@ import {
   showProgress,
 } from './lib.mjs';
 import { info, logger, warn, showErrorMessage } from './log.mjs';
+
+// A revision/preview URI is a different text model, not a project source.
+function isWorkingFile(uri: vscode.Uri) {
+  return uri.scheme === 'file' && !uri.query && !uri.fragment;
+}
+
+function bufferPriority(document: vscode.TextDocument) {
+  return (
+    (document.isDirty ? 2 : 0) +
+    (document === vscode.window.activeTextEditor?.document ? 1 : 0)
+  );
+}
 
 export class StitchWorkspace implements vscode.SignatureHelpProvider {
   readonly semanticHighlightProvider = new GameMakerSemanticTokenProvider(this);
@@ -508,7 +524,7 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
       if (
         document.isClosed ||
         document.languageId !== 'gml' ||
-        document.uri.scheme !== 'file' ||
+        !isWorkingFile(document.uri) ||
         this.getProject(document) !== project
       )
         continue;
@@ -522,9 +538,17 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     project: GameMakerProject,
     document: vscode.TextDocument,
     immediate = false,
+    edited = false,
   ) {
-    const key = document.uri.toString();
+    const key = sourceKey(document.uri.fsPath);
     const prior = this.bufferSnapshots.get(key);
+    // The worker has one graph per physical source. A passive alias must not
+    // steal an existing overlay on open or every time we enumerate buffers.
+    if (prior && prior.document !== document && !prior.document.isClosed) {
+      const difference =
+        bufferPriority(document) - bufferPriority(prior.document);
+      if (difference < 0 || (difference === 0 && !edited)) return;
+    }
     if (
       prior?.document === document &&
       prior.overlay.version === document.version
@@ -553,12 +577,13 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
       document.isClosed ||
       token?.isCancellationRequested ||
       document.languageId !== 'gml' ||
-      document.uri.scheme !== 'file'
+      !isWorkingFile(document.uri)
     )
       return;
     const project = this.getProject(document);
     if (!project) return;
     const version = document.version;
+    this.acceptBuffer(project, document);
     const result = await this.queryProject(
       project,
       { ...query, path: document.uri.fsPath },
@@ -570,6 +595,12 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
       document.version !== version ||
       token?.isCancellationRequested ||
       this.getProject(document) !== project
+    )
+      return;
+    const owner = this.bufferSnapshots.get(sourceKey(document.uri.fsPath));
+    if (
+      !owner ||
+      (owner.document !== document && owner.overlay.text !== document.getText())
     )
       return;
     return result;
@@ -662,7 +693,7 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
       document.isClosed ||
       token?.isCancellationRequested ||
       document.languageId !== 'gml' ||
-      document.uri.scheme !== 'file'
+      !isWorkingFile(document.uri)
     )
       return;
     const project = this.getProject(document);
@@ -712,12 +743,13 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     const opened: { document: vscode.TextDocument; version: number }[] = [];
     for (const source of plan.sources) {
       if (token?.isCancellationRequested) return false;
-      const doc = this.openDocument(vscode.Uri.file(source.path));
-      if (doc) {
+      const docs = this.openDocuments(vscode.Uri.file(source.path));
+      if (!docs.length && (await readFile(source.path, 'utf8')) !== source.text)
+        return false;
+      for (const doc of docs) {
         if (doc.getText() !== source.text) return false;
         opened.push({ document: doc, version: doc.version });
-      } else if ((await readFile(source.path, 'utf8')) !== source.text)
-        return false;
+      }
     }
     return (
       !this.disposed &&
@@ -845,11 +877,22 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     return result;
   }
 
-  private openDocument(uri: vscode.Uri) {
-    return vscode.workspace.textDocuments.find(
+  private openDocuments(uri: vscode.Uri) {
+    const key = sourceKey(uri.fsPath);
+    return vscode.workspace.textDocuments.filter(
       (document) =>
-        !document.isClosed && document.uri.toString() === uri.toString(),
+        !document.isClosed &&
+        isWorkingFile(document.uri) &&
+        (key.endsWith('.gml')
+          ? sourceKey(document.uri.fsPath) === key
+          : document.uri.toString() === uri.toString()),
     );
+  }
+
+  private openDocument(uri: vscode.Uri, excluding?: vscode.TextDocument) {
+    const owner = this.bufferSnapshots.get(sourceKey(uri.fsPath))?.document;
+    if (owner && owner !== excluding && !owner.isClosed) return owner;
+    return this.openDocuments(uri).find((document) => document !== excluding);
   }
 
   async onChangeFile(uri: vscode.Uri): Promise<void> {
@@ -866,24 +909,28 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
   async onCloseDoc(document: vscode.TextDocument): Promise<void> {
     if (
       document.languageId !== 'gml' ||
-      document.uri.scheme !== 'file' ||
+      !isWorkingFile(document.uri) ||
       this.disposed
     )
       return;
     const project = this.getProject(document),
-      key = document.uri.toString();
+      key = sourceKey(document.uri.fsPath);
     const prior = this.bufferSnapshots.get(key);
-    if (prior && prior.document !== document) return;
-    if (prior?.document === document) this.bufferSnapshots.delete(key);
+    if (!prior || prior.document !== document) return;
+    this.bufferSnapshots.delete(key);
     if (!project) return;
-    this.language(project).update(
-      {
-        kind: 'close',
-        path: document.uri.fsPath,
-        generation: prior?.overlay.generation || 0,
-      },
-      true,
-    );
+    const survivor = this.openDocument(document.uri, document);
+    if (survivor?.languageId === 'gml')
+      this.acceptBuffer(project, survivor, true);
+    else
+      this.language(project).update(
+        {
+          kind: 'close',
+          path: document.uri.fsPath,
+          generation: prior.overlay.generation,
+        },
+        true,
+      );
     await this.language(project).flush();
   }
 
@@ -1025,7 +1072,7 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
     const document = 'document' in event ? event.document : event;
     if (
       document.languageId !== 'gml' ||
-      document.uri.scheme !== 'file' ||
+      !isWorkingFile(document.uri) ||
       document.isClosed ||
       ('contentChanges' in event && !event.contentChanges.length)
     )
@@ -1044,7 +1091,7 @@ export class StitchWorkspace implements vscode.SignatureHelpProvider {
       !('contentChanges' in event) ||
       (event.contentChanges.length === 1 &&
         triggers.includes(event.contentChanges[0].text));
-    this.acceptBuffer(project, document, immediate);
+    this.acceptBuffer(project, document, immediate, 'contentChanges' in event);
   }
 
   async createNewProject() {

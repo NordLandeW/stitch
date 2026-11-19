@@ -21,7 +21,8 @@ import type {
   WorkerResponse,
 } from './protocol.mjs';
 
-const sourceKey = (value: string) => value.replaceAll('\\', '/').toLowerCase();
+export const sourceKey = (value: string) =>
+  value.replaceAll('\\', '/').toLowerCase();
 type Reply = Extract<WorkerResponse, { ok: true }>;
 type Request = WorkerRequest extends infer R
   ? R extends WorkerRequest
