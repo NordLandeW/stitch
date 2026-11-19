@@ -154,8 +154,10 @@ export function collectMacros(
       .map((token) => token.startOffset),
   );
   const continuations = new Map<number, { start: number; end: number }>();
-  for (const match of commentFree.matchAll(/\\[\t ]*(\r\n|\r|\n)/g)) {
-    if (!escapes.has(match.index)) continue;
+  // Consume each run once, even when it isn't followed by a newline. Only
+  // code escapes can start a continuation; string and comment text cannot.
+  for (const match of commentFree.matchAll(/\\[\\\t ]*(\r\n|\r|\n)?/g)) {
+    if (!match[1] || !escapes.has(match.index)) continue;
     const end = match.index + match[0].length;
     continuations.set(end - match[1].length, { start: match.index, end });
   }

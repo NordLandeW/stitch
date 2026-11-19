@@ -78,6 +78,41 @@ describe('macro preprocessing', () => {
     }
   });
 
+  it('joins repeated continuation markers at each use and maps the following operand', () => {
+    for (const newline of ['\n', '\r\n', '\r']) {
+      for (const markers of [
+        String.raw`\\`,
+        String.raw`\ /* gap */ \  \ // tail`,
+      ]) {
+        const text = [
+          `#macro ADD (1 + ${markers}`,
+          'operand)',
+          'var first = ADD; var second = ADD;',
+        ].join(newline);
+        const source = collect('file', text);
+        const result = new MacroEnvironment([source]).expand(source);
+        assert.equal(parser.parse(result.text).errors.length, 0);
+        const uses = [...result.text.matchAll(/operand/g)];
+        assert.equal(uses.length, 2);
+        for (const use of uses) {
+          assert.equal(
+            result.sourceMap!.origin(use.index).spelling.start,
+            text.indexOf('operand'),
+          );
+        }
+      }
+    }
+  });
+
+  it('keeps backslashes in string literals and ignores markers inside line comments', () => {
+    const literal = String.raw`@"first\\` + '\nsecond"';
+    const text = `#macro TEXT ${literal} // not continued \\\\\nvar value = TEXT;`;
+    const source = collect('file', text);
+    const result = new MacroEnvironment([source]).expand(source);
+    assert(result.text.includes(`var value =  ${literal}`));
+    assert.equal(parser.parse(result.text).errors.length, 0);
+  });
+
   it('does not activate directives or names inside comments or string text', () => {
     const source = collect(
       'file',
